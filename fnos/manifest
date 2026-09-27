@@ -1,5 +1,5 @@
 appname=dsh-fnos
-version=0.3.25
+version=0.3.26
 display_name=DeepSeek Harness
 desc=DeepSeek Harness Web UI for fnOS
 maintainer=PowerHarness

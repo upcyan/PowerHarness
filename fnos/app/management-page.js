@@ -6,10 +6,10 @@ const pluginPaths = require('./plugin-paths.js');
 const grants = require('./grants.js');
 
 const groups = [
-  { id: 'overview', label: '概览', items: [['overview', '运行状态']] },
-  { id: 'core', label: '核心与扩展', items: [['versions', 'DSH 版本'], ['registry', 'npm 源'], ['plugins', '插件管理'], ['pluginPaths', '插件 URL 放行']] },
-  { id: 'data', label: '数据与安全', items: [['profiles', '配置档'], ['grants', '目录权限'], ['containers', '容器权限'], ['backups', '备份与恢复'], ['runtime', '运行控制']] },
-  { id: 'diagnostics', label: '诊断', items: [['logs', '诊断日志'], ['network', '网络调试']] }
+  { id: 'overview', label: '概览', description: '查看运行状态、重启 DSH 和调整服务端口。', items: [['overview', '运行状态'], ['runtime', '运行控制']] },
+  { id: 'core', label: '核心与扩展', description: '管理 DSH 核心版本、插件及其 npm 下载源。', items: [['versions', 'DSH 版本'], ['plugins', '插件管理'], ['registry', 'npm 源']] },
+  { id: 'data', label: '数据与权限', description: '管理配置档与备份，以及目录、容器和插件 URL 的访问权限。', items: [['profiles', '配置档'], ['backups', '备份与恢复'], ['grants', '目录权限'], ['containers', '容器权限'], ['pluginPaths', '插件 URL 放行']] },
+  { id: 'diagnostics', label: '诊断', description: '查看日志并开启限时网络调试。', items: [['logs', '诊断日志'], ['network', '网络调试']] }
 ];
 const views = new Set(groups.flatMap((group) => group.items.map(([id]) => id)));
 
@@ -93,6 +93,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
 
   const primaryNav = groups.map((item) => `<a href="/__fnos/?view=${item.items[0][0]}"${item.id === group.id ? ' aria-current="page"' : ''}>${item.label}</a>`).join('');
   const secondaryNav = group.items.map(([id, label]) => `<a href="/__fnos/?view=${id}"${id === view ? ' aria-current="page"' : ''}>${label}</a>`).join('');
+  const headerRestart = `<form id="header-restart-form" method="post" action="/__fnos/action"><input type="hidden" name="csrf" value="${csrf}"><input type="hidden" name="view" value="${view}"><input type="hidden" name="action" value="retry"><button class="restart-icon" type="submit" title="重启 DSH" aria-label="重启 DSH"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 1-2.3-5.7"/><path d="M20 4v5h-5"/></svg></button></form>`;
   const noticeBar = notice ? `<div class="notice ${notice.startsWith('操作失败') ? 'notice-error' : ''}" role="status">${escapeHtml(notice)}</div>` : '';
   const busyScript = nonce ? `<script nonce="${nonce}">
   if (window.parent !== window) window.parent.postMessage({ type: 'dsh-fnos-view', view: 'settings' }, '*');
@@ -126,16 +127,25 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     document.querySelectorAll('button.is-working').forEach((button) => {
       button.classList.remove('is-working');
       button.removeAttribute('aria-busy');
-      button.textContent = button.dataset.originalText || button.textContent;
+      if (button.classList.contains('restart-icon')) button.setAttribute('aria-label', '重启 DSH');
+      else button.textContent = button.dataset.originalText || button.textContent;
     });
   }
   window.addEventListener('pageshow', resetBusy);
   document.addEventListener('submit', (event) => {
     if (!event.target.matches('form[action="/__fnos/action"]')) return;
+    if (event.target.querySelector('input[name="action"]')?.value === 'retry' &&
+        !window.confirm('确定重启 DSH 核心吗？当前会话会暂时断开，未保存的输入可能丢失。')) {
+      event.preventDefault();
+      return;
+    }
     const button = event.submitter || event.target.querySelector('button[type="submit"]');
     if (!button) return;
-    button.dataset.originalText = button.textContent;
-    button.textContent = '处理中…';
+    if (button.classList.contains('restart-icon')) button.setAttribute('aria-label', '正在重启 DSH');
+    else {
+      button.dataset.originalText = button.textContent;
+      button.textContent = '处理中…';
+    }
     button.classList.add('is-working');
     button.setAttribute('aria-busy', 'true');
   });
@@ -146,7 +156,8 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   button.is-working::after{inset:0;padding:2px;background:conic-gradient(from var(--edge-angle),transparent 0deg 190deg,#58bfff33 220deg,#6bceffb3 260deg,#f5fdff 300deg,#8cdeff 325deg,transparent 360deg);animation-duration:1.8s}
   @media(prefers-reduced-motion:reduce){button.is-working::after{background:#84d6ff}}
   .debug-info{display:grid;gap:10px;padding:15px;margin:14px 0;background:#f5f8ff;border:1px solid #dfe8fb;border-radius:10px;overflow-wrap:anywhere}.debug-info code{user-select:all}
-  </style></head><body>${noticeBar}<div class="shell"><header><h1>DeepSeek Harness · 应用设置</h1><span class="state">${status}</span></header><nav class="primary" aria-label="设置分类">${primaryNav}</nav><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div>${busyScript}</body></html>`;
+  header .header-actions{display:flex;align-items:center;gap:8px;flex:none}header .header-actions form{display:block;width:auto;margin:0}button.restart-icon{width:34px;height:34px;min-height:34px;padding:0;border:1px solid #cbd7ef;border-radius:9px;background:#fff;color:#175cd3}button.restart-icon:hover,button.restart-icon:focus-visible{background:#e8f0ff;border-color:#82a9ed}button.restart-icon svg{display:block}.group-description{margin:0;padding:0 2px 10px;color:#667085;font-size:13px}@media(max-width:620px){header{align-items:flex-start}header .header-actions{gap:6px}button.restart-icon{width:34px}header .state{font-size:12px}}
+  </style></head><body>${noticeBar}<div class="shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state">${status}</span>${headerRestart}</div></header><nav class="primary" aria-label="设置分类">${primaryNav}</nav><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div>${busyScript}</body></html>`;
 }
 
 module.exports = { render, selectedView };
