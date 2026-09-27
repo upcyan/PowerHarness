@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eu
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+"$(dirname "$0")/main" stop
+FNOS_APP_DIR="${TRIM_APPDEST}" FNOS_DATA_DIR="${TRIM_PKGVAR}" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
+  node "${TRIM_APPDEST}/upgrade-snapshot.js" >> "${TRIM_PKGVAR}/supervisor.log" 2>&1

@@ -1,0 +1,11 @@
+{
+  "name": "dsh-fnos-runtime",
+  "version": "0.3.9",
+  "private": true,
+  "description": "Bundled fallback DeepSeek Harness core for the fnOS FPK",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.5-rc.3",
+    "pnpm": "10.34.5",
+    "selfsigned": "5.5.0"
+  }
+}

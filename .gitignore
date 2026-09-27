@@ -1,0 +1,9 @@
+dist/
+.npm-cache/
+node_modules/
+.inspect/
+.inspect-cache/
+.workbuddy/
+.env
+.env.*
+*.log

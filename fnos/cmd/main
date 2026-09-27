@@ -1,0 +1,63 @@
+#!/bin/bash
+set -u
+
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+DATA_DIR="${TRIM_PKGVAR}"
+APP_DIR="${TRIM_APPDEST}"
+PID_FILE="$DATA_DIR/supervisor.pid"
+LOG_FILE="$DATA_DIR/supervisor.log"
+STATE_FILE="$DATA_DIR/state.json"
+GUIDE_SOCKET="$APP_DIR/guide.sock"
+
+running() {
+  local pid
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE")"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start_app() {
+  if running; then return 0; fi
+  if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 24 ? 0 : 1)'; then
+    echo "DeepSeek Harness requires the fnOS App Center nodejs_v24 dependency." > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    return 1
+  fi
+  mkdir -p "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  rm -f "$STATE_FILE" "$GUIDE_SOCKET"
+  FNOS_APP_DIR="$APP_DIR" FNOS_DATA_DIR="$DATA_DIR" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
+    GUIDE_SOCKET="$GUIDE_SOCKET" FNOS_PORT="${TRIM_SERVICE_PORT:-3080}" \
+    node "$APP_DIR/supervisor.js" >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$PID_FILE"
+  local i
+  for i in $(seq 1 120); do
+    if [ -f "$STATE_FILE" ] && [ -S "$GUIDE_SOCKET" ]; then return 0; fi
+    if ! running; then break; fi
+    sleep 1
+  done
+  echo "DeepSeek Harness could not start; check supervisor.log." > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  return 1
+}
+
+stop_app() {
+  if running; then
+    local pid i
+    pid="$(cat "$PID_FILE")"
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 45); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE" "$GUIDE_SOCKET"
+}
+
+case "${1:-}" in
+  start) start_app ;;
+  stop) stop_app ;;
+  status) if running; then exit 0; else exit 3; fi ;;
+  *) echo "Unknown command: ${1:-}" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"; exit 1 ;;
+esac

@@ -1,0 +1,7 @@
+{
+  "contract": 1,
+  "version": "0.1.5-rc.3",
+  "bin": "runtime/node_modules/@deepseek-ai/dsh/lib/bin.js",
+  "args": ["web", "--no-open", "--host", "{{host}}", "--port", "{{port}}"],
+  "readyPrefix": "dsh web:"
+}
