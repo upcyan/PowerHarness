@@ -1,2 +1,53 @@
 #!/bin/bash
+# fnOS installs the apps declared in install_dep_apps before this hook runs.
+# If the runtime is still missing or too old anyway (offline install, an
+# outdated app centre), say so where the user can see it — lifecycle-script
+# errors that the user should read go to TRIM_TEMP_LOGFILE — instead of
+# leaving the app to fail later with a bare JavaScript error.
+set -u
+
+# Test hook: when set, ONLY this root is probed (fnOS calls this script
+# without arguments and without the variable, so production always walks the
+# default candidates below).
+probe_root="${DSH_NODE_PROBE_ROOT:-}"
+
+if [ -n "$probe_root" ]; then
+  candidates=("$probe_root/target/bin/node")
+else
+  candidates=(
+    "/var/apps/nodejs_v24/target/bin/node"
+    "/vol1/@appcenter/nodejs_v24/bin/node"
+  )
+fi
+
+node_bin=''
+for candidate in "${candidates[@]}"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    node_bin="$candidate"
+    break
+  fi
+done
+
+report() {
+  echo "$1"
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+    echo "$1" >> "$TRIM_TEMP_LOGFILE" 2>/dev/null || true
+  fi
+}
+
+if [ -z "$node_bin" ]; then
+  report "警告：未检测到 Node.js 运行时（nodejs_v24）。本应用需要它才能运行，请在 fnOS 应用中心安装「Node.js v24」。"
+  exit 0
+fi
+
+version="$("$node_bin" --version 2>/dev/null || echo unknown)"
+major="${version#v}"
+major="${major%%.*}"
+
+if [ "$major" -lt 22 ] 2>/dev/null; then
+  report "警告：Node.js 运行时版本过旧（$version）。本应用需要 v24，旧版本会导致 DSH 无法启动。请在 fnOS 应用中心升级「Node.js v24」。"
+elif [ "$major" -lt 24 ] 2>/dev/null; then
+  report "提示：Node.js 运行时版本为 $version；本应用按 v24 打包，建议在 fnOS 应用中心升级「Node.js v24」。"
+fi
+
 exit 0

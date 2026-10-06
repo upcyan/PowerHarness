@@ -1,27 +1,23 @@
-Add-Type -AssemblyName System.Drawing
-$appRoot = Join-Path $PSScriptRoot '..\fnos'
-$iconRoot = Join-Path $appRoot 'app\ui\images'
-$source = Join-Path $iconRoot 'icon-source.png'
-$image = [System.Drawing.Image]::FromFile($source)
+# Regenerates the fnOS app icons from fnos/app/ui/images/icon-source.png.
+#
+# The icon geometry -- opaque white rounded-square background, the corner radius
+# shared with every other fnOS app, and the mark scale -- is defined in exactly
+# one place: create-icons.py.  This wrapper exists only so the step can be
+# invoked the same way on Windows, where the other packaging scripts are run.
+# It deliberately contains no drawing code of its own, so the two entry points
+# cannot drift apart and silently ship icons that look different from the rest
+# of the fnOS desktop.
+#
+# Requires Python 3 with numpy, the same interpreter already used for
+# scripts/repack-windows.py.
+$ErrorActionPreference = 'Stop'
 
-try {
-    foreach ($size in @(64, 256)) {
-        $bitmap = [System.Drawing.Bitmap]::new($size, $size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-        try {
-            $graphics.Clear([System.Drawing.Color]::Transparent)
-            $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $graphics.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-            $graphics.DrawImage($image, [System.Drawing.Rectangle]::new(0, 0, $size, $size))
-            $bitmap.Save((Join-Path $iconRoot "icon_$size.png"), [System.Drawing.Imaging.ImageFormat]::Png)
-            $name = if ($size -eq 256) { 'ICON_256.PNG' } else { 'ICON.PNG' }
-            $bitmap.Save((Join-Path $appRoot $name), [System.Drawing.Imaging.ImageFormat]::Png)
-        } finally {
-            $graphics.Dispose()
-            $bitmap.Dispose()
-        }
-    }
-} finally {
-    $image.Dispose()
+$script = Join-Path $PSScriptRoot 'create-icons.py'
+if (-not (Test-Path -LiteralPath $script)) {
+    Write-Error "Missing $script"
+    exit 1
 }
+
+$python = if (Get-Command py -ErrorAction SilentlyContinue) { 'py' } else { 'python' }
+& $python $script @args
+exit $LASTEXITCODE

@@ -27,17 +27,33 @@ function installedVersion(directory) {
   return ops.dshVersion(directory);
 }
 
+function adapterError(code, message, directory, version, adapter) {
+  const declared = typeof adapter?.version === 'string' && versionPattern.test(adapter.version) ? adapter.version : 'invalid';
+  const error = new Error(`Unsupported core adapter: [${code}] ${message}（runtime=${version || 'missing'}, adapter=${declared}；文件=${path.join(directory, 'adapter.json')}）`);
+  error.code = code;
+  error.details = { runtimeVersion: version || null, adapterVersion: declared, adapterFile: path.join(directory, 'adapter.json') };
+  return error;
+}
 function adapterFor(directory, corePort = 3081) {
   const version = installedVersion(directory);
-  const adapter = ops.readJson(path.join(directory, 'adapter.json'), { contract: 1, version, readyPrefix: 'dsh web:' });
-  if (adapter.contract !== 1 || adapter.version !== version || typeof adapter.readyPrefix !== 'string' || !adapter.readyPrefix || adapter.readyPrefix.length > 100) throw new Error('Unsupported core adapter');
+  if (!version || !versionPattern.test(version)) throw adapterError('CORE_RUNTIME_INVALID', '核心运行时缺失或版本无法识别', directory, null);
+  let adapter;
+  try { adapter = JSON.parse(fs.readFileSync(path.join(directory, 'adapter.json'), 'utf8')); }
+  catch (error) {
+    const code = error.code === 'ENOENT' ? 'ADAPTER_MISSING' : error instanceof SyntaxError ? 'ADAPTER_JSON_INVALID' : 'ADAPTER_UNREADABLE';
+    throw adapterError(code, '适配声明缺失、损坏或无法读取，请保留现场并核对配套部署', directory, version);
+  }
+  if (!adapter || typeof adapter !== 'object' || Array.isArray(adapter)) throw adapterError('ADAPTER_SHAPE_INVALID', '适配声明必须为对象', directory, version, adapter);
+  if (adapter.contract !== 1) throw adapterError('ADAPTER_CONTRACT_UNSUPPORTED', '不支持当前适配契约，只支持contract=1', directory, version, adapter);
+  if (adapter.version !== version) throw adapterError('ADAPTER_VERSION_MISMATCH', '核心与适配声明版本不一致，启动已阻止；不要仅改版本号强行对齐', directory, version, adapter);
+  if (typeof adapter.readyPrefix !== 'string' || !adapter.readyPrefix || adapter.readyPrefix.length > 100) throw adapterError('ADAPTER_READY_PREFIX_INVALID', '就绪标记无效', directory, version, adapter);
   const relativeBin = adapter.bin || defaultBin;
-  const bin = path.resolve(directory, relativeBin);
-  const base = path.resolve(directory);
-  if (bin === base || !bin.startsWith(base + path.sep) || !relativeBin.replaceAll('\\', '/').startsWith('runtime/')) throw new Error('Invalid core executable path');
+  if (typeof relativeBin !== 'string' || relativeBin.length > 1024) throw adapterError('ADAPTER_BIN_INVALID', '核心入口必须为受限相对路径', directory, version, adapter);
+  const bin = path.resolve(directory, relativeBin), base = path.resolve(directory);
+  if (bin === base || !bin.startsWith(base + path.sep) || !relativeBin.replaceAll('\\', '/').startsWith('runtime/')) throw adapterError('ADAPTER_BIN_INVALID', '核心入口越出runtime目录', directory, version, adapter);
   const args = adapter.args || defaultArgs;
-  if (!Array.isArray(args) || args.length > 20 || args.some((item) => typeof item !== 'string' || item.length > 200)) throw new Error('Invalid core arguments');
-  return { version, bin, args: args.map((item) => item.replaceAll('{{host}}', '127.0.0.1').replaceAll('{{port}}', String(corePort))), readyPrefix: adapter.readyPrefix };
+  if (!Array.isArray(args) || args.length > 20 || args.some(item => typeof item !== 'string' || item.length > 200)) throw adapterError('ADAPTER_ARGS_INVALID', '核心启动参数形状无效', directory, version, adapter);
+  return { version, bin, args: args.map(item => item.replaceAll('{{host}}', '127.0.0.1').replaceAll('{{port}}', String(corePort))), readyPrefix: adapter.readyPrefix };
 }
 
 function validCore(directory, version) {
@@ -50,7 +66,8 @@ function selectedCore(dataDir, appDir) {
   if (!selected) return appDir;
   if (!versionPattern.test(selected.version)) throw new Error('Invalid selected core version');
   const directory = corePath(dataDir, selected.version);
-  if (!validCore(directory, selected.version)) throw new Error(`Selected dsh core ${selected.version} is missing or incompatible`);
+  const adapter = adapterFor(directory);
+  if (adapter.version !== selected.version) throw adapterError('CORE_SELECTION_VERSION_MISMATCH', '核心选择记录与实际安装版本不一致', directory, adapter.version);
   return directory;
 }
 
@@ -71,22 +88,15 @@ function listCores(dataDir) {
 }
 
 async function run(command, args, options) {
-  return new Promise((resolve, reject) => {
-    const output = fs.openSync(options.logFile, 'a', 0o600);
-    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ['ignore', output, output] });
-    activeCommand = child;
-    fs.closeSync(output);
-    const timeout = setTimeout(() => child.kill('SIGTERM'), 10 * 60_000);
-    const finish = () => { clearTimeout(timeout); if (activeCommand === child) activeCommand = null; };
-    child.once('error', (error) => { finish(); reject(error); });
-    child.once('exit', (code, signal) => {
-      finish();
-      code === 0 ? resolve() : reject(new Error(`${path.basename(command)} failed (${code ?? signal}); see core-install.log`));
-    });
-  });
+  const controller = new AbortController();
+  activeCommand = controller;
+  try {
+    return await require('./plugins').runCli(command, args, { ...options, signal: controller.signal,
+      failureMessage: code => `${path.basename(command)} failed (${code}); see core-install.log` });
+  } finally { if (activeCommand === controller) activeCommand = null; }
 }
 
-function cancelInstall() { if (activeCommand) activeCommand.kill('SIGTERM'); }
+function cancelInstall() { activeCommand?.abort(); }
 
 async function installCore(dataDir, appDir, version, registry) {
   if (!versionPattern.test(version)) throw new Error('Invalid dsh version');
@@ -121,7 +131,15 @@ async function installCore(dataDir, appDir, version, registry) {
     fs.renameSync(stage, target);
     return target;
   } catch (error) {
-    fs.rmSync(stage, { recursive: true, force: true });
+    // A rejected lifecycle promise may still own a live child/pipes. Never race
+    // recursive cleanup against that installer; keep its evidence and directory.
+    if (error.code === 'ERR_CLI_UNCONFIRMED' || error.closed === false) {
+      error.stagePreserved = stage;
+      throw error;
+    }
+    const checked = path.resolve(stage);
+    if (path.dirname(checked) !== path.resolve(cores) || !path.basename(checked).startsWith(`.pending-${version}-`)) throw new Error('Refuse unsafe installation cleanup', { cause: error });
+    fs.rmSync(checked, { recursive: true, force: true });
     throw error;
   }
 }

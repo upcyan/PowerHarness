@@ -32,21 +32,26 @@ function write(response, status, value) {
 
 function createNetworkDebug(dataDir, getState, onEvent = () => {}, executeCommand = null) {
   let active = null;
-  let timer = null;
-
-  function stop() {
-    if (!active) return false;
-    const previous = active;
-    active = null;
-    clearTimeout(timer);
-    timer = null;
-    try { previous.server.closeAllConnections(); previous.server.close(); } catch {}
-    onEvent('network_debug_stopped');
-    return true;
+  let generation = 0;
+  const resources = new Set();
+  function closeRecord(record) {
+    record.cancelled = true;
+    clearTimeout(record.timer);
+    record.rejectStart?.(new Error('Diagnostic start cancelled'));
+    record.rejectStart = null;
+    try { record.server.closeAllConnections(); record.server.close(); } catch {}
+    if (active === record) active = null;
   }
-
+  function stop() {
+    generation++;
+    const hadResources = resources.size > 0;
+    for (const record of [...resources]) closeRecord(record);
+    if (hadResources) onEvent('network_debug_stopped');
+    return hadResources;
+  }
   function status() {
-    if (!active || Date.now() >= active.expiresAt) { stop(); return null; }
+    if (!active) return null;
+    if (Date.now() >= active.expiresAt) { closeRecord(active); return null; }
     return { address: active.address, port: active.port, token: active.token, expiresAt: new Date(active.expiresAt).toISOString(), minutes: active.minutes, mode: active.mode };
   }
 
@@ -56,6 +61,7 @@ function createNetworkDebug(dataDir, getState, onEvent = () => {}, executeComman
     const mode = validMode(options.mode);
     if (mode === 'command' && typeof executeCommand !== 'function') throw new Error('指令模式不可用');
     stop();
+    const mine = generation;
     const token = randomBytes(32).toString('base64url');
     const lifetimeMs = minutes * 60_000;
     const expiresAt = Date.now() + lifetimeMs;
@@ -114,25 +120,30 @@ function createNetworkDebug(dataDir, getState, onEvent = () => {}, executeComman
     server.requestTimeout = 5_000;
     server.headersTimeout = 5_000;
     server.keepAliveTimeout = 1_000;
+    const record = { server, address, port: null, token, expiresAt, minutes, mode, busy: false, cancelled: false, timer: null, rejectStart: null };
+    resources.add(record);
+    server.once('close', () => { resources.delete(record); if (active === record) active = null; });
+    server.on('error', error => {
+      const reject = record.rejectStart; record.rejectStart = null; reject?.(error);
+      if (!record.cancelled && mine === generation) onEvent('network_debug_error', { code: String(error.code || 'unknown') });
+      closeRecord(record);
+    });
     try {
       await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, address, () => { server.removeListener('error', reject); resolve(); });
+        record.rejectStart = reject;
+        server.listen(0, address, () => {
+          if (record.cancelled || mine !== generation) { closeRecord(record); reject(new Error('Diagnostic start replaced')); return; }
+          record.rejectStart = null;
+          resolve();
+        });
       });
-    } catch (error) {
-      server.close();
-      throw error;
-    }
+      if (record.cancelled || mine !== generation) throw new Error('Diagnostic start replaced');
+    } catch (error) { closeRecord(record); throw error; }
     const port = server.address().port;
-    active = { server, address, port, token, expiresAt, minutes, mode, busy: false };
-    server.on('error', (error) => {
-      if (active?.server === server) {
-        onEvent('network_debug_error', { code: String(error.code || 'unknown') });
-        stop();
-      }
-    });
-    timer = setTimeout(stop, lifetimeMs);
-    timer.unref();
+    record.port = port;
+    active = record;
+    record.timer = setTimeout(() => closeRecord(record), lifetimeMs);
+    record.timer.unref();
     onEvent('network_debug_started', { port, minutes, mode });
     return status();
   }

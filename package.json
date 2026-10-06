@@ -3,8 +3,12 @@
   "version": "0.3.9",
   "private": true,
   "description": "Bundled fallback DeepSeek Harness core for the fnOS FPK",
+  "overrides": {
+    "fflate": "0.8.3",
+    "http-cache-semantics": "4.3.0"
+  },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.5-rc.3",
+    "@deepseek-ai/dsh": "0.2.0-rc.2",
     "pnpm": "10.34.5",
     "selfsigned": "5.5.0"
   }
