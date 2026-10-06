@@ -15,3 +15,9 @@ node_modules/
 # Python 字节码缓存
 __pycache__/
 *.pyc
+
+# 内部记录与开发测试：保留在本地工作副本，不进公开仓库
+docs/*.md
+!docs/design.md
+!docs/decoupled-runtime.md
+tests/

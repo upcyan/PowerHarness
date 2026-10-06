@@ -54,27 +54,6 @@ Web UI 的命令和文件操作在 NAS 上以应用专用用户身份执行。�
 
 **备份的停止确认与失败收尾（0.3.81）。** 见上文"备份不会在核心未确认停止时复制数据"。
 
-## 随包分发的 AI 上下文
-
-包内带两个面向 AI 助手的文件，使**从已安装的 NAS 上**也能理解本项目并安全地继续开发
-（那里没有仓库、没有 git 历史、没有开发机的会话记忆）：
-
-| 文件 | 位置（安装后） | 内容 |
-|---|---|---|
-| `AI-CONTEXT.md` | `$TRIM_APPDEST/AI-CONTEXT.md` | 架构、关键设计决策及其历史原因、调试说明、开发原则、改动记录规范、**已踩过的坑** |
-| `CHANGELOG-AI.md` | `$TRIM_APPDEST/app/CHANGELOG-AI.md` | 机器可解析的改动记录（改动文件/类型/为什么/做了什么/验证方式/影响面/遗留），最新在最上 |
-
-**改动代码后必须记录**：在 `fnos/app/CHANGELOG-AI.md` 最前面追加一条，字段与格式见
-`fnos/app/AI-CONTEXT.md` 第 6 节。构建脚本会**强制校验**两个文件存在，且 changelog 覆盖本次
-发布的版本号 —— 忘记记录就打不出包。
-
-```bash
-# 推荐的改动流程
-python3 scripts/version.py bump          # 先看下一个版本号
-# → 在 fnos/app/CHANGELOG-AI.md 顶部写记录（用该版本号）
-bash scripts/build-linux.sh --set <该版本号>
-```
-
 ## 构建 FPK
 
 在 Linux x86_64 构建机安装 Node.js 24、npm 和官方 `fnpack`，然后执行：
@@ -99,7 +78,7 @@ FPK 携带一份插件包（`app/plugins-bundled/`），使全新安装即得到
 
 Ubuntu WSL2 x86_64 也可作为构建机。将 Linux 版 Node.js 24 加入 `PATH`，再设置 `FNPACK_BIN` 指向 Linux 版 fnpack 后运行上述脚本。构建后可执行 `bash scripts/smoke-linux.sh [包路径]`，从 FPK 解包并检查 dsh、Linux 原生模块、内置 pnpm 版本及 HTTPS 网关启动。
 
-⚠ **不要在有本应用实例运行的机器上直接跑这个脚本**：脚本会启动一份 supervisor，而 supervisor 会把 `/opt/dsh/home` 指向自己的数据目录——在实机上会**改指生产的 DSH 桥接**，故障会延迟到临时目录被清理时才爆发（参见 `docs/INCIDENT-P23-2026-10-04.md`）。此外脚本固定使用 `3080`，该端口被占用时（例如本机已跑着本应用）会直接失败，请只在专用构建机或隔离环境（独立 mount/网络命名空间）中运行。脚本断言桌面入口页含「应用设置」，与 `handleGuide` 现在渲染的内容一致。WSL 中导入 fnOS 根文件系统不能代替 fnOS 安装验收；应用中心依赖、桌面入口和 NAS 文件授权仍需在 fnOS 虚拟机或实机检查。
+⚠ **不要在有本应用实例运行的机器上直接跑这个脚本**：脚本会启动一份 supervisor，而 supervisor 会把 `/opt/dsh/home` 指向自己的数据目录——在实机上会**改指生产的 DSH 桥接**。临时目录被清理后，生产桥接会变成死链，导致应用进入安全模式。此外脚本固定使用 `3080`，该端口被占用时（例如本机已跑着本应用）会直接失败，请只在专用构建机或隔离环境（独立 mount/网络命名空间）中运行。脚本断言桌面入口页含「应用设置」，与 `handleGuide` 现在渲染的内容一致。WSL 中导入 fnOS 根文件系统不能代替 fnOS 安装验收；应用中心依赖、桌面入口和 NAS 文件授权仍需在 fnOS 虚拟机或实机检查。
 
 依赖未变化时可在 Windows 上直接重打包：`python scripts/repack-windows.py [--bump patch|minor|major]` 复用参考 FPK（默认 `dist/dsh-fnos.fpk`）中已打好补丁的 Linux runtime，仅从 `fnos/` 重建应用层。脚本会核对 `package.json`、`package-lock.json` 与 `patch-dsh.mjs` 是否与参考 runtime 一致，不一致时报错并要求完整 Linux 构建。此路径不使用 fnpack：FPK 结构（外层 tar.gz 含 `app.tgz`，manifest 追加 `checksum = MD5(app.tgz)`，键对齐 27 列）已逐字节比对官方 fnpack 1.2.3 输出核对。首次构建或依赖更新仍需 Linux/WSL 构建机，因为 runtime 含 linux-x64 预编译原生模块。
 
