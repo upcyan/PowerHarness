@@ -98,6 +98,14 @@ python3 "$version_py" set "$target_version" --manifest "$stage/manifest" >/dev/n
 for required in app/AI-CONTEXT.md app/CHANGELOG-AI.md; do
   [[ -s "$stage/$required" ]] || { echo "required AI context file missing or empty: fnos/$required" >&2; exit 1; }
 done
+# These working notes name companion repositories (some private) and quote
+# build-machine paths. Generalize the staged copies: the working copy keeps the
+# precise names, the shipped copy does not. Only staged files are touched.
+python3 "$root/scripts/sanitize-ai-context.py" \
+  "$stage/app/AI-CONTEXT.md" "$stage/app/CHANGELOG-AI.md"
+python3 "$root/scripts/sanitize-ai-context.py" --check \
+  "$stage/app/AI-CONTEXT.md" "$stage/app/CHANGELOG-AI.md" \
+  || { echo "AI context files still carry private identifiers after sanitizing" >&2; exit 1; }
 # The changelog must mention the version being shipped, or the record is stale.
 grep -q "^## \[$target_version\]" "$stage/app/CHANGELOG-AI.md" \
   || { echo "CHANGELOG-AI.md has no entry for version $target_version" >&2; exit 1; }

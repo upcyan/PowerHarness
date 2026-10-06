@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ── 隔离硬闸门 ──────────────────────────────────────────────────────────────
+# 本脚本 spawn 真正的 supervisor，而 supervisor 的 resolveDshHomePath() 会把
+# `/opt/dsh/home` 指向它自己的 dataDir。dataDir 是 mktemp 建的临时目录 ⇒
+# 在生产环境直接跑本脚本，会把**生产桥接改指到 /tmp**：
+#   · 当下服务照常（链接目标可达），故障延迟到 /tmp 被清理时才爆发；
+#   · 之后核心每次 mkdir/open 都 ENOENT（表现像核心坏了，实为死链）。
+#
+# 这不是假设，而是第二次发生：
+#   · 2026-10-03 `node --test tests/*.cjs` 通配符跑到 supervisor.test.cjs
+#     → 桥接改指 /tmp/dsh-fnos-heal-XXX → 数小时后进 safe mode（见 INCIDENT-P23）。
+#   · 2026-10-07 本脚本被直接运行 → 桥接改指 /tmp/dsh-fnos-smoke.XXX →
+#     /tmp 清理后死链，生产核心所有写入 ENOENT（见 P27）。
+#
+# supervisor.test.cjs 的整改结论是"不能指望调用者记得先读文档"，于是它自己
+# 检查隔离状态。本脚本照做：没有测试专用的 /opt/dsh 绑定、或生产挂载仍可写，
+# 就**拒绝运行**（退出码 2），而不是把风险留给下一次 /tmp 清理。
+require_isolation() {
+  local mounts
+  mounts="$(cat /proc/self/mountinfo)"
+  # 测试夹具会把一个私有目录 bind 到 /opt/dsh，同时把仓库、appdata、appcenter
+  # 与 /opt 挂成只读。五者缺一都不算隔离。
+  if ! grep -qE ' /opt/dsh( |$)' <<<"$mounts"; then
+    echo "拒绝运行：/opt/dsh 没有测试专用绑定 —— 直接运行会把生产桥接改指到临时目录。" >&2
+    echo "  请改用：python3 pwtest/powerharness/supervisor-integration-isolated.py --suite smoke" >&2
+    exit 2
+  fi
+  local dir
+  # 注意路径要与隔离夹具实际挂载的一致：被只读挂载的是本脚本所在的仓库根
+  # （$root = …/fnos/PowerHarness），不是它的父目录。
+  for dir in "$root" "/vol1/@appdata/dsh-fnos" "/vol1/@appcenter/dsh-fnos" "/opt"; do
+    # mountinfo 第 6 个字段是挂载选项；只读挂载含 "ro"。
+    if ! awk -v t="$dir" '$5==t {print $6}' <<<"$mounts" | grep -q 'ro'; then
+      echo "拒绝运行：$dir 不是只读挂载 —— 隔离不完整，可能误写生产数据。" >&2
+      echo "  请改用：python3 pwtest/powerharness/supervisor-integration-isolated.py --suite smoke" >&2
+      exit 2
+    fi
+  done
+}
+
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 package="${1:-$root/dist/dsh-fnos.fpk}"
 stage="$(mktemp -d "${TMPDIR:-/tmp}/dsh-fnos-smoke.XXXXXXXX")"
@@ -13,6 +52,8 @@ cleanup() {
   rm -rf -- "$stage"
 }
 trap cleanup EXIT
+
+require_isolation
 
 mkdir -p "$stage/app" "$stage/data" "$stage/etc"
 tar -xOf "$package" app.tgz | tar -xzf - -C "$stage/app"
@@ -61,7 +102,19 @@ for ((i=0; i<100; i++)); do
           -c "$stage/remote-cookies" -b "$stage/remote-cookies" \
           -D "$stage/remote-flow.headers" -o "$stage/remote-page.html" "http://localhost$remote_ticket"
         grep -q '<base href="/app/dsh-fnos/dsh/">' "$stage/remote-page.html" || { cat "$stage/remote-flow.headers" "$stage/remote-page.html"; exit 1; }
-        grep -q '__FNOS_GATEWAY_PREFIX__' "$stage/remote-page.html" || { cat "$stage/remote-page.html"; exit 1; }
+        # `__FNOS_GATEWAY_PREFIX__` lives inside plugin-url-compat.js, which the
+        # page pulls in as an *external* script — the HTML can only assert the
+        # reference. The prefix logic itself has to be checked in the served
+        # script, which also proves the route is reachable (it is denied by
+        # default for non-allowlisted plugin paths).
+        grep -q 'src="/app/dsh-fnos/dsh/__fnos-plugin-url-compat\.js"' "$stage/remote-page.html" \
+          || { cat "$stage/remote-page.html"; exit 1; }
+        compat_status="$(curl --silent --show-error --unix-socket "$stage/app/guide.sock" \
+          -H 'Host: remote.fnnas.example' -H 'X-Trim-IsAdmin: true' \
+          -b "$stage/remote-cookies" -o "$stage/compat.js" -w '%{http_code}' \
+          "http://localhost/app/dsh-fnos/dsh/__fnos-plugin-url-compat.js")"
+        [[ "$compat_status" == 200 ]] || { cat "$stage/remote-flow.headers"; exit 1; }
+        grep -q '__FNOS_GATEWAY_PREFIX__' "$stage/compat.js" || { cat "$stage/compat.js"; exit 1; }
         asset="$(sed -n 's/.*src="\.\/\(assets\/[^\"]*\.js\)".*/\1/p' "$stage/remote-page.html" | head -n 1)"
         [[ -n "$asset" ]] || { cat "$stage/remote-page.html"; exit 1; }
         asset_status="$(curl --silent --show-error --unix-socket "$stage/app/guide.sock" \

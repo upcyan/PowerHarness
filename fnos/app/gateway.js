@@ -1128,7 +1128,11 @@ function proxyGuideDsh(request, response) {
       reply.on('data', (chunk) => { body += chunk; if (body.length > 2 * 1024 * 1024) reply.destroy(new Error('DSH page too large')); });
       reply.on('end', () => {
         if (response.destroyed || response.writableEnded) return;
-        body = body.replace(/<base\s+href="\/"\s*\/?\s*>/i, `<base href="${gatewayDshPrefix}/">`)
+        // The core injects a *document-relative* base (`<base href="./">`); an
+        // older one emitted the root form (`<base href="/">`). Match both and
+        // pin the prefix explicitly: relying on `./` resolving against the
+        // document URL only works while that URL keeps its trailing slash.
+        body = body.replace(/<base\s+href="(?:\.\/|\/)"\s*\/?\s*>/i, `<base href="${gatewayDshPrefix}/">`)
           .replace(/\b(src|href|action|poster)=(['"])(\/(?!\/|app\/|_fnos\/|__fnos\/)[^'"]*)\2/gi,
             (_match, attribute, quote, url) => {
               const pathname = new URL(url, 'http://fnos.invalid').pathname;
