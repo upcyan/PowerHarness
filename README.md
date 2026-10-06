@@ -8,12 +8,6 @@
 
 ![桌面端主界面](docs/images/dsh-main-pc.png)
 
-移动端（手机飞牛 App / 主机名入口，走 fnOS 已认证的同源应用路径）：
-
-<img src="docs/images/dsh-main-mobile.png" alt="移动端主界面" width="320">
-
-> 两张图都由**真实 DSH 核心**在空数据目录中渲染后截取，未连接任何真实会话、凭据或 NAS 目录；示意图不含个人信息。
-
 ## 下载与安装
 
 安装包发布在 [Releases](https://github.com/upcyan/PowerHarness/releases) 页面，每个版本附带 `dsh-fnos-<版本>.fpk` 与同目录的 `release-proof.json`（该版本的 SHA-256、打包后的源文件哈希和依赖版本）。
