@@ -10,12 +10,14 @@
 
 ## 下载与安装
 
-安装包发布在 [Releases](https://github.com/upcyan/PowerHarness/releases) 页面，每个版本附带 `dsh-fnos-<版本>.fpk` 与同目录的 `release-proof.json`（该版本的 SHA-256、打包后的源文件哈希和依赖版本）。
+安装包发布在 [Releases](https://github.com/upcyan/PowerHarness/releases) 页面，每个版本附一个 `dsh-fnos-<版本>.fpk`。**请选标有 Latest 的最新版本**；release 正文里有该版本的 SHA-256，下载后核对：
 
 ```sh
-# 校验下载的包与发布记录一致（把 <版本> 换成实际版本号）
+# 把 <版本> 换成实际版本号，哈希以该 release 正文为准
 sha256sum dsh-fnos-<版本>.fpk
 ```
+
+> ℹ️ **`v0.3.82` 的安装包已撤下**（包内随附的 AI 工作记录未脱敏，点名了私有同伴仓库与本机构建路径）。该 release 正文已指向替代版本。请使用 [0.3.84](https://github.com/upcyan/PowerHarness/releases/tag/v0.3.84) 或更新版本 —— `0.3.84` 是 `0.3.82` 的超集，含其全部修复，且随包记录在打包时完成泛化。
 
 安装步骤：
 
