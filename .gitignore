@@ -21,3 +21,8 @@ docs/*.md
 !docs/design.md
 !docs/decoupled-runtime.md
 tests/
+
+# 给 AI 助手读的工作记录（含私有仓库名与内部版本矩阵）：
+# 仍然随 FPK 分发给已安装的 NAS，但不进公开仓库
+fnos/app/AI-CONTEXT.md
+fnos/app/CHANGELOG-AI.md
