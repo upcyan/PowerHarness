@@ -131,7 +131,7 @@ def sanitize_text(data: bytes, name: str) -> bytes:
     """Generalize local-machine paths inside bundled text files.
 
     Self-authored plugins keep development notes in their README/docs with the
-    build machine's absolute paths (`/vol1/1000/deepseek_harness/...`,
+    build machine's absolute paths (a per-user workspace under `/vol1/<uid>/…`,
     `/vol1/@appdata/dsh-fnos/...`) and LAN addresses. None of that belongs in a
     package handed to other fnOS clients: it leaks the local layout, and the
     examples cannot work on another machine anyway. Only doc-ish text files are
@@ -146,8 +146,10 @@ def sanitize_text(data: bytes, name: str) -> bytes:
     except UnicodeDecodeError:
         return data
     replacements = (
-        # absolute paths anchored at well-known local roots → placeholder
-        (re.compile(r"/vol1/1000/deepseek_harness/[^\s`\"')\]]*"), "<local-workspace>"),
+        # absolute paths anchored at well-known local roots → placeholder.
+        # The per-user root is matched generically (`/vol1/<uid>/…`) so this
+        # sanitizer never has to spell out one machine's directory layout.
+        (re.compile(r"/vol1/\d+/[^\s`\"')\]]*"), "<local-workspace>"),
         (re.compile(r"/vol1/@appdata/[^\s`\"')\]]*"), "<local-appdata>"),
         (re.compile(r"/vol1/@appcenter/[^\s`\"')\]]*"), "<local-appcenter>"),
         (re.compile(r"/mnt/[^\s`\"')\]]*"), "<local-mount>"),
