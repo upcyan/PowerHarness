@@ -68,6 +68,14 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 cp -a "$root/fnos/." "$stage/"
+# Local source backups must never ship: they carry stale copies of app code
+# (including pre-fix versions of supervisor.js/gateway.js) in the installed
+# tree, where they are dead weight at best and a supply of outdated copies at
+# worst. Remove them from the stage instead of relying on the repo .gitignore,
+# which cannot affect what `cp` copies.
+find "$stage" -type f -name '*.bak' -delete
+find "$stage" -type f -name '*.bak-*' -delete
+find "$stage" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage/cmd/"*
