@@ -5,7 +5,8 @@
   "description": "Bundled fallback DeepSeek Harness core for the fnOS FPK",
   "overrides": {
     "fflate": "0.8.3",
-    "http-cache-semantics": "4.3.0"
+    "http-cache-semantics": "4.3.0",
+    "@modelcontextprotocol/client": "2.2.0"
   },
   "dependencies": {
     "@deepseek-ai/dsh": "0.2.0-rc.2",

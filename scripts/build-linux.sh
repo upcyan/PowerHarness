@@ -45,6 +45,7 @@ command -v npm >/dev/null || { echo "npm is required." >&2; exit 1; }
 command -v node >/dev/null || { echo "Node.js 24 is required." >&2; exit 1; }
 [[ "$(node -p 'process.versions.node.split(".")[0]')" == 24 ]] || { echo "Node.js 24 is required." >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
+command -v cc >/dev/null || { echo "A C compiler with static libc is required for the CLI subreaper." >&2; exit 1; }
 
 version_py="$root/scripts/version.py"
 current_version="$(python3 "$version_py" show)"
@@ -79,6 +80,9 @@ find "$stage" -type d -name '__pycache__' -prune -exec rm -rf -- {} +
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f -exec chmod 0644 {} +
 chmod 0755 "$stage/cmd/"*
+# Always rebuild the native child-subreaper; never ship a stale local binary.
+# Static libc avoids introducing a build-host glibc version dependency on NAS.
+bash "$root/scripts/build-cli-supervisor.sh" "$stage/app"
 mkdir -p "$stage/app/runtime"
 cp "$root/package.json" "$root/package-lock.json" "$stage/app/runtime/"
 cp "$root/scripts/patch-dsh.mjs" "$stage/app/patch-dsh.mjs"
@@ -124,6 +128,11 @@ else
 fi
 
 npm ci --omit=dev --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
+# npm ci only warns about advisories: it is NOT a release security gate.
+# Network errors, vulnerabilities or SDK contract failures abort before fnpack,
+# preserving the prior artifact and manifest instead of emitting an unsafe FPK.
+npm audit --omit=dev --audit-level=low --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
+node "$root/scripts/verify-mcp-runtime.mjs" "$stage/app/runtime"
 node "$root/scripts/patch-dsh.mjs" "$stage/app/runtime"
 # Generate from the installed staged runtime, never copy a stale source declaration.
 node "$root/scripts/generate-adapter.cjs" "$stage/app"

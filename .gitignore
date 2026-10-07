@@ -1,4 +1,7 @@
 dist/
+# Rebuilt from fnos/native/cli-supervisor.c for Linux candidates.
+fnos/app/cli-supervisor
+fnos/app/cli-supervisor.json
 .npm-cache/
 node_modules/
 .inspect/

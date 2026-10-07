@@ -15,6 +15,7 @@ FPK layout produced (verified against an fnpack 1.2.3 build):
 import argparse
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -86,6 +87,22 @@ def build_app_tgz(ref, app_dir, patch_script, out_path, extra_dirs=None):
     if "runtime" not in old_names:
         die("reference FPK has no app/runtime; a full Linux build is required")
 
+    # Native reaper is part of the application contract, not a host-generated
+    # executable. Reuse only the reference binary whose source+binary hashes
+    # match; a native change requires a real Linux build. Never copy a Windows
+    # executable or a stale local helper under its Linux name.
+    native_names = {'cli-supervisor', 'cli-supervisor.json'}
+    if not native_names <= old_names:
+        die('reference lacks CLI containment helper; full Linux rebuild required')
+    native_meta = json.load(src.extractfile('cli-supervisor.json'))
+    with open(os.path.join(ROOT, 'fnos', 'native', 'cli-supervisor.c'), 'rb') as f:
+        native_source_hash = hashlib.sha256(f.read()).hexdigest()
+    native_binary = src.extractfile('cli-supervisor').read()
+    if (native_meta.get('protocol') != 1 or native_meta.get('sourceSha256') != native_source_hash
+            or native_meta.get('binarySha256') != hashlib.sha256(native_binary).hexdigest()
+            or not native_binary.startswith(b'\x7fELF') or not src.getmember('cli-supervisor').mode & 0o111):
+        die('CLI containment source/binary differs from reference; full Linux rebuild required')
+
     # guards: runtime must match current lockfile and patch script
     for name, repo in (
         ("runtime/package.json", os.path.join(ROOT, "package.json")),
@@ -113,17 +130,17 @@ def build_app_tgz(ref, app_dir, patch_script, out_path, extra_dirs=None):
 
     with tarfile.open(out_path, "w:gz", compresslevel=9) as out:
         for m in members:
-            if m.name == "runtime" or m.name.startswith("runtime/"):
+            if m.name in native_names or m.name == "runtime" or m.name.startswith("runtime/"):
                 out.addfile(m, src.extractfile(m) if m.isfile() else None)
             elif m.name == "patch-dsh.mjs":
-                out.addfile(fresh_member(m.name, patch_script),
-                            open(patch_script, "rb"))
+                with open(patch_script, "rb") as payload:
+                    out.addfile(fresh_member(m.name, patch_script), payload)
             elif m.name == "legacy-compat.js":
-                out.addfile(fresh_member(m.name, compat_repo),
-                            open(compat_repo, "rb"))
+                with open(compat_repo, "rb") as payload:
+                    out.addfile(fresh_member(m.name, compat_repo), payload)
             elif m.isfile() and m.name in src_files:
-                out.addfile(fresh_member(m.name, src_files[m.name]),
-                            open(src_files[m.name], "rb"))
+                with open(src_files[m.name], "rb") as payload:
+                    out.addfile(fresh_member(m.name, src_files[m.name]), payload)
             elif m.isdir() and m.name in src_dirs:
                 dm = tarfile.TarInfo(m.name)
                 dm.type = tarfile.DIRTYPE
@@ -138,8 +155,8 @@ def build_app_tgz(ref, app_dir, patch_script, out_path, extra_dirs=None):
             parent = os.path.dirname(name)
             if parent and parent not in old_names and parent not in src_dirs:
                 continue  # unreachable in practice
-            out.addfile(fresh_member(name, src_files[name]),
-                        open(src_files[name], "rb"))
+            with open(src_files[name], "rb") as payload:
+                out.addfile(fresh_member(name, src_files[name]), payload)
     src.close()
 
 
@@ -265,6 +282,48 @@ def bundle_plugins(out_dir, source):
     return out_dir
 
 
+def audit_reference_runtime(ref_app, directory):
+    """Re-audit the exact reused lock before emitting an FPK; no installed runtime mutation."""
+    os.makedirs(directory, exist_ok=False)
+    wanted = {'runtime/package.json', 'runtime/package-lock.json',
+              'runtime/node_modules/@modelcontextprotocol/client/package.json'}
+    found = {}
+    with tarfile.open(ref_app, 'r|gz') as archive:
+        for member in archive:
+            name = member.name.removeprefix('./')
+            if name in wanted:
+                if not member.isfile() or name in found:
+                    die('invalid reference runtime audit member')
+                found[name] = archive.extractfile(member).read()
+    if set(found) != wanted:
+        die('reference lacks patched MCP metadata; full Linux rebuild required')
+    lock = json.loads(found['runtime/package-lock.json'])
+    clients = [value for key, value in lock['packages'].items()
+               if key.endswith('node_modules/@modelcontextprotocol/client')]
+    if (not clients or any(value['version'] != '2.2.0' for value in clients)
+            or json.loads(found['runtime/node_modules/@modelcontextprotocol/client/package.json'])['version'] != '2.2.0'):
+        die('reference MCP client is not patched 2.2.0; full Linux rebuild required')
+    for name in ['package.json', 'package-lock.json']:
+        with open(os.path.join(directory, name), 'wb') as output:
+            output.write(found['runtime/' + name])
+    npm = shutil.which('npm')
+    if not npm:
+        die('npm is required for the pre-pack security audit')
+    home = os.path.join(directory, 'home'); os.makedirs(home)
+    configs = [os.path.join(home, name) for name in ['npm-user.conf', 'npm-global.conf']]
+    for config in configs:
+        with open(config, 'w') as output: output.write('')
+    env = {'PATH': os.environ.get('PATH', ''), 'HOME': home,
+           'NPM_CONFIG_USERCONFIG': configs[0], 'NPM_CONFIG_GLOBALCONFIG': configs[1]}
+    if os.name == 'nt':
+        for name in ['SystemRoot', 'COMSPEC', 'TEMP', 'TMP']:
+            if name in os.environ: env[name] = os.environ[name]
+    completed = subprocess.run([npm, 'audit', '--omit=dev', '--audit-level=low', '--prefix', directory,
+                                '--cache', os.path.join(directory, 'cache')], env=env, shell=os.name == 'nt')
+    if completed.returncode:
+        die('runtime security audit failed; no FPK is generated')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reference", default=os.path.join(ROOT, "dist", "dsh-fnos.fpk"))
@@ -291,6 +350,7 @@ def main():
         extra = {"plugins-bundled": bundled_dir} if bundled_dir else None
         build_app_tgz(ref_app, os.path.join(fnos, "app"), patch,
                       os.path.join(td, "new-app.tgz"), extra_dirs=extra)
+        audit_reference_runtime(ref_app, os.path.join(td, 'prepack-audit'))
         digest = build_fpk(os.path.join(td, "new-app.tgz"), fnos, args.out,
                            version=target_version)
 

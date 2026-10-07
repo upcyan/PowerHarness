@@ -17,7 +17,7 @@
 sha256sum dsh-fnos-<版本>.fpk
 ```
 
-> ℹ️ **`v0.3.82` 的安装包已撤下**（包内随附的 AI 工作记录未脱敏，点名了私有同伴仓库与本机构建路径）。该 release 正文已指向替代版本。请使用 [0.3.84](https://github.com/upcyan/PowerHarness/releases/tag/v0.3.84) 或更新版本 —— `0.3.84` 是 `0.3.82` 的超集，含其全部修复，且随包记录在打包时完成泛化。
+> 请使用 [0.3.86](https://github.com/upcyan/PowerHarness/releases/tag/v0.3.86) 或更新版本。旧版 `0.3.84`、`0.3.85` 的 MCP 依赖存在已知 OAuth 凭据校验漏洞，不建议安装。
 
 安装步骤：
 
@@ -80,9 +80,9 @@ Web UI 的命令和文件操作在 NAS 上以应用专用用户身份执行。�
 
 ## 近期加固与已知边界
 
-以下三项是 0.3.79–0.3.81 的重点加固，细节与验证记录见 `docs/` 下对应文档。
+以下三项是 0.3.79–0.3.85 的重点加固，细节与验证记录见 `docs/` 下对应文档。
 
-**插件安装/卸载进程的收尾（0.3.79）。** 管理命令通过 DSH 官方 CLI（内部为 pnpm）执行，应用会让它在 Linux 上拥有独立的进程组。只有在核对过进程身份（启动时间、进程组、会话、非僵尸状态）后才向该组发送 TERM/KILL，且永不向生产过程或其他插件的进程组发信号；PID 0/1 及无效 PID 一律不发组信号（负数会导致广播）。子进程关闭事件不再等同于"整个进程树已停止"：进程组仍存活、权限不可读或 `/proc` 扫描不完整时会判为**未确认**，保留操作记录并阻止对同一目录的重试，同时把插件安装标记为需要人工确认。租约数量有上限，反复更换工作目录不会无限累积。**已知边界**：主动 `setsid`/`detach` 逃逸的后代不在覆盖范围内；`/proc` 检查与发送信号之间不是原子操作，因此不宣称彻底解决内核 PID 复用竞态。
+**插件安装/卸载进程的收尾（0.3.85）。** Linux 管理命令由随包的独立 subreaper 助手执行，保持原命令参数、工作目录、环境和用户身份。命令结束后，它也会接管并清理主动 `setsid`/`detach` 的后代，直到内核 `waitpid` 确认已无子进程，再经 CLI 无法继承的专用管道发送完成回执。取消先请求 TERM，宽限后请求助手强杀并回收自己的子进程，而不是杀掉助手后猜测整树已停；管理进程死亡时助手也会主动清理。助手缺失或不可执行时明确拒绝运行，不降级为无保护启动。无有效回执、助手意外退出、权限不明或清理超时时均判为**未确认**，保留有限操作租约、阻止同目录重试及并发备份。未知状态不会被一次无害组查询清除。助手只信号自己的未回收子进程，不枚举或杀宿主全部进程；此机制不是恶意程序安全沙箱，也不涵盖通过外部守护进程代执行的工作。D 状态或不可终止的后代仍可能让操作保守保持 UNKNOWN。非 Linux 保留原直接子进程行为。
 
 **插件禁用意图与失败恢复（0.3.80）。** 见上文"禁用和启用插件"与"卸载"两段。
 
@@ -90,13 +90,15 @@ Web UI 的命令和文件操作在 NAS 上以应用专用用户身份执行。�
 
 ## 构建 FPK
 
-在 Linux x86_64 构建机安装 Node.js 24、npm 和官方 `fnpack`，然后执行：
+在 Linux x86_64 构建机安装 Node.js 24、npm、Python 3、支持静态 libc 的 C 编译器和官方 `fnpack`，然后执行：
 
 ```sh
 bash scripts/build-linux.sh                 # 用 fnos/manifest 里的版本原样打包
 bash scripts/build-linux.sh --bump patch    # 打包前把版本自增（patch|minor|major）
 bash scripts/build-linux.sh --set 1.0.0     # 指定版本
 ```
+
+**先通过安全与兼容性检查，再生成 FPK。** Linux 构建在调用 `fnpack` 前强制执行运行时依赖审计（所有等级）与实际 MCP 客户端/DSH 桥接 ABI、OAuth issuer 拒绝/正常授权检查；漏洞、审计网络故障或兼容检查失败立即退出，不生成新 FPK、不推进 manifest。Windows 重打包也重新审计参考包的实际锁文件，并拒绝复用未修复的 MCP 客户端。不能用 `npm ci` 的审计警告或旧包曾通过代替这些门禁。
 
 **版本必须自增，否则 fnOS 会认为不是更新。** 版本只在**打包成功后**才写回 `fnos/manifest`：暂存副本先盖上目标版本（`fnpack` 从那里读取），失败或中断的构建不会推进已记录的版本。两条构建路径（`build-linux.sh` 与 `repack-windows.py --bump`）共用 `scripts/version.py`，不再各写一份自增逻辑——两套实现不一致，正是打包出「应用商店已有版本」的原因。`version.py show|bump|set` 也可单独使用。
 
@@ -114,7 +116,7 @@ Ubuntu WSL2 x86_64 也可作为构建机。将 Linux 版 Node.js 24 加入 `PATH
 
 ⚠ **不要在有本应用实例运行的机器上直接跑这个脚本**：脚本会启动一份 supervisor，而 supervisor 会把 `/opt/dsh/home` 指向自己的数据目录——在实机上会**改指生产的 DSH 桥接**。临时目录被清理后，生产桥接会变成死链，导致应用进入安全模式。此外脚本固定使用 `3080`，该端口被占用时（例如本机已跑着本应用）会直接失败，请只在专用构建机或隔离环境（独立 mount/网络命名空间）中运行。脚本断言桌面入口页含「应用设置」，与 `handleGuide` 现在渲染的内容一致。WSL 中导入 fnOS 根文件系统不能代替 fnOS 安装验收；应用中心依赖、桌面入口和 NAS 文件授权仍需在 fnOS 虚拟机或实机检查。
 
-依赖未变化时可在 Windows 上直接重打包：`python scripts/repack-windows.py [--bump patch|minor|major]` 复用参考 FPK（默认 `dist/dsh-fnos.fpk`）中已打好补丁的 Linux runtime，仅从 `fnos/` 重建应用层。脚本会核对 `package.json`、`package-lock.json` 与 `patch-dsh.mjs` 是否与参考 runtime 一致，不一致时报错并要求完整 Linux 构建。此路径不使用 fnpack：FPK 结构（外层 tar.gz 含 `app.tgz`，manifest 追加 `checksum = MD5(app.tgz)`，键对齐 27 列）已逐字节比对官方 fnpack 1.2.3 输出核对。首次构建或依赖更新仍需 Linux/WSL 构建机，因为 runtime 含 linux-x64 预编译原生模块。
+运行时依赖及原生 CLI 助手源码均未变化时可在 Windows 上直接重打包（助手只复用已校验源码/二进制哈希的 Linux 参考包；缺助手或源码变化必须完整 Linux 构建）：`python scripts/repack-windows.py [--bump patch|minor|major]` 复用参考 FPK（默认 `dist/dsh-fnos.fpk`）中已打好补丁的 Linux runtime，仅从 `fnos/` 重建应用层。脚本会核对 `package.json`、`package-lock.json` 与 `patch-dsh.mjs` 是否与参考 runtime 一致，不一致时报错并要求完整 Linux 构建。此路径不使用 fnpack：FPK 结构（外层 tar.gz 含 `app.tgz`，manifest 追加 `checksum = MD5(app.tgz)`，键对齐 27 列）已逐字节比对官方 fnpack 1.2.3 输出核对。首次构建或依赖更新仍需 Linux/WSL 构建机，因为 runtime 含 linux-x64 预编译原生模块。
 
 应用图标（`fnos/ICON.PNG`、`fnos/ICON_256.PNG`，以及应用内引用的 `fnos/app/ui/images/icon_{64,256}.png`）由 `scripts/create-icons.py` 从 `fnos/app/ui/images/icon-source.png` 生成，需要 Python 3 和 numpy。图标是铺满画布的**白色不透明圆角方块**，圆角半径取边长的 `0.2518`——该常数实测自 fnOS 自带图标（`/usr/trim/www/static/app/icons/` 的 224/272/112 px 三族一致）与第三方 FPK 图标，飞牛不会自行裁剪应用图标，因此圆角必须烘焙进 alpha 通道。**改动图标素材或该脚本后必须重新生成，否则会退回旧的透明底字形样式。** Windows 下用 `scripts/create-icons.ps1`（转发到同一个 Python 脚本，不重复实现绘制逻辑）。
 

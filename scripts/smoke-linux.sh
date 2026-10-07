@@ -41,22 +41,39 @@ require_isolation() {
 }
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-package="${1:-$root/dist/dsh-fnos.fpk}"
+app_tree=''
+if [[ "${1:-}" == --app-tree ]]; then
+  [[ $# -eq 2 && -d "$2/runtime" ]] || { echo "--app-tree requires one installed candidate app directory" >&2; exit 2; }
+  app_tree="$(realpath -- "$2")"
+  package=''
+else
+  package="${1:-$root/dist/dsh-fnos.fpk}"
+fi
 stage="$(mktemp -d "${TMPDIR:-/tmp}/dsh-fnos-smoke.XXXXXXXX")"
+stage="$(realpath -- "$stage")"
+stage_parent="$(realpath -- "${TMPDIR:-/tmp}")"
 pid=''
 cleanup() {
   if [[ -n "$pid" ]]; then
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
-  rm -rf -- "$stage"
+  local resolved
+  resolved="$(realpath -m -- "${stage:?}")" || return 1
+  [[ "$resolved" == "$stage_parent"/dsh-fnos-smoke.* && "$resolved" != "$stage_parent" ]] || { echo "refusing unsafe smoke cleanup" >&2; return 1; }
+  rm -rf -- "$resolved"
 }
 trap cleanup EXIT
 
 require_isolation
 
 mkdir -p "$stage/app" "$stage/data" "$stage/etc"
-tar -xOf "$package" app.tgz | tar -xzf - -C "$stage/app"
+if [[ -n "$app_tree" ]]; then
+  # Validate the exact staged dependency tree before creating any FPK.
+  cp -a "$app_tree/." "$stage/app/"
+else
+  tar -xOf "$package" app.tgz | tar -xzf - -C "$stage/app"
+fi
 cd "$stage/app/runtime"
 node -e 'const {createRequire}=require("node:module"); const r=createRequire(process.cwd()+"/node_modules/@deepseek-ai/dsh/package.json"); for(const name of ["node-pty", "koffi", "sharp"]) { r(name); console.log(`${name}: OK`) }'
 pnpm_bin="$stage/app/runtime/node_modules/.bin/pnpm"
@@ -66,6 +83,24 @@ pnpm_version="$("$pnpm_bin" --version)"
 pnpm_store="$(PNPM_HOME="$stage/data/pnpm-home" npm_config_store_dir="$stage/data/pnpm-store" "$pnpm_bin" store path)"
 [[ "$pnpm_store" == "$stage/data/pnpm-store"* ]] || { echo "pnpm store escaped application data: $pnpm_store" >&2; exit 1; }
 echo "private pnpm $pnpm_version: OK"
+
+# Execute the actual packaged adapter/helper, not the development-tree binary.
+node - "$stage/app" "$stage/data" <<'JS'
+const assert = require('node:assert/strict'), path = require('node:path');
+const [app, data] = process.argv.slice(2);
+const plugins = require(path.join(app, 'plugins.js'));
+const code = 'console.log(JSON.stringify({uid:process.getuid(),gid:process.getgid(),groups:process.getgroups().sort((a,b)=>a-b),cwd:process.cwd(),marker:process.env.FNOS_SMOKE_CLI,args:process.argv.slice(1)}))';
+(async () => {
+  const result = await plugins.runCli(process.execPath, ['-e', code, '--', 'literal with spaces'], {
+    cwd: data, env: {...process.env, DSH_HOME:path.join(data,'dsh-home'), FNOS_SMOKE_CLI:'isolated'},
+    logFile:path.join(data,'cli-smoke.log'), timeoutMs:3000,
+  });
+  assert.equal(result.closed,true); assert.equal(result.code,0);
+  assert.deepEqual(JSON.parse(result.text), {uid:process.getuid(),gid:process.getgid(),groups:process.getgroups().sort((a,b)=>a-b),cwd:data,marker:'isolated',args:['literal with spaces']});
+  assert.equal(plugins.cliOperationStatus().length,0);
+  console.log('packaged CLI subreaper: closed receipt, identity/cwd/env/argv OK');
+})().catch(error=>{console.error(error);process.exitCode=1});
+JS
 
 FNOS_APP_DIR="$stage/app" FNOS_DATA_DIR="$stage/data" FNOS_CONFIG_DIR="$stage/etc" \
   GUIDE_SOCKET="$stage/app/guide.sock" FNOS_PORT=3080 FNOS_NAS_IPV4=127.0.0.1 \

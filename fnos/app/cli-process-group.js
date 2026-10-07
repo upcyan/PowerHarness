@@ -61,7 +61,7 @@ function create(child) {
     } catch (error) { return unknown(`incomplete proc snapshot: ${error.code || error.message}`); }
   }
   function signal(name) {
-    if (name !== 'SIGTERM' && name !== 'SIGKILL') return unknown('invalid group signal');
+    if (name !== 'SIGTERM' && name !== 'SIGKILL' && name !== 'SIGUSR2') return unknown('invalid group signal');
     if (!birth) return unknown('group owner birth unavailable');
     let owner;
     try { owner = stat(pid); } catch { return unknown('group leader gone or unreadable'); }

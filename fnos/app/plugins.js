@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const cliProcessGroup = require('./cli-process-group.js');
+const cliContainment = require('./cli-containment.js');
 const ops = require('./ops.js');
 
 // Single source of truth for an empty patch layer (see ops.PATCH_EMPTY comment).
@@ -129,10 +130,15 @@ function runCli(command, args, {
       reject(Object.assign(new Error('Previous CLI has not confirmed close'), { code: 'ERR_CLI_UNCONFIRMED', closed: false })); return;
     }
     if (cliOperations.size >= MAX_CLI_OPERATIONS) { reject(Object.assign(new Error('CLI operation capacity reached; wait for active or unknown operations'), { code: 'ERR_CLI_CAPACITY', closed: true })); return; }
-    let child, output;
+    let child, output, containment;
     try {
+      containment = process.platform === 'linux' ? cliContainment.prepare(command, args) : null;
       if (!collectStderr) output = fs.openSync(logFile, 'a', 0o600);
-      child = spawn(command, args, { cwd, env, detached: process.platform === 'linux', stdio: ['ignore', 'pipe', collectStderr ? 'pipe' : output] });
+      child = spawn(containment?.command || command, containment?.args || args, {
+        cwd, env, detached: process.platform === 'linux',
+        stdio: ['ignore', 'pipe', collectStderr ? 'pipe' : output, ...(containment ? ['pipe'] : [])],
+      });
+      containment?.attach(child);
     } catch (error) { reject(error); return; }
     finally { if (output !== undefined) fs.closeSync(output); }
     const group = process.platform === 'linux' ? cliProcessGroup.create(child) : null;
@@ -158,7 +164,9 @@ function runCli(command, args, {
     };
     const signalChild = signal => {
       if (childClosed || done) return; // late callbacks must never signal a recycled PGID
-      if (group) return group.signal(signal);
+      // SIGKILL would destroy the reaper before it can prove descendant exit.
+      // SIGUSR2 asks the owned helper to force-kill/reap its children instead.
+      if (group) return group.signal(containment && signal === 'SIGKILL' ? 'SIGUSR2' : signal);
       if (process.platform === 'linux') return; // failed spawn: never fall back to a shared group
       try { child.kill(signal); } catch (error) { cause ||= error; }
     };
@@ -185,7 +193,7 @@ function runCli(command, args, {
       }, termGraceMs);
     };
     const operation = { child, cwd, cancel, completion, unconfirmed: false, reap() {
-      if (childClosed && group && ['gone', 'quiescent'].includes(group.probe().state)) cliOperations.delete(operation);
+      if (childClosed && containment?.result() && group && ['gone', 'quiescent'].includes(group.probe().state)) cliOperations.delete(operation);
     } };
     const onAbort = () => cancel(Object.assign(new Error('CLI aborted'), {code:'ERR_CLI_CANCELLED'}));
     cliOperations.add(operation);
@@ -210,9 +218,13 @@ function runCli(command, args, {
       child.stdout?.removeListener('data', collect);
       child.stderr?.removeListener('data', collect);
       child.removeListener('error', onError);
+      const proof = containment?.result();
+      const failedSpawn = containment && !Number.isSafeInteger(child.pid) && cause;
       const tree = group ? group.probe() : { state: 'gone' };
-      closed = tree.state === 'gone' || tree.state === 'quiescent';
-      if (!closed) { unconfirmed(`process group ${tree.state}: ${tree.reason || 'live members remain'}`); return; }
+      closed = (tree.state === 'gone' || tree.state === 'quiescent') && (!containment || !!proof || !!failedSpawn);
+      if (!closed) { unconfirmed(`process group ${tree.state}: ${tree.reason || 'descendant completion receipt missing'}`); return; }
+      if (failedSpawn) cause = cliContainment.unavailable(cause);
+      if (proof) { code = proof.code; closeSignal = proof.signal; cause ||= proof.error; }
       cliOperations.delete(operation);
       if (cause) settle(cause);
       else if (code === 0 || (allowFailure && code !== null && !closeSignal)) settle(null, code, closeSignal);
@@ -603,12 +615,12 @@ async function uninstall(dataDir, profile, spec, registry) {
   try {
     await runDshPlugin(['remove', name], dataDir, profile, logFile);
   } catch (firstError) {
-    if (firstError.code === 'ERR_CLI_UNCONFIRMED' || firstError.code === 'ERR_CLI_CANCELLED' || cliStopping) throw firstError;
+    if (firstError.code === 'ERR_CLI_UNCONFIRMED' || firstError.code === 'ERR_CLI_CANCELLED' || firstError.code === 'ERR_CLI_CONTAINMENT' || cliStopping) throw firstError;
     try {
       await runDshPlugin(['remove', name, '--force'], dataDir, profile, logFile);
       removedBy = 'pnpm --force';
     } catch (secondError) {
-      if (secondError.code === 'ERR_CLI_UNCONFIRMED' || secondError.code === 'ERR_CLI_CANCELLED' || cliStopping) throw secondError;
+      if (secondError.code === 'ERR_CLI_UNCONFIRMED' || secondError.code === 'ERR_CLI_CANCELLED' || secondError.code === 'ERR_CLI_CONTAINMENT' || cliStopping) throw secondError;
       manualDetach(directory, name);
       removedBy = 'manual';
       degradeNote = 'pnpm remove 两次失败（' + String(secondError.message || secondError).slice(0, 160) + '），已从配置层摘除；node_modules 文件保留。';
