@@ -14,6 +14,7 @@ const profiles = require('./profiles.js');
 const diagnostics = require('./diagnostics.js');
 const managementUi = require('./management-page.js');
 const diagnosticsUi = require('./diagnostics-page.js');
+const automaticBackups = require('./automatic-backup-policy.js');
 const actions = require('./actions.js');   // action 白名单的唯一来源（见该文件头注释）
 let yamlModule = null;
 try { yamlModule = require('yaml'); } catch { /* NODE_PATH 未含 runtime 时降级 */ }
@@ -903,7 +904,7 @@ function handlePublic(request, response) {
     if (!session) return send(response, 401, JSON.stringify({ ok: false, error: '请从 fnOS 桌面图标打开 DeepSeek Harness。' }));
     const current = currentState();
     const ready = available();
-    const body = JSON.stringify({ ok: ready, mode: current?.mode || 'unknown', error: current?.error || null, activeVersion: current?.activeVersion || null, operation: current?.operation || null, bootId: current?.bootId || null, restartReceipt: current?.restartReceipt || null, updatedAt: current?.updatedAt || null });
+    const body = JSON.stringify({ ok: ready, mode: current?.mode || 'unknown', error: current?.error || null, activeVersion: current?.activeVersion || null, operation: current?.operation || null, automaticBackupDeferred: automaticBackups.publicDeferrals(current?.automaticBackupDeferred), bootId: current?.bootId || null, restartReceipt: current?.restartReceipt || null, updatedAt: current?.updatedAt || null });
     response.writeHead(ready ? 200 : 503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
     return response.end(body);
   }
@@ -1360,6 +1361,7 @@ function handleGuide(request, response) {
       ok: ready,
       mode: state?.mode || 'unknown',
       operation: state?.operation && typeof state.operation === 'object' ? state.operation : null,
+      automaticBackupDeferred: automaticBackups.publicDeferrals(state?.automaticBackupDeferred),
       bootId: state?.bootId || null,
       restartReceipt: state?.restartReceipt || null,
       updatedAt: state?.updatedAt || null,

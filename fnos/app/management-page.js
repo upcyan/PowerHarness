@@ -9,6 +9,7 @@ const profiles = require('./profiles.js');
 const plugins = require('./plugins.js');
 const pluginPaths = require('./plugin-paths.js');
 const grants = require('./grants.js');
+const automaticBackups = require('./automatic-backup-policy.js');
 const actions = require('./actions.js');   // 破坏性 action 的唯一定义处（见该文件头注释）
 
 const groups = [
@@ -108,6 +109,16 @@ function pluginWiringCard(wiring, action) {
     + '<div class="actions">' + (fixable.length ? action('repair-plugin-wiring', '登记到装载清单并重启') : '') + '</div>'
     + '<p class="hint">核心启动时会自动登记可修复项；这里提供手动入口（需重启核心生效）。</p></div>';
 }
+function automaticBackupCard(state, action) {
+  const deferred = automaticBackups.publicDeferrals(state.automaticBackupDeferred);
+  const detail = Object.entries(deferred || {}).map(([source, entry]) =>
+    (source === 'daily' ? '每日备份' : '会话存档') + '：' + automaticBackups.reasonText(entry.reason)).join('；');
+  return '<div id="automatic-backup-notice" class="card remediation"' + (deferred ? '' : ' hidden') + '><h3>自动备份已延期</h3>'
+    + '<p id="automatic-backup-reasons">' + escapeHtml(detail) + '</p>'
+    + '<p>为避免中断业务，核心运行或停止未确认时不会自动停服备份。长期运行可能一直无法自动备份，请按需手动操作。</p>'
+    + '<p class="hint">手动备份会暂停 DSH，正在进行的任务可能中断；完成后自动重新启动核心。</p>'
+    + '<div class="actions">' + action('backup', '手动备份（将暂停 DSH）') + '</div></div>';
+}
 function sessionArchiveCard(archive, action, settings) {
   if (!archive) return '';
   // 策略说明（0.3.61）：默认「自动」，可选定时（周期自定义）或手动。
@@ -117,8 +128,8 @@ function sessionArchiveCard(archive, action, settings) {
     : intervalMin >= 60 ? (intervalMin % 60 === 0 ? intervalMin / 60 + ' 小时' : intervalMin + ' 分钟')
     : intervalMin + ' 分钟';
   const modeText = {
-    auto: '自动：核心启动后检测到未存档的会话即建立快照',
-    timer: '定时：每 ' + humanInterval + ' 检查一次，有更新则快照',
+    auto: '自动：核心启动后检查会话，运行中保守延期',
+    timer: '定时：每 ' + humanInterval + ' 检查一次，运行中延期；确认停止后才快照',
     manual: '手动：仅在点击下方按钮时检查',
   }[mode];
   const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MB';
@@ -339,7 +350,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const dockerPanel = `<h2>容器权限</h2><p>当前连接：<strong>${dockerStatus?.mode === 'rootless' ? 'Rootless Docker' : '系统默认'}</strong>。Rootless 守护进程应以应用用户运行，Socket 固定在 <code>${escapeHtml(dockerStatus?.socket || '/run/user/UID/docker.sock')}</code>。</p><div class="table-scroll"><table><tbody>${dockerRows || '<tr><td>无法读取 Docker 检查状态</td></tr>'}</tbody></table></div>${dockerStatus?.dockerGroup ? '<p class="error">应用用户仍属于系统 docker 组。即使切到 Rootless，DSH 仍可显式访问系统 Docker Socket；确认 Rootless 可用后，应从该组移除应用用户并重启 FPK。</p>' : ''}<div class="divider"></div><h3>连接 DSH</h3><p>启用时会验证本用户 Socket 与 Docker 的 Rootless 标志，然后重启 DSH。关闭连接仅清除专用 Socket 设置，不会修改 NAS 的用户组。</p><div class="actions">${dockerStatus?.connection.ready && dockerStatus.mode !== 'rootless' ? action('set-docker-mode', '使用 Rootless Docker', '<input type="hidden" name="dockerMode" value="rootless">') : ''}${dockerStatus?.mode === 'rootless' ? action('set-docker-mode', '恢复系统默认连接', '<input type="hidden" name="dockerMode" value="system">') : ''}<a class="primary-link" href="/__fnos/?view=containers">刷新检查</a></div><div class="divider"></div><h3>NAS 管理员准备步骤</h3><ol><li>检查应用用户 <code>${escapeHtml(dockerUser)}</code> 的主目录是否存在且可写；安装 <code>newuidmap</code>、<code>newgidmap</code> 与 Docker Rootless 安装工具，并为该用户配置互不重叠的 subuid/subgid 范围，每项至少 65536 个。</li><li>以该应用用户运行 <code>dockerd-rootless-setuptool.sh install</code>。若 fnOS 支持用户级 systemd，再启用用户的 Docker 服务和 linger。</li><li>刷新本页，确认“Rootless 守护进程”显示“已验证”，然后点击“使用 Rootless Docker”。</li><li>确认 DSH 能使用 Rootless Docker 后，由 NAS 管理员执行 <code>sudo gpasswd -d ${escapeHtml(dockerUser)} docker</code>，再从应用中心完整停止并启动 FPK，刷新本页确认不再属于系统 docker 组。</li></ol><p class="hint">FPK 不会安装 Docker、修改 NAS 系统用户或自动开放 Docker Socket。Rootless Docker 仍可操作应用用户有权访问的文件，请继续限制工作区和插件权限。</p>`;
 
   const panels = {
-    overview: `<h2>运行状态</h2><div class="summary"><div><span>应用状态</span><strong>${status}</strong></div><div><span>DSH 核心</span><strong>${escapeHtml(state.activeVersion || state.bundledVersion || '未知')}</strong></div><div><span>配置档</span><strong>${escapeHtml(activeProfile)}</strong></div><div><span>应用版本</span><strong>${escapeHtml(appVer || '未知')}</strong></div></div>${state.error ? `${safeModeRemediation(state, form, action)}${startupDiagnosisCard(startupDiag, form, action, state)}${state.reportPath && state.mode === 'safe' ? `<p class="hint">完整诊断报告：<code>${escapeHtml(state.reportPath)}</code>（含错误全文与启动日志尾部）</p>` : ''}` : ''}${/*
+    overview: `<h2>运行状态</h2>${automaticBackupCard(state, action)}<div class="summary"><div><span>应用状态</span><strong>${status}</strong></div><div><span>DSH 核心</span><strong>${escapeHtml(state.activeVersion || state.bundledVersion || '未知')}</strong></div><div><span>配置档</span><strong>${escapeHtml(activeProfile)}</strong></div><div><span>应用版本</span><strong>${escapeHtml(appVer || '未知')}</strong></div></div>${state.error ? `${safeModeRemediation(state, form, action)}${startupDiagnosisCard(startupDiag, form, action, state)}${state.reportPath && state.mode === 'safe' ? `<p class="hint">完整诊断报告：<code>${escapeHtml(state.reportPath)}</code>（含错误全文与启动日志尾部）</p>` : ''}` : ''}${/*
       诊断模式卡片独立渲染（0.3.62 修复）：它原先挂在 `state.error` 分支里，
       而**诊断模式下核心是正常运行的**（正是它要达成的效果）—— error 为 null，
       于是整张卡片（含模型 provider 下拉）根本不出现。用户进诊断模式后只看到
@@ -354,7 +365,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     profiles: `<h2>DSH 配置档</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。新配置档从 DSH 官方 Web 模板创建，切换前自动备份。</p>${form('switch-profile', `<label>已有配置档 ${select('profile', profileOptions, activeProfile)}</label>`, '切换配置档')}${form('create-profile', '<label>新配置档名称 <input name="profile" required pattern="[a-z][a-z0-9_-]{0,31}" maxlength="32" placeholder="例如 work"></label>', '新建并切换')}`,
     grants: `<h2>目录权限</h2><p>在 fnOS 应用中心找到 DeepSeek Harness，打开访问权限并授予需要使用的 NAS 文件夹。授权后重新启动应用，再刷新此页。</p><p>已授权且可读取的目录会在 DSH 工作区的 <code>${escapeHtml(grants.shortcutFolder)}</code> 中显示为快捷入口。文件操作仍受 fnOS 对应用账号授予的权限限制。</p><div class="table-scroll"><table><thead><tr><th>fnOS 授权目录</th><th>当前访问</th></tr></thead><tbody>${grantRows || '<tr><td colspan="2">当前未收到 fnOS 授权目录。请在 fnOS 应用中心授予访问权限。</td></tr>'}</tbody></table></div><div class="divider"></div><h3>检测工作区写入权限</h3><p>输入在 DSH 中选择的完整目录，例如 <code>/vol1/共享文件夹/项目目录</code>。检测会在该目录短暂创建并删除一个空文件夹，与 DSH 的工作区检查一致。</p>${form('probe-workspace', '<label>工作区绝对路径 <input name="workspacePath" required placeholder="/vol1/共享文件夹/项目目录"></label>', '检测实际写入权限')}<p class="hint">上表只显示授权根目录的基础权限；子目录可能有不同 ACL。若刚授权仍未显示，请在 fnOS 应用中心停止并重新启动本应用。</p>`,
     containers: dockerPanel,
-    backups: `<h2>备份与恢复</h2>${sessionArchiveCard(sessionArchive, action, backupSettings)}<p>备份包含 DSH 设置、会话和私有工作区；恢复会覆盖当前数据。</p><p>自动备份条件：${{ always: '每天 03:00', changed: '每天 03:00，仅内容有改动', updates: '仅在更新或切换前' }[backupSettings.dailyMode]}。更新前的回滚备份始终执行。</p>${action('backup', '立即备份')}<div class="divider"></div><h3>备份策略</h3>${form('set-backup-settings', `<label>每日保留 <input type="number" name="dailyLimit" min="1" max="30" value="${backupSettings.daily}" required></label><label>手动保留 <input type="number" name="manualLimit" min="1" max="30" value="${backupSettings.manual}" required></label><label>更新前保留 <input type="number" name="upgradeLimit" min="1" max="10" value="${backupSettings['pre-upgrade']}" required></label><label>自动备份 ${select('dailyMode', [['always', '每天'], ['changed', '仅内容有改动'], ['updates', '仅更新或切换前']], backupSettings.dailyMode)}</label><label>会话存档 ${select('sessionMode', [['auto', '自动（推荐）'], ['timer', '定时检查'], ['manual', '仅手动']], backupSettings.sessionMode)}</label><label>检查周期（分钟）<input type="number" name="sessionInterval" min="5" max="10080" value="${backupSettings.sessionInterval}" required></label>`, '保存备份策略')}<p class="hint">会话存档策略只影响「是否/何时为会话新建快照」：自动模式在核心启动后检测到未存档的会话即快照；定时模式按检查周期执行（5 分钟 ~ 7 天，默认 60 分钟）；手动模式只在上面按钮点击时检查。</p>}<h3>已有备份</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>DSH 版本</th><th>操作</th></tr></thead><tbody>${backupRows || '<tr><td colspan="4">暂无备份</td></tr>'}</tbody></table></div>`,
+    backups: `<h2>备份与恢复</h2>${automaticBackupCard(state, action)}${sessionArchiveCard(sessionArchive, action, backupSettings)}<p>备份包含 DSH 设置、会话和私有工作区；恢复会覆盖当前数据。</p><p>自动备份条件：${{ always: '每天 03:00', changed: '每天 03:00，仅内容有改动', updates: '仅在更新或切换前' }[backupSettings.dailyMode]}。核心运行或停止未确认时，自动检查会延期，不会主动停服；用户发起更新或切换前的回滚快照仍执行。</p>${action('backup', '立即备份（将暂停 DSH）')}<div class="divider"></div><h3>备份策略</h3>${form('set-backup-settings', `<label>每日保留 <input type="number" name="dailyLimit" min="1" max="30" value="${backupSettings.daily}" required></label><label>手动保留 <input type="number" name="manualLimit" min="1" max="30" value="${backupSettings.manual}" required></label><label>更新前保留 <input type="number" name="upgradeLimit" min="1" max="10" value="${backupSettings['pre-upgrade']}" required></label><label>自动备份 ${select('dailyMode', [['always', '每天'], ['changed', '仅内容有改动'], ['updates', '仅更新或切换前']], backupSettings.dailyMode)}</label><label>会话存档 ${select('sessionMode', [['auto', '自动检查（运行中延期）'], ['timer', '定时检查（运行中延期）'], ['manual', '仅手动']], backupSettings.sessionMode)}</label><label>检查周期（分钟）<input type="number" name="sessionInterval" min="5" max="10080" value="${backupSettings.sessionInterval}" required></label>`, '保存备份策略')}<p class="hint">会话存档策略只影响「是否/何时为会话新建快照」：自动模式在核心启动后检查；定时模式按检查周期执行（5 分钟 ~ 7 天，默认 60 分钟）。核心运行、停止未确认或管理命令仍活动时均延期，仅在已确认停止的安全模式下自动快照。长期运行可能一直无法自动备份；手动备份会暂停任务并重新启动核心。</p>}<h3>已有备份</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>DSH 版本</th><th>操作</th></tr></thead><tbody>${backupRows || '<tr><td colspan="4">暂无备份</td></tr>'}</tbody></table></div>`,
     runtime: `${state.mode === 'safe' ? remediationGuide({
       action,
       error: state.error,
@@ -493,6 +504,17 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     }, delay);
     return true;
   };
+  const automaticBackupReasons = ${JSON.stringify(Object.fromEntries(['application-stopping', 'management-cli-active', 'core-running-or-unconfirmed', 'core-stop-unconfirmed', 'scan-incomplete'].map(reason => [reason, automaticBackups.reasonText(reason)])))};
+  const updateAutomaticBackupNotice = (info) => {
+    const notice = document.getElementById('automatic-backup-notice');
+    const detail = document.getElementById('automatic-backup-reasons');
+    if (!notice || !detail) return;
+    const deferred = info && info.automaticBackupDeferred;
+    const lines = ['daily', 'session'].filter(source => deferred && deferred[source]).map(source =>
+      (source === 'daily' ? '每日备份' : '会话存档') + '：' + (automaticBackupReasons[deferred[source].reason] || '当前状态无法确认'));
+    detail.textContent = lines.join('；');
+    notice.hidden = lines.length === 0;
+  };
   // 所有状态读取共享一次在途请求，deadline 包括响应体读取。
   const requestState = (deadline = Date.now() + 12000) => {
     if (!pageActive || document.hidden) return Promise.reject(new Error('页面已暂停'));
@@ -513,6 +535,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
       const info = await res.json();
       if (!currentOperation(generation)) throw new Error('状态请求已失效');
       if (/^[a-f0-9]{32}$/.test(info?.bootId || '')) observedBootId = info.bootId;
+      updateAutomaticBackupNotice(info);
       return { status: res.status, info };
     })().finally(() => { clearTimeout(timer); if (stateFlight === flight) stateFlight = null; });
     stateFlight = flight;

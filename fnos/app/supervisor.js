@@ -119,6 +119,8 @@ function archiveStartupLogs(reason, directory, profileName, extra = {}) {
 const restartTracker = require('./restart-tracker').createRestartTracker(dataDir);
 let state = { mode: 'starting', bootId: restartTracker.bootId, restartReceipt: restartTracker.snapshot(), bundledVersion: ops.dshVersion(appDir), activeVersion: null, error: null, updatedAt: new Date().toISOString() };
 let dsh = null;
+let coreStopConfirmed = false;
+const automaticBackups = require('./automatic-backup-policy.js');
 let gateway = null;
 let activeDir = appDir;
 let stopping = false;
@@ -282,6 +284,7 @@ async function startsAsIs() {
 const gitEnv = require('./git-transport.js');
 
 function spawnDsh(directory, profileName = profiles.selected(dataDir), createProfile = false, { startupTimeoutMs = 90_000, attempt = 1 } = {}) {
+  coreStopConfirmed = false;
   return new Promise((resolve, reject) => {
     if (stopping || shuttingDown) return reject(new Error('应用正在停止，不再启动核心'));
     let adapter;
@@ -665,9 +668,10 @@ function settleAfterExit(child, { timeoutMs = 10_000 } = {}) {
 }
 
 async function stopDsh() {
+  coreStopConfirmed = false;
   cancelSelfRestart();
-  if (!dsh) { await releaseOwnedCorePort(); return; }
-  if (exited(dsh)) { dsh = null; await releaseOwnedCorePort(); return; }
+  if (!dsh) { await releaseOwnedCorePort(); coreStopConfirmed = true; return; }
+  if (exited(dsh)) { dsh = null; await releaseOwnedCorePort(); coreStopConfirmed = true; return; }
   expectedDshStop = true;
   const child = dsh;
   startupCancels.get(child)?.();
@@ -683,6 +687,7 @@ async function stopDsh() {
   }
   dsh = null;
   await releaseOwnedCorePort();
+  coreStopConfirmed = true;
 }
 
 async function stopGateway() {
@@ -879,9 +884,36 @@ async function checkUpdate() {
   return result;
 }
 
-async function backup(kind) {
+function deferAutomaticBackup(source, reason) {
+  const previous = state.automaticBackupDeferred || {};
+  if (previous[source]?.reason !== reason) {
+    const entry = { reason, at: new Date().toISOString() };
+    publish({ automaticBackupDeferred: { ...previous, [source]: entry } });
+    log(`automatic ${source} backup deferred: ${automaticBackups.reasonText(reason)}; use manual backup if needed`);
+    eventLog('automatic_backup_deferred', { source, reason });
+  }
+  return { skipped: 'automatic-deferred', reason, source };
+}
+function clearAutomaticBackupDeferred(source = null) {
+  if (!state.automaticBackupDeferred) return;
+  const next = { ...state.automaticBackupDeferred };
+  if (source) delete next[source];
+  else for (const key of Object.keys(next)) delete next[key];
+  if (Object.keys(next).length === Object.keys(state.automaticBackupDeferred).length) return;
+  publish({ automaticBackupDeferred: Object.keys(next).length ? next : null });
+}
+async function backup(kind, { automatic = kind === 'daily', source = kind === 'daily' ? 'daily' : 'session' } = {}) {
   const settings = ops.backupSettings(dataDir);
-  if (kind === 'daily' && settings.dailyMode === 'updates') return { skipped: 'updates-only' };
+  if (kind === 'daily' && settings.dailyMode === 'updates') {
+    clearAutomaticBackupDeferred('daily');
+    return { skipped: 'updates-only' };
+  }
+  if (automatic) {
+    const decision = automaticBackups.decide({ mode: state.mode,
+      coreHandlePresent: Boolean(dsh), coreStopConfirmed, restartPending: Boolean(cleanExitTimer),
+      stopping, shuttingDown, cliActive: plugins.cliOperationStatus().length > 0 });
+    if (!decision.allowed) return deferAutomaticBackup(source, decision.reason);
+  }
   const wasSafe = state.mode === 'safe';
   if (plugins.cliOperationStatus().length) {
     const error = Object.assign(new Error('备份未执行：仍有管理CLI尚未确认退出，不能与安装器并发复制数据；请勿重复操作'), { code: 'ERR_CLI_UNCONFIRMED' });
@@ -892,7 +924,9 @@ async function backup(kind) {
   // safe is a UI/recovery state, not proof of process death (e.g. a failed stop).
   // Never copy files or advance the archive ledger until stop is confirmed.
   try {
-    await stopDsh();
+    // Automatic backups only copy after an already-confirmed safe-mode stop.
+    // They must not signal, cancel a restart, or stop an orphan core.
+    if (!automatic) await stopDsh();
     if (plugins.cliOperationStatus().length) throw Object.assign(new Error('停止期间出现未确认退出的管理CLI，拒绝并发备份'), { code: 'ERR_CLI_UNCONFIRMED' });
   }
   catch (error) {
@@ -905,7 +939,10 @@ async function backup(kind) {
     if (kind === 'daily' && settings.dailyMode === 'changed' && lastDaily?.fingerprint === ops.snapshotFingerprint(dataDir, configDir)) snapshot = { skipped: 'unchanged' };
     else snapshot = ops.createSnapshot(dataDir, configDir, kind, state.activeVersion);
     if (snapshot && !snapshot.skipped) {
+      clearAutomaticBackupDeferred();
       try { ops.markSessionsArchived(dataDir, { snapshotId: snapshot.id }); } catch (error) { log('session archive mark failed: ' + error.message); }
+    } else if (automatic && snapshot?.skipped) {
+      clearAutomaticBackupDeferred(source);
     }
     if (wasSafe) publish({ mode: 'safe', lastBackup: snapshot?.createdAt ?? state.lastBackup });
   } catch (error) {
@@ -1217,6 +1254,8 @@ async function runCommand(message) {
         sessionMode: message.sessionMode, sessionInterval: message.sessionInterval
       });
       // 策略改动立即生效：重排定时器；切到 auto 就马上检查一次，不必等下次启动。
+      if (result.dailyMode === 'updates') clearAutomaticBackupDeferred('daily');
+      if (result.sessionMode === 'manual') clearAutomaticBackupDeferred('session');
       scheduleSessionCheck();
       if (result.sessionMode === 'auto') maybeAutoArchiveSessions();
     }
@@ -1627,7 +1666,7 @@ async function runCommand(message) {
 }
 
 // 会话存档检查（0.3.61）。三种策略共用这一个入口：
-//   · auto   检测到新增/增长的会话就建 manual 快照（默认，无需人工干预）；
+//   · auto   启动后检查会话；核心运行/停止未确认时保守延期；
 //   · timer  由 scheduleSessionCheck 按周期调用；
 //   · manual 只在设置页点按钮时（force=true 允许无更新也复检）。
 // 返回 { skipped, reason, ...status } 形式，便于日志与 UI 复用。
@@ -1643,31 +1682,37 @@ async function runCommand(message) {
 // 新判据区分三种"没有账本"的语义：
 //   · baselineEmpty（扫描完整且 0 会话）→ 只初始化空基线账本，**不备份、不停核心**；
 //   · 扫描不完整 → 不下结论，明确延期并在日志/事件里报告原因；
-//   · 有会话但无账本 → 仍走真实快照（绝不把现成文件直接标记成"已存档"）。
+//   · 有会话但无账本 → 仅在允许快照时建立真实存档，延期不得推进账本。
 async function checkSessionArchive({ force = false } = {}) {
   const status = ops.sessionArchiveStatus(dataDir);
   // 扫描不完整：宁可延期，也不要把没读到的会话误记成已存档。
   if (!status.complete) {
     log(`session archive deferred: 会话目录未能完整读取（${(status.scanErrors || []).length} 处错误）`);
     eventLog('session_archive_scan_incomplete', { errors: (status.scanErrors || []).slice(0, 5), count: status.count });
+    if (!force) deferAutomaticBackup('session', 'scan-incomplete');
     return { ...status, snapshotId: null, skipped: 'scan-incomplete' };
   }
   // 空基线：只落一个"当前确实为空"的账本，完全不触碰核心。
   if (!status.known && status.baselineEmpty && !force) {
     ops.initEmptySessionArchive(dataDir);
+    clearAutomaticBackupDeferred('session');
     log('session archive baseline initialized (0 sessions; core left running)');
     eventLog('session_archive_baseline', { count: 0 });
     return { ...ops.sessionArchiveStatus(dataDir), snapshotId: null, skipped: 'baseline-initialized' };
   }
   const pending = !status.known || status.added || status.grown;
-  if (!pending) return { ...status, snapshotId: null, skipped: 'up-to-date' };
-  const created = await backup('manual');
+  if (!pending) {
+    clearAutomaticBackupDeferred('session');
+    return { ...status, snapshotId: null, skipped: 'up-to-date' };
+  }
+  const created = await backup('manual', { automatic: !force, source: 'session' });
   const after = ops.sessionArchiveStatus(dataDir);
   return {
     ...after,
     before: { added: status.added, grown: status.grown, pendingBytes: status.pendingBytes },
     snapshotId: created?.id || null,
     skipped: created?.skipped || null,
+    reason: created?.reason || null,
   };
 }
 
@@ -1706,6 +1751,7 @@ function maybeAutoArchiveSessions() {
   });
 }
 function scheduleDaily() {
+  clearTimeout(dailyTimer);
   const next = new Date();
   next.setHours(3, 0, 0, 0);
   if (next <= new Date()) next.setDate(next.getDate() + 1);
@@ -2050,10 +2096,15 @@ async function boot() {
   const previousVersion = ops.dshVersion(lastGood);
   let preUpgrade = null;
   if (previousVersion && previousVersion !== desiredVersion) {
+    // A user-initiated application/core upgrade still gets its safety snapshot,
+    // but do not copy while an old orphan core may still own the data.
+    await stopDsh();
     preUpgrade = ops.createSnapshot(dataDir, configDir, 'pre-upgrade', previousVersion);
     log(`pre-upgrade snapshot ${preUpgrade.id}`);
   } else if (!ops.listBackups(dataDir).length) {
-    ops.createSnapshot(dataDir, configDir, 'daily', bundled);
+    // No tracked child at boot is not proof that an old core is gone.
+    // Do not take a first automatic snapshot before stop ownership is known.
+    deferAutomaticBackup('daily', 'core-stop-unconfirmed');
   }
   try {
     await startDsh(activeDir);
