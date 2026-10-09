@@ -10,6 +10,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const cli = require('./plugins.js');
 const ops = require('./ops.js');
+const coordination = require('./config-coordination.js');
 
 const ALLOWED = new Set(['dsh', 'npm', 'pnpm']);
 const FORBIDDEN = /[;&|`$><\r\n]/;
@@ -64,6 +65,16 @@ function storeDirFor(dataDir, profile, plugins) {
 // 执行并把结果写入历史（最新在前）。绝不 throw —— 非零退出属于正常结果，
 // 由调用方读返回值。
 async function run(dataDir, profile, commandText, logFile, plugins) {
+  try {
+    // argv can select a different profile or install prefix: keep the whole
+    // application's data barrier, not merely the terminal's working directory.
+    return await coordination.withDataLock(dataDir, () => runLocked(dataDir, profile, commandText, logFile, plugins));
+  } catch (error) {
+    return { time: new Date().toISOString(), command: String(commandText || ''), code: -1, output: error.message,
+      closed: !coordination.isUnconfirmed(error), errorCode: error.code || null };
+  }
+}
+async function runLocked(dataDir, profile, commandText, logFile, plugins) {
   const appDir = process.env.FNOS_APP_DIR;
   if (!appDir) return { command: commandText, code: -1, output: 'Missing fnOS application path' };
   let argv, display;
@@ -99,6 +110,7 @@ async function run(dataDir, profile, commandText, logFile, plugins) {
     });
     entry = { time: new Date().toISOString(), command: display, code: result.code, output: result.text, closed: true };
   } catch (error) {
+    if (coordination.isUnconfirmed(error)) coordination.retain(dataDir, { errorCode: error.code || 'CLI_UNCONFIRMED', phase: 'terminal-unconfirmed' });
     entry = { time: new Date().toISOString(), command: display, code: -1,
       output: `${error.text || ''}${error.text ? '\n' : ''}${error.message}`, closed: error.closed === true };
   }

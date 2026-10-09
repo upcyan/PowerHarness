@@ -1,5 +1,6 @@
 'use strict';
 const fs = require('node:fs');
+const coordination = require('./config-coordination.js');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
 const KEY = '_powerHarnessPluginEnablement';
@@ -107,43 +108,72 @@ function transform(text, ids, record, yaml, ops, name) {
   }
   return { text: apply(text, edits), rows: saved };
 }
-function commit(dataDir, profile, manifestFile, manifest, beforePatch, afterPatch, ops) {
+function commit(dataDir, profile, manifestFile, manifest, beforePatch, afterPatch, ops, beforeManifest, patchSnapshot) {
   const patchFile = path.join(path.dirname(manifestFile), 'cordis.patch.yml');
-  const beforeManifest = fs.readFileSync(manifestFile, 'utf8');
-  // Both durable backups must exist before either business file is written.
+  const manifestRevision = coordination.revision(beforeManifest), patchRevision = coordination.revision(patchSnapshot);
+  coordination.assertRevision(manifestFile, manifestRevision);
+  coordination.assertRevision(patchFile, patchRevision);
   const evidence = `${manifestFile}.enablement-backup-${randomBytes(8).toString('hex')}`;
   fs.writeFileSync(evidence, beforeManifest, { flag: 'wx', mode: 0o600 });
-  const hadPatch = fs.existsSync(patchFile);
-  if (!hadPatch && afterPatch !== beforePatch) throw new Error('patch 已消失，拒绝创建未经确认的新配置');
+  const hadPatch = patchSnapshot !== null;
+  if (!hadPatch && afterPatch !== beforePatch) throw Object.assign(new Error('patch 已消失，拒绝创建未经确认的新配置'), { code: 'ERR_CONFIG_CONFLICT' });
   const backup = hadPatch ? ops.backupPatchConfig(dataDir, patchFile, profile) : null;
   if (hadPatch && !backup) throw new Error('patch 备份未确认，拒绝写入');
+  coordination.assertRevision(manifestFile, manifestRevision);
+  coordination.assertRevision(patchFile, patchRevision);
+  const manifestAfter = JSON.stringify(manifest, null, 2);
   let patchWritten = false;
   try {
-    if (afterPatch !== beforePatch) { ops.atomicPatchWrite(patchFile, afterPatch); patchWritten = true; }
-    ops.writeJson(manifestFile, manifest);
-  } catch (error) {
+    if (afterPatch !== beforePatch) {
+      ops.atomicPatchWrite(patchFile, afterPatch, { expectedRevision: patchRevision }); patchWritten = true;
+    }
+    ops.writeJson(manifestFile, manifest, { expectedRevision: manifestRevision });
+    coordination.assertRevision(manifestFile, coordination.revision(manifestAfter));
+    if (patchWritten) coordination.assertRevision(patchFile, coordination.revision(afterPatch));
+  } catch (failure) {
     const failures = [];
-    // Attempt both restorations independently, even if the first one fails.
-    try { ops.atomicPatchWrite(manifestFile, beforeManifest); } catch (failure) { failures.push(failure); }
+    // Never restore a file merely because it was read earlier. Only our own
+    // exact published image may be rolled back; newer foreign bytes survive.
+    let currentManifest;
+    try { currentManifest = coordination.snapshot(manifestFile); } catch (error) { failures.push(error); }
+    if (currentManifest === manifestAfter) {
+      try { ops.atomicPatchWrite(manifestFile, beforeManifest, { expectedRevision: coordination.revision(manifestAfter) }); } catch (error) { failures.push(error); }
+    } else if (currentManifest !== beforeManifest && patchWritten) {
+      failures.push(Object.assign(new Error('manifest 已被外部改写，拒绝回滚覆盖'), { code: 'ERR_CONFIG_CONFLICT' }));
+    }
     if (patchWritten) {
-      try { ops.atomicPatchWrite(patchFile, beforePatch); } catch (failure) { failures.push(failure); }
+      let currentPatch;
+      try { currentPatch = coordination.snapshot(patchFile); } catch (error) { failures.push(error); }
+      if (currentPatch === afterPatch) {
+        try { ops.atomicPatchWrite(patchFile, beforePatch, { expectedRevision: coordination.revision(afterPatch) }); } catch (error) { failures.push(error); }
+      } else if (currentPatch !== patchSnapshot) {
+        failures.push(Object.assign(new Error('patch 已被外部改写，拒绝回滚覆盖'), { code: 'ERR_CONFIG_CONFLICT' }));
+      }
     }
     if (failures.length) {
-      throw Object.assign(new Error(`UNKNOWN: 禁用事务回滚失败；保留证据 ${evidence} / ${backup}: ${failures.map(f => f.message).join('; ')}`), { code: 'ERR_ENABLEMENT_UNKNOWN', cause: error, rollbackErrors: failures, evidence, backup });
+      let retentionError;
+      try { coordination.retain(path.dirname(manifestFile), { evidence, backup, phase: 'rollback-unconfirmed' }); } catch (error) { retentionError = error; }
+      throw Object.assign(new Error('UNKNOWN: 配置回滚所有权未确认；已保留锁与备份，请勿重复操作'), { code: 'ERR_ENABLEMENT_UNKNOWN', cause: failure, rollbackErrors: failures, retentionError, evidence, backup });
     }
-    discardEvidence();
-    throw error;
+    discardEvidence(); throw failure;
   }
-  discardEvidence();
-  return { backup };
+  discardEvidence(); return { backup };
   function discardEvidence() {
-    // This exact absolute sibling was exclusively created by this transaction.
     if (path.resolve(evidence) !== evidence || path.dirname(evidence) !== path.dirname(manifestFile) || !evidence.startsWith(manifestFile + '.enablement-backup-')) throw new Error('Invalid transaction evidence path');
     try { fs.unlinkSync(evidence); } catch { /* retained evidence is harmless */ }
   }
 }
 function set(dataDir, profile, state, enabled, ops, options = {}) {
+  if (options.preflightOnly === true) {
+    coordination.assertCanStart(dataDir); // Read-only admission check; no lock files created.
+    return setLocked(dataDir, profile, state, enabled, ops, options);
+  }
+  return coordination.withLock(state.directory, () => setLocked(dataDir, profile, state, enabled, ops, options));
+}
+function setLocked(dataDir, profile, state, enabled, ops, options) {
   const { name, directory, manifestFile, manifest } = state;
+  const beforeManifest = state.beforeManifest ?? coordination.snapshot(manifestFile);
+  if (JSON.stringify(JSON.parse(beforeManifest)) !== JSON.stringify(manifest)) throw Object.assign(new Error('插件配置输入已过期，拒绝覆盖'), { code: 'ERR_CONFIG_CONFLICT' });
   const disabled = intents(manifest), record = Object.hasOwn(disabled, name) ? disabled[name] : undefined, yaml = parser(options);
   const ids = record?.ids || ownedIds(directory, name, yaml, ops);
   if (enabled && record) {
@@ -152,7 +182,8 @@ function set(dataDir, profile, state, enabled, ops, options = {}) {
   }
   if (Object.entries(disabled).some(([other, state]) => other !== name && state.ids.some(id => ids.includes(id)))) throw new Error('entry 归属与其他禁用 package 冲突');
   const patchFile = path.join(directory, 'cordis.patch.yml');
-  const before = fs.existsSync(patchFile) ? ops.readPatchConfig(dataDir, profile).patch : ops.PATCH_EMPTY;
+  const patchSnapshot = coordination.snapshot(patchFile);
+  const before = patchSnapshot ?? ops.PATCH_EMPTY;
   let next = before;
   if (!enabled && record) transform(before, ids, record, yaml, ops, name); // verify, without restoring
   if (!enabled && !record) {
@@ -168,7 +199,7 @@ function set(dataDir, profile, state, enabled, ops, options = {}) {
   if (enabled) manifest.dsh.profile.bundles.push(name);
   const check = ops.validatePatchText(next, yaml); if (!check.ok) throw new Error(check.error);
   if (options.preflightOnly === true) return { name, enabled }; // No files/backups are written; reject unsupported bindings before stopping core.
-  return { name, enabled, ...commit(dataDir, profile, manifestFile, manifest, before, next, ops) };
+  return { name, enabled, ...commit(dataDir, profile, manifestFile, manifest, before, next, ops, beforeManifest, patchSnapshot) };
 }
 function removeBoundRows(text, record, yaml, ops, name) {
   // Confirm every recorded disabled row first; never delete a changed/foreign row.
@@ -195,14 +226,18 @@ function removeBoundRows(text, record, yaml, ops, name) {
 // Confirmed removal deletes only bound profile rows and forgets intent. Reinstall
 // instead restores precise prior disabled fields. Failed removal retains intent.
 function forget(dataDir, profile, name, ops, options = {}) {
+  const directory = ops.dataPath(dataDir, 'dsh-home', 'profiles', profile);
+  return coordination.withLock(directory, () => forgetLocked(dataDir, profile, name, ops, options));
+}
+function forgetLocked(dataDir, profile, name, ops, options) {
   const directory = ops.dataPath(dataDir, 'dsh-home', 'profiles', profile), manifestFile = path.join(directory, 'package.json');
-  const manifest = ops.readJson(manifestFile), disabled = intents(manifest), record = Object.hasOwn(disabled, name) ? disabled[name] : undefined;
+  const beforeManifest = coordination.snapshot(manifestFile), manifest = JSON.parse(beforeManifest), disabled = intents(manifest), record = Object.hasOwn(disabled, name) ? disabled[name] : undefined;
   if (!record) return false;
-  const yaml = parser(options), before = fs.existsSync(path.join(directory, 'cordis.patch.yml')) ? ops.readPatchConfig(dataDir, profile).patch : ops.PATCH_EMPTY;
+  const yaml = parser(options), patchSnapshot = coordination.snapshot(path.join(directory, 'cordis.patch.yml')), before = patchSnapshot ?? ops.PATCH_EMPTY;
   const next = options.removed === true ? removeBoundRows(before, record, yaml, ops, name)
     : transform(before, record.ids, record, yaml, ops, name).text;
   delete disabled[name]; manifest[KEY] = { version: 1, disabled };
-  commit(dataDir, profile, manifestFile, manifest, before, next, ops);
+  commit(dataDir, profile, manifestFile, manifest, before, next, ops, beforeManifest, patchSnapshot);
   return true;
 }
 module.exports = { KEY, intents, set, forget, ownedIds };

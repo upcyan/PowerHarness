@@ -1,4 +1,5 @@
 const fs = require('node:fs');
+const configCoordination = require('./config-coordination.js');
 // 会话库完整性校验用（P6 防护）：zstd -t 只校验不落盘。
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
@@ -15,18 +16,35 @@ function dataPath(dataDir, ...parts) { return inside(dataDir, path.join(dataDir,
 function exists(p) { return fs.existsSync(p); }
 function privateDir(p) { fs.mkdirSync(p, { recursive: true, mode: 0o700 }); fs.chmodSync(p, 0o700); }
 function id() { return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(4).toString('hex')}`; }
-function writeJson(file, value) {
-  const tmp = `${file}.tmp-${randomBytes(4).toString('hex')}`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+function writeJson(file, value, options = {}) {
+  return configCoordination.withFileLock(file, isProfile => {
+    const expectedRevision = options.expectedRevision ?? (isProfile ? configCoordination.revision(configCoordination.snapshot(file)) : undefined);
+    return writeJsonUnlocked(file, value, { ...options, expectedRevision });
+  });
+}
+function writeJsonUnlocked(file, value, options) {
+  configCoordination.assertRevision(file, options.expectedRevision);
+  const tmp = inside(path.dirname(file), `${file}.tmp-${randomBytes(16).toString('hex')}`);
+  let fd, owned = false;
   try {
+    fd = fs.openSync(tmp, 'wx', 0o600); owned = true;
+    fs.writeFileSync(fd, JSON.stringify(value, null, 2), { encoding: 'utf8' });
+    fs.closeSync(fd); fd = undefined;
     for (let attempt = 0; ; attempt++) {
-      try { fs.renameSync(tmp, file); break; }
+      try { configCoordination.assertRevision(file, options.expectedRevision); fs.renameSync(tmp, file); break; }
       catch (error) {
         if (process.platform !== 'win32' || !['EPERM', 'EACCES'].includes(error.code) || attempt >= 20) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       }
     }
-  } catch (error) { fs.rmSync(tmp, { force: true }); throw error; }
+  } catch (error) {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+    if (owned) {
+      if (path.dirname(tmp) !== path.resolve(path.dirname(file)) || !path.basename(tmp).startsWith(path.basename(file) + '.tmp-')) throw new Error('JSON temporary file ownership path mismatch');
+      try { fs.unlinkSync(tmp); } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') error.cleanupError = cleanupError; }
+    }
+    throw error;
+  }
 }
 function readJson(file, fallback = null) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
@@ -84,6 +102,7 @@ function saveBackupSettings(dataDir, value) {
 function snapshotFingerprint(dataDir, configDir) {
   const hash = createHash('sha256');
   const visit = (file, relative) => {
+    if (!configCoordination.snapshotFilter(file)) return; // Coordination metadata is not user content.
     const info = fs.lstatSync(file);
     hash.update(relative);
     if (info.isSymbolicLink()) { hash.update('link'); hash.update(fs.readlinkSync(file)); }
@@ -444,6 +463,9 @@ function diagnosePluginWiring(dataDir, profile, yamlModule) {
 // 补进 bundles。只做加法（登记缺失项），不动已有条目，不碰 @deepseek-ai/* 核心包。
 // 返回 { fixed, issues }；fixed 非空时需要重启核心才生效。
 function repairPluginWiring(dataDir, profile, yamlModule) {
+  return configCoordination.withLock(patchProfileDir(dataDir, profile), () => repairPluginWiringLocked(dataDir, profile, yamlModule));
+}
+function repairPluginWiringLocked(dataDir, profile, yamlModule) {
   const diag = diagnosePluginWiring(dataDir, profile, yamlModule);
   const fixable = (diag.issues || []).filter((item) => item.kind === 'not-in-bundles');
   if (!fixable.length) return { fixed: [], issues: diag.issues || [] };
@@ -530,6 +552,9 @@ function pruneBackups(dataDir) {
 
 function createSnapshot(dataDir, configDir, kind, version) {
   if (!['daily', 'manual', 'pre-upgrade'].includes(kind)) throw new Error('Invalid backup kind');
+  return configCoordination.withDataLock(dataDir, () => createSnapshotLocked(dataDir, configDir, kind, version));
+}
+function createSnapshotLocked(dataDir, configDir, kind, version) {
   const root = dataPath(dataDir, 'backups');
   privateDir(root);
   const backupId = id();
@@ -539,7 +564,7 @@ function createSnapshot(dataDir, configDir, kind, version) {
   try {
     for (const name of ['dsh-home', 'workspace']) {
       const src = dataPath(dataDir, name);
-      if (exists(src)) fs.cpSync(src, path.join(pending, name), { recursive: true, dereference: false });
+      if (exists(src)) fs.cpSync(src, path.join(pending, name), { recursive: true, dereference: false, filter: configCoordination.snapshotFilter });
     }
     const meta = { id: backupId, kind, version, createdAt: new Date().toISOString(), fingerprint: snapshotFingerprint(dataDir, configDir) };
     writeJson(path.join(pending, 'meta.json'), meta);
@@ -566,7 +591,7 @@ function archiveBeforeRestore(dataDir) {
   const dest = dataPath(dataDir, 'backups', `.pre-restore-${new Date().toISOString().replace(/[:.]/g, '-')}`);
   try {
     privateDir(dest);
-    fs.cpSync(live, path.join(dest, 'dsh-home'), { recursive: true, dereference: false, force: true });
+    fs.cpSync(live, path.join(dest, 'dsh-home'), { recursive: true, dereference: false, force: true, filter: configCoordination.snapshotFilter });
     return dest;
   } catch { return null; }
 }
@@ -609,12 +634,16 @@ function prunePreRestoreArchives(dataDir, keep = 5) {
 }
 function restoreSnapshot(dataDir, configDir, backupId) {
   if (!/^\d{4}-\d{2}-\d{2}T[0-9Z-]+-[a-f0-9]{8}$/.test(backupId)) throw new Error('Invalid backup ID');
+  return configCoordination.withDataLock(dataDir, () => restoreSnapshotLocked(dataDir, configDir, backupId));
+}
+function restoreSnapshotLocked(dataDir, configDir, backupId) {
   const source = dataPath(dataDir, 'backups', backupId);
   const meta = readJson(path.join(source, 'meta.json'));
   if (!meta || meta.id !== backupId) throw new Error('Backup metadata mismatch');
   for (const name of ['dsh-home', 'workspace']) {
     if (!fs.lstatSync(path.join(source, name), { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Backup is incomplete: ${name}`);
   }
+  configCoordination.assertNoProfileLocks(path.join(source, 'dsh-home'));
   const targets = [
     ['dsh-home', dataPath(dataDir, 'dsh-home')],
     ['workspace', dataPath(dataDir, 'workspace')]
@@ -638,12 +667,24 @@ function restoreSnapshot(dataDir, configDir, backupId) {
       entry.installed = true;
     }
   } catch (error) {
+    const rollbackErrors = [];
     for (const entry of stages.reverse()) {
-      if (entry.installed && exists(entry.target)) fs.rmSync(entry.target, { recursive: true, force: true });
-      if (exists(entry.old)) {
-        fs.renameSync(entry.old, entry.target);
+      // All paths are unique siblings created by this invocation. A failed
+      // restoration keeps its old/staged copies instead of deleting evidence.
+      const root = path.resolve(dataDir), target = path.resolve(entry.target);
+      if (path.dirname(target) !== root || !['dsh-home', 'workspace'].includes(path.basename(target))
+          || path.dirname(entry.stage) !== root || !entry.stage.startsWith(`${target}.restore-new-`)
+          || path.dirname(entry.old) !== root || !entry.old.startsWith(`${target}.restore-old-`)) {
+        rollbackErrors.push(new Error('Restore rollback ownership path mismatch')); continue;
       }
-      if (exists(entry.stage)) fs.rmSync(entry.stage, { recursive: true, force: true });
+      try {
+        if (entry.installed && exists(entry.target)) fs.rmSync(entry.target, { recursive: true, force: true });
+        if (exists(entry.old)) fs.renameSync(entry.old, entry.target);
+        if (exists(entry.stage)) fs.rmSync(entry.stage, { recursive: true, force: true });
+      } catch (failure) { rollbackErrors.push(failure); }
+    }
+    if (rollbackErrors.length) {
+      throw Object.assign(new Error('UNKNOWN: 备份恢复的回滚未确认；已保留数据屏障和旧/暂存目录，请勿重复操作'), { code: 'ERR_CONFIG_UNKNOWN', cause: error, rollbackErrors, stages });
     }
     throw error;
   }
@@ -798,8 +839,11 @@ function patchProfileDir(dataDir, name = 'web') {
 
 function readPatchConfig(dataDir, profile = 'web') {
   const dir = patchProfileDir(dataDir, profile);
+  let patch = '', patchRevision = 'missing';
+  try { patch = fs.readFileSync(path.join(dir, 'cordis.patch.yml'), 'utf8'); patchRevision = configCoordination.revision(patch); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
   return {
-    patch: readTextFile(path.join(dir, 'cordis.patch.yml')),
+    patch, patchRevision,
     rootConfig: readTextFile(path.join(dir, 'cordis.yml')),
   };
 }
@@ -1252,7 +1296,14 @@ function validatePatchText(text, yamlModule) {
 }
 
 // Exclusive creation establishes ownership before writing; cleanup never targets business files.
-function atomicPatchWrite(file, content) {
+function atomicPatchWrite(file, content, options = {}) {
+  return configCoordination.withFileLock(file, isProfile => {
+    const expectedRevision = options.expectedRevision ?? (isProfile ? configCoordination.revision(configCoordination.snapshot(file)) : undefined);
+    return atomicPatchWriteUnlocked(file, content, { ...options, expectedRevision });
+  });
+}
+function atomicPatchWriteUnlocked(file, content, options) {
+  configCoordination.assertRevision(file, options.expectedRevision);
   const tmp = inside(path.dirname(file), `${file}.tmp-${randomBytes(16).toString('hex')}`);
   let fd;
   let owned = false;
@@ -1261,6 +1312,7 @@ function atomicPatchWrite(file, content) {
     owned = true;
     fs.writeFileSync(fd, content, { encoding: 'utf8' });
     fs.closeSync(fd); fd = undefined;
+    configCoordination.assertRevision(file, options.expectedRevision);
     fs.renameSync(tmp, file);
   } catch (error) {
     if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
@@ -1274,7 +1326,12 @@ function atomicPatchWrite(file, content) {
   }
 }
 
-function writePatchConfig(dataDir, text, yamlModule, profile = 'web') {
+function writePatchConfig(dataDir, text, yamlModule, profile = 'web', options = {}) {
+  const directory = patchProfileDir(dataDir, profile);
+  if (!fs.existsSync(directory)) throw new Error(`配置档目录不存在，无法写入 patch：${directory}（profile=${profile}）`);
+  return configCoordination.withLock(directory, () => writePatchConfigUnlocked(dataDir, text, yamlModule, profile, options));
+}
+function writePatchConfigUnlocked(dataDir, text, yamlModule, profile, options) {
   // 入参类型断言（0.3.70，落实 P21 建议）：本函数的第一个参数是**文本**，
   // 但历史上有调用点误传 JS 对象/数组 —— `String([{...}])` 会静默产出
   // "[object Object]" 写进 cordis.patch.yml，core 启动即报
@@ -1293,12 +1350,17 @@ function writePatchConfig(dataDir, text, yamlModule, profile = 'web') {
   // `cordis.patch.yml.tmp-xxxx`，看不出真正原因是"配置档不存在"（0.3.73）。
   if (!fs.existsSync(dir)) throw new Error(`配置档目录不存在，无法写入 patch：${dir}（profile=${profile}）`);
   const file = path.join(dir, 'cordis.patch.yml');
+  const expectedRevision = options.expectedRevision ?? configCoordination.revision(configCoordination.snapshot(file));
+  configCoordination.assertRevision(file, expectedRevision);
   const backup = backupPatchConfig(dataDir, file, profile);
-  atomicPatchWrite(file, content);
+  atomicPatchWrite(file, content, { expectedRevision });
   return { backup };
 }
 
 function restorePatchConfig(dataDir, backupName, yamlModule, profile = 'web', options = {}) {
+  return configCoordination.withLock(patchProfileDir(dataDir, profile), () => restorePatchConfigUnlocked(dataDir, backupName, yamlModule, profile, options));
+}
+function restorePatchConfigUnlocked(dataDir, backupName, yamlModule, profile, options) {
   if (!PATCH_BACKUP_NAME.test(backupName || '')) throw new Error('备份名不合法');
   const file = dataPath(dataDir, 'patch-backups', backupName);
   if (!fs.existsSync(file)) throw new Error('备份不存在或已被清理');
@@ -1309,8 +1371,10 @@ function restorePatchConfig(dataDir, backupName, yamlModule, profile = 'web', op
   if (!check.ok) throw new Error(`备份内容校验失败：${check.error}`);
   const dir = patchProfileDir(dataDir, profile);
   const current = path.join(dir, 'cordis.patch.yml');
+  const expectedRevision = options.expectedRevision ?? configCoordination.revision(configCoordination.snapshot(current));
+  configCoordination.assertRevision(current, expectedRevision);
   const backup = backupPatchConfig(dataDir, current, profile);
-  atomicPatchWrite(current, content);
+  atomicPatchWrite(current, content, { expectedRevision });
   return { backup };
 }
 

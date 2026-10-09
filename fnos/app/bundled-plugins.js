@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const ops = require('./ops.js');
+const coordination = require('./config-coordination.js');
 const profiles = require('./profiles.js');
 const plugins = require('./plugins.js');
 const gitEnv = require('./git-transport.js');
@@ -113,9 +114,9 @@ function stageTarballs(entries, { appDir, profileDir }) {
 /**
  * Install the bundled plugins into a profile that has just been created.
  *
- * Never throws: a profile that starts without an optional plugin is far better
- * than an install that fails and leaves the user with no working core. Failures
- * are reported through the returned summary and the plugin-install log.
+ * Ordinary confirmed install failures are returned in the summary: missing an
+ * optional plugin need not block startup. Unconfirmed CLI/config transactions
+ * instead throw and retain the profile lock; they must not be treated as safe.
  */
 async function installInto({ appDir, dataDir, profile, logFile, onProgress = null }) {
   const entries = available(appDir);
@@ -125,6 +126,9 @@ async function installInto({ appDir, dataDir, profile, logFile, onProgress = nul
   const manifestFile = path.join(profileDir, 'package.json');
   if (!fs.existsSync(manifestFile)) return { installed: [], skipped: [], failed: [], reason: 'profile is not initialized' };
 
+  return coordination.withLock(profileDir, () => installIntoLocked({ appDir, dataDir, profile, logFile, onProgress }, entries, profileDir, manifestFile));
+}
+async function installIntoLocked({ appDir, dataDir, profile, logFile, onProgress }, entries, profileDir, manifestFile) {
   const manifest = ops.readJson(manifestFile, {});
   const deps = manifest.dependencies || {};
   // Only packages the profile does not have yet: anything already declared is
@@ -142,6 +146,7 @@ async function installInto({ appDir, dataDir, profile, logFile, onProgress = nul
       await runDshPlugin(['add', target], { appDir, dataDir, profile, logFile });
       installed.push(`${entry.name}@${entry.version}`);
     } catch (error) {
+      if (coordination.isUnconfirmed(error)) throw error;
       failed.push(`${entry.name}: ${error.message}`);
     }
   }

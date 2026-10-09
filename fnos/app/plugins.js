@@ -4,6 +4,7 @@ const { spawn } = require('node:child_process');
 const cliProcessGroup = require('./cli-process-group.js');
 const cliContainment = require('./cli-containment.js');
 const ops = require('./ops.js');
+const configCoordination = require('./config-coordination.js');
 
 // Single source of truth for an empty patch layer (see ops.PATCH_EMPTY comment).
 const EMPTY_PATCH_TEXT = ops.PATCH_EMPTY;
@@ -52,10 +53,11 @@ function profilePackage(dataDir, profile, spec) {
   if (requestedVersion) throw new Error('Select an installed plugin by package name');
   const directory = profiles.directory(dataDir, profile);
   const manifestFile = path.join(directory, 'package.json');
-  const manifest = ops.readJson(manifestFile);
+  const beforeManifest = configCoordination.snapshot(manifestFile);
+  const manifest = beforeManifest === null ? null : JSON.parse(beforeManifest);
   if (!manifest || !Object.hasOwn(manifest.dependencies || {}, name)) throw new Error('Plugin is not installed in this profile');
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw new Error('dsh profile manifest is incompatible');
-  return { name, directory, manifestFile, manifest };
+  return { name, directory, manifestFile, manifest, beforeManifest };
 }
 function list(dataDir, profile) {
   const directory = profiles.directory(dataDir, profile);
@@ -78,8 +80,9 @@ function list(dataDir, profile) {
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
 function setEnabled(dataDir, profile, spec, enabled, options = {}) {
-  return require('./plugin-enablement.js').set(dataDir, profile,
+  const apply = () => require('./plugin-enablement.js').set(dataDir, profile,
     profilePackage(dataDir, profile, spec), enabled, ops, options);
+  return options.preflightOnly === true ? apply() : configCoordination.withLock(profiles.directory(dataDir, profile), apply);
 }
 async function metadata(name, registry) {
   const url = new URL(encodeURIComponent(name), cores.registryUrl(registry));
@@ -639,4 +642,10 @@ async function uninstall(dataDir, profile, spec, registry) {
   if (pruneMarketState(directory, name)) cleaned.push('插件市场状态');
   return { name, removed: true, cleaned, removedBy, degradeNote };
 }
-module.exports = { runCli, cancelCliOperations, cliOperationStatus, repairPluginFiles, runtimeStoreDir, parseSpec, normalizePluginSpec, inspect, install, installLocal, list, setEnabled, uninstall };
+function coordinatedProfileOperation(operation) {
+  return (dataDir, profile, ...args) => configCoordination.withLock(profiles.directory(dataDir, profile), () => operation(dataDir, profile, ...args));
+}
+module.exports = { runCli, cancelCliOperations, cliOperationStatus,
+  repairPluginFiles: coordinatedProfileOperation(repairPluginFiles), runtimeStoreDir, parseSpec, normalizePluginSpec, inspect,
+  install: coordinatedProfileOperation(install), installLocal: coordinatedProfileOperation(installLocal), list, setEnabled,
+  uninstall: coordinatedProfileOperation(uninstall) };

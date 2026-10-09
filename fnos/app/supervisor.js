@@ -4,6 +4,7 @@ const path = require('node:path');
 const { spawn, fork } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
 const ops = require('./ops.js');
+const configCoordination = require('./config-coordination.js');
 const actions = require('./actions.js');   // action 白名单的唯一来源（见该文件头注释）
 const cores = require('./core-manager.js');
 const profiles = require('./profiles.js');
@@ -539,6 +540,9 @@ function askGatewayPublicPort(port) {
 }
 
 async function startDsh(directory, profileName = profiles.selected(dataDir), createProfile = false) {
+  return configCoordination.withDataLock(dataDir, () => startDshLocked(directory, profileName, createProfile));
+}
+async function startDshLocked(directory, profileName, createProfile) {
   if (stopping || shuttingDown) throw new Error('应用正在停止，不再启动核心');
   // Must run before EVERY core start, not once during boot: the core itself
   // rewrites this file (profile init writes `[]`, dshmarket appends patch rows
@@ -610,6 +614,7 @@ async function startDsh(directory, profileName = profiles.selected(dataDir), cre
   } catch (error) { log('module resolution hygiene failed: ' + error.message); }
   await reclaimCorePort();
   try {
+    configCoordination.assertNoProfileLocks(ops.dataPath(dataDir, 'dsh-home'));
     return await spawnDsh(directory, profileName, createProfile);
   } catch (error) {
     if (!error?.startupTimeout || stopping) throw error;
@@ -620,6 +625,7 @@ async function startDsh(directory, profileName = profiles.selected(dataDir), cre
     eventLog('dsh_startup_retry', { firstWaitedMs: 90_000, retryTimeoutMs: 180_000 });
     await stopDsh();
     await reclaimCorePort();
+    configCoordination.assertNoProfileLocks(ops.dataPath(dataDir, 'dsh-home'));
     return spawnDsh(directory, profileName, createProfile, { startupTimeoutMs: 180_000, attempt: 2 });
   }
 }
@@ -1053,7 +1059,7 @@ async function setPluginEnabled(action, name, label, profile, wasSafe) {
     publish({ mode: readyMode(), error: null });
     return { name, enabled: action === 'enable-plugin' };
   } catch (error) {
-    if (error.code === 'ERR_ENABLEMENT_UNKNOWN') {
+    if (configCoordination.isUnconfirmed(error)) {
       publish({ mode: 'safe', error: `插件${label}事务恢复未确认，已保留证据；不继续改写或重启核心：${error.message}` });
       throw error;
     }
@@ -1076,7 +1082,11 @@ async function setPluginEnabled(action, name, label, profile, wasSafe) {
       await probeWeb();
       publish({ mode: readyMode(), error: `插件${label}失败：${error.message}（已恢复原状态）` });
       return { name, enabled: wasEnabled, warning: `插件${label}失败，已恢复原状态` };
-    } catch {
+    } catch (restoreError) {
+      if (configCoordination.isUnconfirmed(restoreError)) {
+        publish({ mode: 'safe', error: `插件${label}恢复事务未确认，保留证据且不继续重启：${restoreError.message}` });
+        throw restoreError;
+      }
       try { await stopDsh(); } catch {}
       publish({ mode: 'safe', error: `插件${label}失败：${error.message}，且恢复原状态后 DSH 仍无法启动` });
       throw error;
@@ -1105,7 +1115,7 @@ async function uninstallPlugin(name, label, profile) {
   try {
     result = await plugins.uninstall(dataDir, profile, name, updateSettings().registry);
   } catch (error) {
-    if (error.code === 'ERR_CLI_UNCONFIRMED' || error.code === 'ERR_ENABLEMENT_UNKNOWN' || error.closed === false) {
+    if (configCoordination.isUnconfirmed(error)) {
       publish({ mode: 'safe', lastBackup: snapshot.createdAt, error: `插件卸载执行/恢复未确认，已保留当前数据与操作前备份；不继续改写或并发启动核心，请勿重复操作：${error.message}` });
       throw error;
     }
@@ -1363,7 +1373,11 @@ async function runCommand(message) {
         throw error;
       }
     }
-    else if (message.action === 'save-patch-config') result = ops.writePatchConfig(dataDir, String(message.content ?? ''), patchYamlModule());
+    else if (message.action === 'save-patch-config') {
+      const selected = profiles.selected(dataDir);
+      if (message.profile !== selected || !/^(?:[a-f0-9]{64}|missing)$/.test(message.patchRevision || '')) throw Object.assign(new Error('配置页面版本或配置档已变化，请刷新后再保存'), { code: 'ERR_CONFIG_CONFLICT' });
+      result = ops.writePatchConfig(dataDir, String(message.content ?? ''), patchYamlModule(), selected, { expectedRevision: message.patchRevision });
+    }
     else if (message.action === 'disable-patch-config') result = ops.disablePatchConfig(dataDir, patchYamlModule());
     else if (message.action === 'disable-third-party-plugins') {
       // safe mode 的第三恢复按钮（上游 desktop fatal-recovery 同款）：把全部第三方
@@ -1371,8 +1385,9 @@ async function runCommand(message) {
       // 恢复方式：配置文件页的备份恢复下拉，或 dsh-fix 重置整层。
       const profileName = profiles.selected(dataDir);
       const file = path.join(profiles.directory(dataDir, profileName), 'cordis.patch.yml');
-      let text = '';
-      try { text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''; } catch { text = ''; }
+      const snapshotText = configCoordination.snapshot(file);
+      const text = snapshotText ?? '';
+      const expectedRevision = configCoordination.revision(snapshotText);
       // 现内容可能语法损坏（正是需要 safe mode 的场景）——禁用合并会因
       // writePatchConfig 校验失败而整个操作失败（曾 15ms 即失败）。降级：以
       // 最新可解析备份为基底执行禁用，保住用户配置。
@@ -1394,7 +1409,7 @@ async function runCommand(message) {
         result = { warning: '未发现可禁用的第三方插件条目（可能已全部禁用）' };
       } else {
         ops.backupPatchConfig(dataDir, file, profileName);
-        ops.writePatchConfig(dataDir, merged.text, patchYamlModule(), profileName);
+        ops.writePatchConfig(dataDir, merged.text, patchYamlModule(), profileName, { expectedRevision });
         normalizeProfilePatch(profileName);
         log(`third-party plugins disabled: ${merged.applied.join(', ')}`);
         result = await restartCoreAfterPatchFix('已禁用全部第三方插件' + baseNote);
@@ -1417,18 +1432,19 @@ async function runCommand(message) {
       // 却仍停在 safe mode。
       const profileName = profiles.selected(dataDir);
       const file = path.join(profiles.directory(dataDir, profileName), 'cordis.patch.yml');
+      const expectedRevision = configCoordination.revision(configCoordination.snapshot(file));
       ops.backupPatchConfig(dataDir, file, profileName);
       // 修复顺序（0.3.61）：① 最新可解析备份（保留用户配置） ② 兜底清空。
       // 直接清空曾导致一次事故：备份目录里有 16 条的完好备份，heal 却把配置
       // 降成 2 条，插件配置全部丢失（见 MEMORY 二十二·补）。
       const healBackup = ops.newestValidPatchBackup(dataDir, patchYamlModule(), profileName);
       if (healBackup && healBackup.entries > 0) {
-        ops.writePatchConfig(dataDir, healBackup.text, patchYamlModule(), profileName);
+        ops.writePatchConfig(dataDir, healBackup.text, patchYamlModule(), profileName, { expectedRevision });
         normalizeProfilePatch(profileName);
         log('heal restored ' + healBackup.entries + ' entries from ' + healBackup.name);
         result = await restartCoreAfterPatchFix('已从备份 ' + healBackup.name + ' 恢复 ' + healBackup.entries + ' 个条目（保留用户配置；原文件已留底）');
       } else {
-        ops.writePatchConfig(dataDir, ops.PATCH_EMPTY, patchYamlModule(), profileName);
+        ops.writePatchConfig(dataDir, ops.PATCH_EMPTY, patchYamlModule(), profileName, { expectedRevision });
         normalizeProfilePatch(profileName);
         result = await restartCoreAfterPatchFix('已重置 patch 配置（无可用的历史备份）');
       }
@@ -1438,16 +1454,17 @@ async function runCommand(message) {
       // 随后重启 core。若解析失败则退化为 heal（整体重置）。
       const profileName = profiles.selected(dataDir);
       const file = path.join(profiles.directory(dataDir, profileName), 'cordis.patch.yml');
-      let text = '';
-      try { text = fs.readFileSync(file, 'utf8'); } catch { text = ''; }
+      const snapshotText = configCoordination.snapshot(file);
+      const text = snapshotText ?? '';
+      const expectedRevision = configCoordination.revision(snapshotText);
       const dup = ops.findDuplicatePatchIds(text, patchYamlModule());
       if (dup) {
         ops.backupPatchConfig(dataDir, file, profileName);
         const next = ops.dedupePatchEntriesText(text, dup.duplicateIds);
-        if (next !== null) ops.writePatchConfig(dataDir, next, patchYamlModule(), profileName);
+        if (next !== null) ops.writePatchConfig(dataDir, next, patchYamlModule(), profileName, { expectedRevision });
       } else {
         // 检测不到重复（可能文件已坏）→ 退化为整体重置
-        ops.writePatchConfig(dataDir, ops.PATCH_EMPTY, patchYamlModule(), profileName);
+        ops.writePatchConfig(dataDir, ops.PATCH_EMPTY, patchYamlModule(), profileName, { expectedRevision });
       }
       normalizeProfilePatch(profileName);
       result = await restartCoreAfterPatchFix('已清理重复声明');
@@ -1529,7 +1546,13 @@ async function runCommand(message) {
       let repair;
       try {
         repair = await plugins.repairPluginFiles(dataDir, profiles.selected(dataDir), updateSettings().registry);
-      } catch (error) { repair = { ok: false, text: String(error.message || error), missing: [] }; }
+      } catch (error) {
+        if (configCoordination.isUnconfirmed(error)) {
+          publish({ mode: 'safe', error: `插件重建结果未确认，保留锁与证据，不继续启动核心：${error.message}` });
+          throw error;
+        }
+        repair = { ok: false, text: String(error.message || error), missing: [] };
+      }
       try {
         await startDsh(activeDir);
         await probeWeb();
@@ -1791,7 +1814,11 @@ async function seedBundledPlugins() {
   try {
     summary = await bundledPlugins.seed({ appDir, dataDir, profile, logFile });
   } catch (error) {
-    // A missing optional plugin is never worth failing startup over.
+    if (configCoordination.isUnconfirmed(error)) {
+      publish({ mode: 'safe', error: `内置插件安装结果未确认，已保留锁与证据：${error.message}` });
+      throw error;
+    }
+    // A confirmed missing optional plugin need not prevent startup.
     log(`bundled plugin seed failed: ${error.message}`);
     return;
   }
@@ -1981,11 +2008,12 @@ function normalizeProfilePatch(profileName) {
     // The shared transaction validates the result, attributes a unique backup
     // to this profile, then commits via an exclusive random sibling temp file.
     // A failed backup must never be logged-and-ignored before changing config.
-    ops.writePatchConfig(dataDir, text, yamlModule, profile);
+    ops.writePatchConfig(dataDir, text, yamlModule, profile, { expectedRevision: configCoordination.revision(original) });
     log(`patch layer self-healed before core start: ${fixes.join('; ')}`);
     publish({ notice: `启动前已自动修复 cordis.patch.yml：${fixes.join('；')}` });
   } catch (error) {
     log(`patch layer normalization failed: ${error.message}`);
+    if (configCoordination.isUnconfirmed(error)) throw error;
   }
 }
 

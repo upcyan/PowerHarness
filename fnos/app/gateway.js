@@ -531,7 +531,7 @@ function command(action, params) {
     const id = randomBytes(12).toString('hex');
     const timer = setTimeout(() => { pendingCommands.delete(id); reject(new Error('操作超时')); }, 15 * 60_000);
     pendingCommands.set(id, (message) => { clearTimeout(timer); message.ok ? resolve(message.result) : reject(new Error(message.error)); });
-    process.send({ type: 'command', id, action, backupId: params.get('backupId'), version: params.get('version'), registry: params.get('registry'), profile: params.get('profile'), packageName: params.get('packageName'), dockerMode: params.get('dockerMode'), corePort: params.get('corePort'), publicPort: params.get('publicPort'), dailyLimit: params.get('dailyLimit'), manualLimit: params.get('manualLimit'), upgradeLimit: params.get('upgradeLimit'), dailyMode: params.get('dailyMode'), content: params.get('content'), backupName: params.get('backupName'), confirmLegacyProfile: params.get('confirmLegacyProfile'), restartRequestId: params.get('restartRequestId'), commandText: params.get('command') });
+    process.send({ type: 'command', id, action, backupId: params.get('backupId'), version: params.get('version'), registry: params.get('registry'), profile: params.get('profile'), packageName: params.get('packageName'), dockerMode: params.get('dockerMode'), corePort: params.get('corePort'), publicPort: params.get('publicPort'), dailyLimit: params.get('dailyLimit'), manualLimit: params.get('manualLimit'), upgradeLimit: params.get('upgradeLimit'), dailyMode: params.get('dailyMode'), content: params.get('content'), patchRevision: params.get('patchRevision'), backupName: params.get('backupName'), confirmLegacyProfile: params.get('confirmLegacyProfile'), restartRequestId: params.get('restartRequestId'), commandText: params.get('command') });
   });
 }
 
@@ -694,6 +694,7 @@ async function managementAction(request, response, session, guide = false) {
   }
   if (!csrfMatches(session, String(params.get('csrf') || ''))) return send(response, 403, 'Invalid CSRF token');
   const action = params.get('action');
+  if (action === 'save-patch-config' && (!/^(?:[a-f0-9]{64}|missing)$/.test(params.get('patchRevision') || '') || !params.get('profile'))) return send(response, 400, '配置页面版本缺失或过旧，请刷新后再保存');
   if (!actions.isGatewayAction(action)) return send(response, 400, 'Unknown action');
   log('admin_action', { action });
   let notice;
