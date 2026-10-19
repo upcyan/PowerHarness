@@ -113,9 +113,13 @@ def safe_member(name: str) -> bool:
     parts = [p for p in Path(name).parts if p not in (".", "")]
     if any(p == ".." for p in parts):
         return False
-    if any(part in EXCLUDED_DIRS for part in parts[:-1]):
+    relative = parts[1:] if parts and parts[0] == "package" else parts
+    if any(part in {".git", ".agent-history", "node_modules", ".cache", ".npm", ".pnpm"} for part in relative):
         return False
-    if parts and parts[-1] in EXCLUDED_DIRS:
+    # Published code can legitimately use lib/log, src/state or dist/data.
+    # The leaf credential/data-file checks below still apply at every depth.
+    code_tree = bool(relative and relative[0] in {"lib", "src", "dist", "build", "contracts"})
+    if not code_tree and any(part in EXCLUDED_DIRS for part in relative):
         return False
     leaf = parts[-1] if parts else ""
     if leaf in EXCLUDED_FILES:
@@ -161,7 +165,7 @@ def sanitize_text(data: bytes, name: str) -> bytes:
     return text.encode("utf-8")
 
 
-def npm_pack(package_dir: Path, out_dir: Path) -> Path:
+def npm_pack(package_dir: Path, out_dir: Path, require_licenses: bool = False) -> Path | None:
     """Pack a package using npm's own `files` semantics.
 
     npm already implements "which files does this package publish" correctly,
@@ -188,7 +192,24 @@ def npm_pack(package_dir: Path, out_dir: Path) -> Path:
         # Re-filter: npm honours `files`, this drops anything sensitive that a
         # package without a `files` allowlist would otherwise publish.
         target = out_dir / produced[0].name
+        metadata = json.loads((package_dir / 'package.json').read_text(encoding='utf-8'))
+        approved = {'dsh-plugin-proxy': '0.1.0', 'dsh-preset-integrator': '0.1.0', '@vectorize-io/hindsight-coding-agents': '0.8.1'}
+        files = []
+        if metadata['name'] in approved and approved[metadata['name']] == metadata.get('version'):
+            supplement = Path(__file__).resolve().parent.parent / 'fnos/app/third-party-licenses' / Path(*metadata['name'].split('/'))
+            files = [p for p in supplement.glob('LICENSE*') if p.is_file() and not p.is_symlink()]
+            if metadata['name'] == '@vectorize-io/hindsight-coding-agents' and files:
+                proof = json.loads((supplement / 'source.json').read_text(encoding='utf-8'))
+                if proof.get('name') != metadata['name'] or proof.get('version') != metadata['version'] or proof.get('license') != 'MIT':
+                    die('Version-specific license evidence does not match')
+        with tarfile.open(produced[0], 'r:gz') as probe:
+            has_license = any(m.isfile() and m.size > 0 and m.name.count('/') == 1 and m.name.split('/')[-1].lower().startswith(('license', 'licence', 'copying')) for m in probe.getmembers())
+        declared = metadata.get('license') or ('MIT' if files and metadata['name'] == '@vectorize-io/hindsight-coding-agents' else None)
+        if require_licenses and (declared not in {'MIT', 'Apache-2.0', 'AGPL-3.0-only'} or not (has_license or files)):
+            print(f"    NOT DISTRIBUTED: {metadata['name']} — license/notice not verified")
+            return None
         dropped: list[str] = []
+        added = set()
         with tarfile.open(produced[0], "r:gz") as src, tarfile.open(target, "w:gz", compresslevel=9) as dst:
             for member in src.getmembers():
                 name = member.name[2:] if member.name.startswith("./") else member.name
@@ -206,6 +227,17 @@ def npm_pack(package_dir: Path, out_dir: Path) -> Path:
                 info.size = len(data)
                 info.mode = 0o644
                 info.mtime = member.mtime
+                dst.addfile(info, io.BytesIO(data))
+                added.add(name)
+            for license_file in files:
+                archive_name = 'package/' + license_file.name
+                if archive_name in added:
+                    continue
+                data = license_file.read_bytes()
+                info = tarfile.TarInfo(archive_name)
+                info.size = len(data)
+                info.mode = 0o644
+                info.mtime = 0
                 dst.addfile(info, io.BytesIO(data))
         if dropped:
             print(f"    excluded {len(dropped)} entr{'y' if len(dropped) == 1 else 'ies'}: "
@@ -229,6 +261,7 @@ def main(argv: list[str]) -> int:
                         help="restrict to these package names (repeatable)")
     parser.add_argument("--list", action="store_true",
                         help="print the index of the out directory instead of building")
+    parser.add_argument("--require-licenses", action="store_true", help="exclude resources without verified redistribution license and notice")
     args = parser.parse_args(argv[1:])
 
     if args.list:
@@ -262,7 +295,9 @@ def main(argv: list[str]) -> int:
         package_dir = profile / "node_modules" / Path(*name.split("/"))
         version = package_version(package_dir)
         print(f"  {name}@{version}")
-        archive = npm_pack(package_dir, out_dir)
+        archive = npm_pack(package_dir, out_dir, require_licenses=args.require_licenses)
+        if archive is None:
+            continue
         entries.append({
             "name": name,
             "version": version,

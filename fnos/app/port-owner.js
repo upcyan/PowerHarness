@@ -148,7 +148,14 @@ function processIdentity(pid, dataDir, appDir = process.env.FNOS_APP_DIR || __di
   if (entry === canonical(path.join(appDir, 'supervisor.js'))) role = 'supervisor';
   else if (entry === canonical(path.join(appDir, 'gateway.js'))) role = 'gateway';
   else if (coreEntryMatches(entry, appDir, dataDir)) role = 'core';
-  else return null;
+  else {
+    const profiles = path.join(dataDir, 'dsh-home', 'profiles');
+    const recovery = fs.existsSync(profiles) && fs.readdirSync(profiles, { withFileTypes: true })
+      .filter(item => item.isDirectory())
+      .some(item => entry === canonical(path.join(profiles, item.name, 'node_modules', 'dshmarket', 'lib', 'recovery.js')));
+    if (recovery) role = 'market-recovery';
+  }
+  if (!role) return null;
   const starttime = processStarttime(pid, proc);
   if (!starttime) {
     try { fs.readFileSync(path.join(directory, 'stat')); } catch (error) {

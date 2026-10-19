@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const configCoordination = require('./config-coordination.js');
+const backupStore = require('./backup-store.js');
 // 会话库完整性校验用（P6 防护）：zstd -t 只校验不落盘。
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
@@ -55,14 +56,15 @@ function dshVersion(appDir) {
 }
 
 function listBackups(dataDir) {
-  const root = dataPath(dataDir, 'backups');
-  if (!exists(root)) return [];
-  return fs.readdirSync(root, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-    .map((entry) => {
-      const meta = readJson(dataPath(dataDir, 'backups', entry.name, 'meta.json'));
-      return meta && meta.id === entry.name ? meta : null;
-    }).filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const seen = new Set();
+  return backupStore.roots(dataDir).flatMap(root => !exists(root) ? [] : fs.readdirSync(root, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+    .map(entry => {
+      const meta = readJson(path.join(root, entry.name, 'meta.json'));
+      if (!meta || meta.id !== entry.name || seen.has(meta.id)) return null;
+      seen.add(meta.id);
+      return meta;
+    })).filter(Boolean).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
 // sessionMode（0.3.61）—— 会话存档策略，三档：
@@ -70,11 +72,11 @@ function listBackups(dataDir) {
 //   'timer'  按 sessionInterval 分钟周期定时检查并快照；
 //   'manual' 只在设置页手动点「检查并立即快照」。
 // sessionInterval 为定时的检查周期（分钟），范围 5 分钟 ~ 7 天。
-const defaultBackupSettings = { daily: 7, manual: 3, 'pre-upgrade': 2, dailyMode: 'always', sessionMode: 'auto', sessionInterval: 60 };
+const defaultBackupSettings = { daily: 7, manual: 3, session: 48, 'pre-upgrade': 2, dailyMode: 'always', sessionMode: 'auto', sessionInterval: 60 };
 function backupSettings(dataDir) {
   const saved = readJson(dataPath(dataDir, 'backup-settings.json'), {});
   const result = { ...defaultBackupSettings, ...saved };
-  for (const [kind, max] of [['daily', 30], ['manual', 30], ['pre-upgrade', 10]]) {
+  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10]]) {
     if (!Number.isInteger(result[kind]) || result[kind] < 1 || result[kind] > max) throw new Error(`Invalid ${kind} backup limit`);
   }
   if (!['always', 'changed', 'updates'].includes(result.dailyMode)) throw new Error('Invalid daily backup mode');
@@ -86,7 +88,7 @@ function backupSettings(dataDir) {
 function saveBackupSettings(dataDir, value) {
   const settings = { ...backupSettings(dataDir), ...value };
   for (const kind of ['daily', 'manual', 'pre-upgrade']) if (typeof settings[kind] === 'string') settings[kind] = Number(settings[kind]);
-  for (const [kind, max] of [['daily', 30], ['manual', 30], ['pre-upgrade', 10]]) {
+  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10]]) {
     if (!Number.isInteger(settings[kind]) || settings[kind] < 1 || settings[kind] > max) throw new Error(`Invalid ${kind} backup limit`);
   }
   if (!['always', 'changed', 'updates'].includes(settings.dailyMode)) throw new Error('Invalid daily backup mode');
@@ -99,17 +101,21 @@ function saveBackupSettings(dataDir, value) {
   pruneBackups(dataDir);
   return settings;
 }
-function snapshotFingerprint(dataDir, configDir) {
+function snapshotFingerprint(dataDir, configDir, { scope = 'all' } = {}) {
+  if (!['all', 'static', 'mutable'].includes(scope)) throw new Error('Invalid fingerprint scope');
   const hash = createHash('sha256');
   const visit = (file, relative) => {
-    if (!configCoordination.snapshotFilter(file)) return; // Coordination metadata is not user content.
+    if (!configCoordination.snapshotFilter(file)) return;
+    const isStatic = relative.split('/').includes('node_modules');
+    if (scope === 'mutable' && isStatic) return;
     const info = fs.lstatSync(file);
-    hash.update(relative);
-    if (info.isSymbolicLink()) { hash.update('link'); hash.update(fs.readlinkSync(file)); }
+    const include = scope !== 'static' || isStatic;
+    if (include) hash.update(relative);
+    if (info.isSymbolicLink()) { if (include) { hash.update('link'); hash.update(fs.readlinkSync(file)); } }
     else if (info.isDirectory()) {
-      hash.update('dir');
-      for (const name of fs.readdirSync(file).sort()) visit(path.join(file, name), `${relative}/${name}`);
-    } else if (info.isFile()) {
+      if (include) hash.update('dir');
+      for (const name of fs.readdirSync(file).sort()) visit(path.join(file, name), relative + '/' + name);
+    } else if (info.isFile() && include) {
       hash.update('file');
       const fd = fs.openSync(file, 'r');
       const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -117,9 +123,9 @@ function snapshotFingerprint(dataDir, configDir) {
       finally { fs.closeSync(fd); }
     }
   };
-  // TRIM_PKGETC is fnOS-managed. Package users may read it but cannot rename its parent.
-  for (const [name, root] of [['dsh-home', dataPath(dataDir, 'dsh-home')], ['workspace', dataPath(dataDir, 'workspace')]]) {
-    if (root && exists(root)) visit(root, name);
+  for (const name of ['dsh-home', 'workspace']) {
+    const root = dataPath(dataDir, name);
+    if (exists(root)) visit(root, name);
   }
   return hash.digest('hex');
 }
@@ -213,8 +219,8 @@ function sessionArchiveStatus(dataDir) {
 // 记下本次存档点（在快照成功之后调用）。
 // 0.3.73（R25）：补 schemaVersion / initializedAt / lastArchiveAt / snapshotId，
 // 让"上次真实备份于何时"与"空基线的初始化时刻"可区分（空基线不是备份）。
-function markSessionsArchived(dataDir, { snapshotId = null } = {}) {
-  const current = scanSessions(dataDir);
+function markSessionsArchived(dataDir, { snapshotId = null, inventory = null } = {}) {
+  const current = inventory || scanSessions(dataDir);
   if (!current.complete) throw new Error('会话目录未能完整读取，拒绝提交存档账本');
   const existing = readJson(sessionArchiveFile(dataDir), null);
   const at = new Date().toISOString();
@@ -539,36 +545,103 @@ function pruneBackups(dataDir) {
   const limits = backupSettings(dataDir);
   const groups = new Map();
   for (const item of listBackups(dataDir)) {
+    // Legacy evidence must neither be deleted nor consume the new store quota.
+    if (path.dirname(backupStore.locate(dataDir, item.id)) !== backupStore.root(dataDir)) continue;
+    if (item.kind === 'uninstall') continue; // Explicit user-data preservation is never automatic-pruned.
     const group = groups.get(item.kind) || [];
     group.push(item);
     groups.set(item.kind, group);
   }
   for (const [kind, entries] of groups) {
     for (const item of entries.slice(limits[kind] ?? 2)) {
-      fs.rmSync(dataPath(dataDir, 'backups', item.id), { recursive: true, force: true });
+      const target = backupStore.locate(dataDir, item.id);
+      // Legacy snapshots are read-only evidence, never prune them during migration.
+      if (path.dirname(target) === backupStore.root(dataDir)) fs.rmSync(target, { recursive: true, force: true });
     }
   }
 }
 
-function createSnapshot(dataDir, configDir, kind, version) {
-  if (!['daily', 'manual', 'pre-upgrade'].includes(kind)) throw new Error('Invalid backup kind');
-  return configCoordination.withDataLock(dataDir, () => createSnapshotLocked(dataDir, configDir, kind, version));
+function createSnapshot(dataDir, configDir, kind, version, options = {}) {
+  if (!['daily', 'manual', 'session', 'pre-upgrade', 'uninstall'].includes(kind)) throw new Error('Invalid backup kind');
+  return configCoordination.withDataLock(dataDir, () => createSnapshotLocked(dataDir, configDir, kind, version, options));
 }
-function createSnapshotLocked(dataDir, configDir, kind, version) {
-  const root = dataPath(dataDir, 'backups');
+function createSnapshotLocked(dataDir, configDir, kind, version, { online = false } = {}) {
+  const root = backupStore.root(dataDir);
   privateDir(root);
   const backupId = id();
-  const pending = dataPath(dataDir, 'backups', `.pending-${backupId}`);
-  const final = dataPath(dataDir, 'backups', backupId);
+  const pending = path.join(root, '.pending-' + backupId);
+  const final = path.join(root, backupId);
   privateDir(pending);
   try {
-    for (const name of ['dsh-home', 'workspace']) {
-      const src = dataPath(dataDir, name);
-      if (exists(src)) fs.cpSync(src, path.join(pending, name), { recursive: true, dereference: false, filter: configCoordination.snapshotFilter });
+    const fingerprint = (directory, scope) => snapshotFingerprint(directory, configDir, { scope });
+    const copy = scope => {
+      for (const name of ['dsh-home', 'workspace']) {
+        const src = dataPath(dataDir, name);
+        if (exists(src)) fs.cpSync(src, path.join(pending, name), {
+          recursive: true, dereference: false, verbatimSymlinks: true,
+          filter: file => {
+            if (!configCoordination.snapshotFilter(file)) return false;
+            const isStatic = path.relative(dataDir, file).split(path.sep).includes('node_modules');
+            return scope === 'all' || (scope === 'mutable' ? !isStatic : isStatic || fs.lstatSync(file).isDirectory());
+          },
+        });
+      }
+    };
+    // Large dependency trees are retained, but do not stretch the consistency
+    // window for frequently-written sessions. Verify their content separately.
+    const staticBefore = online ? fingerprint(dataDir, 'static') : null;
+    if (online) {
+      copy('static');
+      if (staticBefore !== fingerprint(pending, 'static') || staticBefore !== fingerprint(dataDir, 'static')) {
+        throw Object.assign(new Error('备份期间插件依赖发生变化'), { code: 'ERR_BACKUP_SOURCE_CHANGED' });
+      }
     }
-    const meta = { id: backupId, kind, version, createdAt: new Date().toISOString(), fingerprint: snapshotFingerprint(dataDir, configDir) };
+    const before = online ? fingerprint(dataDir, 'mutable') : null;
+    const sessions = online ? scanSessions(dataDir) : null;
+    copy(online ? 'mutable' : 'all');
+    if (online) {
+      const checkCompressed = directory => {
+        if (!exists(directory)) return;
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) checkCompressed(file);
+          else if (entry.isFile() && entry.name.endsWith('.zstd')) execFileSync('zstd', ['-t', '-q', file], { timeout: 10000, stdio: 'pipe' });
+        }
+      };
+      checkCompressed(path.join(pending, 'dsh-home', 'sessions'));
+    }
+    if (online && (!sessions.complete || before !== fingerprint(pending, 'mutable') || before !== fingerprint(dataDir, 'mutable') || staticBefore !== fingerprint(dataDir, 'static'))) {
+      throw Object.assign(new Error('备份期间源数据发生变化，未提交快照或存档账本'), { code: 'ERR_BACKUP_SOURCE_CHANGED' });
+    }
+    const controlFiles = [];
+    const controlRoot = path.join(pending, 'control-evidence');
+    for (const name of ['tls.key', 'tls.crt', 'desired-exemptions.json', 'plugin-url-paths.json', 'authorized-links.json', 'backup-settings.json', 'connection-settings.json', 'ports.json', 'update.json']) {
+      const source = dataPath(dataDir, name);
+      if (!fs.lstatSync(source, { throwIfNoEntry: false })?.isFile()) continue;
+      privateDir(controlRoot);
+      const beforeHash = createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+      const target = path.join(controlRoot, name);
+      fs.copyFileSync(source, target); fs.chmodSync(target, 0o600);
+      const sha256 = createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+      if (online && (beforeHash !== sha256 || beforeHash !== createHash('sha256').update(fs.readFileSync(source)).digest('hex'))) {
+        throw Object.assign(new Error('备份期间持久化控制配置发生变化'), { code: 'ERR_BACKUP_SOURCE_CHANGED' });
+      }
+      controlFiles.push({ name, sha256 });
+    }
+    // Configuration evidence includes gateway settings/certificates; restore of
+    // fnOS-managed configuration remains an explicit administrative action.
+    if (configDir && exists(configDir)) fs.cpSync(configDir, path.join(pending, 'config-evidence'), { recursive: true, dereference: false, verbatimSymlinks: true });
+    const meta = { id: backupId, kind, version, createdAt: new Date().toISOString(), fingerprint: snapshotFingerprint(pending, configDir), controlFiles, consistency: online ? 'verified-online' : 'stopped-core', ...(online ? { sessions } : {}) };
     writeJson(path.join(pending, 'meta.json'), meta);
+    const flush = file => {
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) return;
+      if (stat.isDirectory()) for (const name of fs.readdirSync(file)) flush(path.join(file, name));
+      if (stat.isDirectory() || stat.isFile()) { const fd = fs.openSync(file, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+    };
+    flush(pending);
     fs.renameSync(pending, final);
+    const fd = fs.openSync(root, 'r'); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     pruneBackups(dataDir);
     return meta;
   } catch (error) {
@@ -588,10 +661,10 @@ function createSnapshotLocked(dataDir, configDir, kind, version) {
 function archiveBeforeRestore(dataDir) {
   const live = dataPath(dataDir, 'dsh-home');
   if (!exists(live)) return null;
-  const dest = dataPath(dataDir, 'backups', `.pre-restore-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+  const dest = path.join(backupStore.root(dataDir), `.pre-restore-${new Date().toISOString().replace(/[:.]/g, '-')}`);
   try {
     privateDir(dest);
-    fs.cpSync(live, path.join(dest, 'dsh-home'), { recursive: true, dereference: false, force: true, filter: configCoordination.snapshotFilter });
+    fs.cpSync(live, path.join(dest, 'dsh-home'), { recursive: true, dereference: false, verbatimSymlinks: true, force: true, filter: configCoordination.snapshotFilter });
     return dest;
   } catch { return null; }
 }
@@ -637,9 +710,14 @@ function restoreSnapshot(dataDir, configDir, backupId) {
   return configCoordination.withDataLock(dataDir, () => restoreSnapshotLocked(dataDir, configDir, backupId));
 }
 function restoreSnapshotLocked(dataDir, configDir, backupId) {
-  const source = dataPath(dataDir, 'backups', backupId);
+  const source = backupStore.locate(dataDir, backupId);
   const meta = readJson(path.join(source, 'meta.json'));
   if (!meta || meta.id !== backupId) throw new Error('Backup metadata mismatch');
+  if (meta.consistency && meta.fingerprint !== snapshotFingerprint(source, configDir)) throw new Error('Backup content integrity mismatch; live data left unchanged');
+  for (const file of meta.controlFiles || []) {
+    const target = inside(path.join(source, 'control-evidence'), path.join(source, 'control-evidence', file.name));
+    if (createHash('sha256').update(fs.readFileSync(target)).digest('hex') !== file.sha256) throw new Error('Backup control evidence integrity mismatch; live data left unchanged');
+  }
   for (const name of ['dsh-home', 'workspace']) {
     if (!fs.lstatSync(path.join(source, name), { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Backup is incomplete: ${name}`);
   }
@@ -659,7 +737,7 @@ function restoreSnapshotLocked(dataDir, configDir, backupId) {
       if (!exists(saved)) continue;
       const stage = `${target}.restore-new-${randomBytes(4).toString('hex')}`;
       stages.push({ target, stage, old: `${target}.restore-old-${randomBytes(4).toString('hex')}`, installed: false });
-      fs.cpSync(saved, stage, { recursive: true, dereference: false });
+      fs.cpSync(saved, stage, { recursive: true, dereference: false, verbatimSymlinks: true });
     }
     for (const entry of stages) {
       if (exists(entry.target)) fs.renameSync(entry.target, entry.old);

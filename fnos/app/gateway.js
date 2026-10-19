@@ -2,6 +2,7 @@ const http = require('node:http');
 const sseProxy = require('./sse-proxy');
 const unavailablePage = require('./unavailable-page');
 const wsUpgrade = require('./ws-upgrade');
+const connectionSettings = require('./connection-settings');
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -702,6 +703,11 @@ async function managementAction(request, response, session, guide = false) {
     if (['allow-plugin-path', 'dismiss-plugin-path', 'revoke-plugin-path'].includes(action)) {
       pluginPaths.change(dataDir, action.split('-')[0], params.get('path'));
       notice = action === 'allow-plugin-path' ? '插件路径已放行，请返回并强制刷新 DSH' : action === 'revoke-plugin-path' ? '插件路径放行已撤销，请强制刷新 DSH' : '已忽略此候选路径';
+    } else if (action === 'set-connection-settings') {
+      const values = params.getAll('autoReconnect');
+      if (values.length > 1 || values.length === 1 && !['true', 'false'].includes(values[0])) throw new Error('自动重连参数无效');
+      connectionSettings.save(dataDir, values[0] === 'true', params.get('connectionRevision'));
+      notice = '连接设置已保存；下一次恢复检查生效，无需重启核心';
     } else if (action === 'probe-workspace') {
       grants.probeWorkspace(params.get('workspacePath'));
       notice = '工作区目录可读写，可以在 DSH 中使用';
@@ -880,10 +886,26 @@ async function browserDiagnostic(request, response) {
 function sessionExpiredPage(response) {
   const nonce = randomBytes(16).toString('base64');
   response.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'`, 'X-Content-Type-Options': 'nosniff' });
-  return response.end(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>会话已失效</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fb;color:#1c2333;font:16px system-ui,sans-serif}.card{max-width:520px;margin:20px;padding:28px;background:white;border:1px solid #e1e7f0;border-radius:14px}h1{font-size:22px}p{line-height:1.6}button{display:inline-block;margin-top:8px;padding:10px 14px;border:0;border-radius:8px;background:#175cd3;color:white;font:inherit;cursor:pointer}</style></head><body><main class="card"><h1>会话已失效</h1><p>应用网关重启过，登录状态未保留。请回到 fnOS 桌面，重新点击应用图标打开。</p><button id="recheck" type="button">已重新进入，再试一次</button></main><script nonce="${nonce}">document.getElementById('recheck').onclick=()=>location.reload();</script></body></html>`);
+  return response.end(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>会话已失效</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f9fafb;color:#0f1115;font:16px system-ui,sans-serif}.card{max-width:520px;margin:20px;padding:28px;background:white;border:1px solid rgba(15,17,21,.08);border-radius:14px}h1{font-size:22px}p{line-height:1.6}button{display:inline-block;margin-top:8px;padding:10px 14px;border:0;border-radius:8px;background:#4176e6;color:#fff;font:inherit;cursor:pointer}</style></head><body><main class="card"><h1>会话已失效</h1><p>应用网关重启过，登录状态未保留。请回到 fnOS 桌面，重新点击应用图标打开。</p><button id="recheck" type="button">已重新进入，再试一次</button></main><script nonce="${nonce}">document.getElementById('recheck').onclick=()=>location.reload();</script></body></html>`);
+}
+
+function connectionPolicyResponse(request, response) {
+  if (request.method !== 'GET') return send(response, 405, 'Method not allowed');
+  let policy;
+  try { policy = connectionSettings.read(dataDir); } catch {
+    response.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return response.end(JSON.stringify({ error: '连接设置不可读取' }));
+  }
+  response.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+  response.end(JSON.stringify({ autoReconnect: policy.autoReconnect }));
 }
 
 function handlePublic(request, response) {
+  if (request.url.split('?')[0] === '/__fnos/connection-policy') {
+    if (!cookieSession(request)) return send(response, 401, 'Authentication required');
+    if (!sameOrigin(request)) return send(response, 403, 'Origin denied');
+    return connectionPolicyResponse(request, response);
+  }
   // A credential-free pixel lets the fnOS mobile shell check whether its own
   // WebView can reach the separate HTTPS port before navigating an iframe.
   if (request.method === 'GET' && request.url.startsWith('/_fnos/reachability.svg?')) {
@@ -1074,7 +1096,9 @@ function gatewayProxyHeaders(reply) {
   return headers;
 }
 
-function proxyGuideDsh(request, response) {
+const guideCoreAuth = require('./guide-core-auth.js').create({ launchPath: dshPath, port: upstreamPort });
+
+async function proxyGuideDsh(request, response) {
   const localPath = request.url.slice(gatewayDshPrefix.length) || '/';
   if (localPath === '/__fnos-plugin-url-compat.js') {
     if (request.method !== 'GET') return send(response, 405, 'Method not allowed');
@@ -1113,7 +1137,8 @@ function proxyGuideDsh(request, response) {
     response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'`, 'X-Content-Type-Options': 'nosniff' });
     return response.end(unavailablePage.render(unavailableState, { nonce, settingsUrl: `${gatewayManagePrefix}/?view=runtime` }));
   }
-  const headers = upstreamHeaders(request);
+  const headers = await guideCoreAuth.headersForGuide(request, upstreamHeaders(request));
+  if (response.destroyed || response.writableEnded) return;
   headers['accept-encoding'] = 'identity';
   const lifetime = sseProxy.createProxyLifetime(request, response);
   const upstream = http.request({ host: '127.0.0.1', port: upstreamPort, method: request.method, path: localPath, headers }, (reply) => {
@@ -1203,9 +1228,11 @@ function proxyGuideDsh(request, response) {
   request.pipe(upstream);
 }
 
-function upgradeGuideDsh(request, socket, head) {
+async function upgradeGuideDsh(request, socket, head) {
   if (request.headers['x-trim-isadmin'] !== 'true' || !request.url.startsWith(`${gatewayDshPrefix}/`) || !available()) return socket.destroy();
-  const upstream = http.request({ host: '127.0.0.1', port: upstreamPort, method: 'GET', path: request.url.slice(gatewayDshPrefix.length), headers: upstreamHeaders(request) });
+  const headers = await guideCoreAuth.headersForGuide(request, upstreamHeaders(request));
+  if (socket.destroyed) return;
+  const upstream = http.request({ host: '127.0.0.1', port: upstreamPort, method: 'GET', path: request.url.slice(gatewayDshPrefix.length), headers });
   wsUpgrade.forwardUpgrade(socket, upstream, head, pipeUpgradeSockets);
   upstream.end();
 }
@@ -1256,10 +1283,10 @@ function managementFallbackPage(response, error, session) {
   const nonce = randomBytes(16).toString('base64');
   const body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">`
     + `<meta name="viewport" content="width=device-width,initial-scale=1"><title>设置页加载失败</title><style>`
-    + `body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f7fb;color:#1c2333;font:15px/1.6 system-ui,sans-serif}`
-    + `.card{max-width:640px;margin:20px;padding:26px;background:#fff;border:1px solid #e1e7f0;border-radius:14px}`
+    + `body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f9fafb;color:#0f1115;font:15px/1.6 system-ui,sans-serif}`
+    + `.card{max-width:640px;margin:20px;padding:26px;background:#fff;border:1px solid rgba(15,17,21,.08);border-radius:14px}`
     + `h1{font-size:20px;margin:0 0 10px}.reason{padding:12px;background:#fdf2f2;border:1px solid #fecaca;border-radius:8px;font:13px/1.5 ui-monospace,monospace;word-break:break-all;white-space:pre-wrap}`
-    + `.hint{color:#667085;font-size:13px}a{display:inline-block;margin:6px 8px 0 0;padding:9px 14px;border-radius:8px;background:#175cd3;color:#fff;text-decoration:none}`
+    + `.hint{color:#667085;font-size:13px}a{display:inline-block;margin:6px 8px 0 0;padding:9px 14px;border-radius:8px;background:#4176e6;color:#fff;text-decoration:none}`
     + `</style></head><body><main class="card"><h1>应用设置页加载失败</h1>`
     + `<p>DSH 核心可能仍然是好的 —— 出问题的是<b>设置页自身的渲染</b>。下面是具体错误：</p>`
     + `<p class="reason">${escapeHtml(message)}</p>`
@@ -1349,8 +1376,11 @@ function recoveryChecksResponse(response) {
 }
 function handleGuide(request, response) {
   if (request.headers['x-trim-isadmin'] !== 'true') { log('guide_denied'); return send(response, 403, '仅 fnOS 管理员可打开。'); }
+  if (request.url.split('?')[0] === `${gatewayDshPrefix}/__fnos/connection-policy`) return connectionPolicyResponse(request, response);
   if (request.method === 'GET' && request.url.split('?')[0] === `${gatewayManagePrefix}/preflight`) return recoveryChecksResponse(response);
-  if (request.url.startsWith(`${gatewayDshPrefix}/`)) return proxyGuideDsh(request, response);
+  if (request.url.startsWith(`${gatewayDshPrefix}/`)) return proxyGuideDsh(request, response).catch(() => {
+    if (!response.destroyed && !response.writableEnded) send(response, 503, 'DSH 核心鉴权尚未就绪，请稍后刷新');
+  });
   if (request.method === 'GET' && request.url.split('?')[0] === `${gatewayManagePrefix}/state`) {
     const state = currentState();
     const ready = available();
@@ -1829,6 +1859,30 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     // 导航「更多」下拉（0.3.62）：开合、点外关闭、选中后收起；
     // 「诊断」= 记录 frame report（#diagnose 既有绑定）+ 跳转日志页。
     const navMore = document.getElementById('nav-more');
+  // DSH-style scroller: hide scrollbar, edge fades via mask, arrow buttons appear only on overflow
+  const nav = document.querySelector('nav[aria-label="应用导航"]');
+  if (nav && !nav.querySelector('.nav-scroller')) {
+    const moreWrap = nav.querySelector('.nav-more');
+    const scroller = document.createElement('div');
+    scroller.className = 'nav-scroller';
+    [...nav.childNodes].forEach((node) => { if (node !== moreWrap) scroller.appendChild(node); });
+    const prev = document.createElement('button');
+    prev.type = 'button'; prev.className = 'nav-arrow'; prev.dataset.dir = 'prev'; prev.setAttribute('aria-label', '向左滚动导航'); prev.textContent = '‹';
+    const next = document.createElement('button');
+    next.type = 'button'; next.className = 'nav-arrow'; next.dataset.dir = 'next'; next.setAttribute('aria-label', '向右滚动导航'); next.textContent = '›';
+    nav.append(prev, scroller, next);
+    if (moreWrap) nav.insertBefore(moreWrap, next);
+    const update = () => {
+      const max = scroller.scrollWidth - scroller.clientWidth;
+      prev.classList.toggle('visible', scroller.scrollLeft > 4);
+      next.classList.toggle('visible', scroller.scrollLeft < max - 4);
+    };
+    scroller.addEventListener('scroll', update, { passive: true });
+    window.addEventListener('resize', update);
+    prev.addEventListener('click', () => scroller.scrollBy({ left: -scroller.clientWidth * 0.6 }));
+    next.addEventListener('click', () => scroller.scrollBy({ left: scroller.clientWidth * 0.6 }));
+    requestAnimationFrame(update);
+  }
     const navMenu = document.getElementById('nav-menu');
     if (navMore && navMenu) {
       const setMenu = (open) => { navMenu.hidden = !open; navMore.setAttribute('aria-expanded', String(open)); };
@@ -1840,10 +1894,17 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     if (diagBtn) diagBtn.addEventListener('click', () => { try { frame.contentWindow.location.href = '/app/dsh-fnos/diagnostics'; } catch {} });
   })();
   </script>`;
-  let body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-visual"><title>DeepSeek Harness</title><style>*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;flex-direction:column;background:#101828;color:#fff;font:14px system-ui,sans-serif}header{min-height:48px;padding:7px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #344054}strong{white-space:nowrap}nav{margin-left:auto;display:flex;gap:8px}a{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:5px 12px;border:1px solid #475467;border-radius:7px;color:#fff;text-decoration:none;white-space:nowrap}a:hover,a:focus-visible{background:#344054}a.settings{order:10;background:#175cd3;border-color:#175cd3}a.settings:hover,a.settings:focus-visible{background:#1248a4}nav button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:5px 12px;border:1px solid #475467;border-radius:7px;background:transparent;color:#fff;font:inherit;white-space:nowrap;cursor:pointer}nav button:hover,nav button:focus-visible{background:#344054}[hidden]{display:none!important}iframe{flex:1;width:100%;min-height:0;border:0;background:#fff}.connection-state{flex:1;display:grid;align-content:center;justify-items:center;padding:24px;text-align:center;background:#f5f7fb;color:#1c2333}.connection-state h1{font-size:20px;margin:0 0 12px}.connection-state p{max-width:420px;line-height:1.6;margin:0 0 12px}.connection-state a,.connection-state button{margin:5px;padding:9px 14px;color:#fff;background:#175cd3;border:0;border-radius:8px;text-decoration:none;font:inherit}</style></head><body><header><strong>DeepSeek Harness</strong><nav aria-label="应用导航"><button type="button" id="console-open" aria-haspopup="dialog" aria-expanded="false">控制台</button><a id="dsh-nav"  href="${contentBase}/" target="dsh-frame">刷新 DSH</a><a id="settings-nav"  class="settings" href="${gatewayMode ? gatewayManagePrefix : `${appOrigin}/__fnos`}/" target="dsh-frame">应用设置</a></nav></header>${connectionState}<iframe name="dsh-frame" title="DeepSeek Harness 内容" ${frameAttributes} allow="clipboard-read; clipboard-write"></iframe>${consoleScript}</body></html>`;
+  let body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-visual,viewport-fit=cover"><title>DeepSeek Harness</title><style id="shell-boot-banner">header:has(nav[aria-label="应用导航"]){display:none!important}</style><style>*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;flex-direction:column;background:var(--dsh-shell-bg,#fff);color:var(--dsh-shell-text,#0f1115);font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif}header{min-height:48px;padding:6px 12px;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(15,17,21,.08);background:var(--dsh-shell-bg,#fff)}strong{white-space:nowrap;font-weight:700;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;max-width:38vw}nav{margin-left:auto;display:flex;gap:2px;align-items:center;min-width:0;max-width:calc(100% - 150px);position:relative}
+nav .nav-scroller{display:flex;gap:2px;align-items:center;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;scroll-behavior:smooth;mask-image:linear-gradient(to right,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%);-webkit-mask-image:linear-gradient(to right,transparent 0,#000 14px,#000 calc(100% - 14px),transparent 100%)}
+nav .nav-scroller::-webkit-scrollbar{display:none}
+nav .nav-arrow{display:none;align-items:center;justify-content:center;flex:0 0 26px;width:26px;height:26px;border:0;border-radius:999px;background:transparent;color:#61666b;font-size:15px;line-height:1;cursor:pointer;touch-action:manipulation;padding:0}
+nav .nav-arrow.visible{display:inline-flex}
+nav .nav-arrow:hover{background:rgba(15,17,21,.06);color:#0f1115}
+nav .nav-arrow[data-dir="prev"]{margin-right:-2px}
+nav .nav-arrow[data-dir="next"]{margin-left:-2px}nav a,nav .nav-more>button{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px clamp(7px,1.6vw,13px);font-size:clamp(12.5px,2.6vw,14px);border:0;border-radius:999px;color:#61666b;background:transparent;text-decoration:none;white-space:nowrap;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation;flex:0 0 auto}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible{background:rgba(15,17,21,.06);color:#0f1115}nav a[aria-current='page']{background:rgba(15,17,21,.06);color:#0f1115;font-weight:600}nav .nav-more{position:relative;display:inline-flex}#nav-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:60;display:flex;flex-direction:column;gap:2px;min-width:180px;padding:6px;border:.5px solid rgba(15,17,21,.16);border-radius:14px;background:#fff;box-shadow:0 10px 34px rgba(15,17,21,.14)}#nav-menu button{display:flex;align-items:center;gap:8px;width:100%;min-height:36px;padding:7px 10px;border:0;border-radius:9px;background:transparent;color:#0f1115;font:inherit;text-align:left;cursor:pointer}#nav-menu button:hover{background:#f7f8fa}@media(prefers-color-scheme:dark){body{--dsh-shell-bg:#151517;--dsh-shell-text:#f9fafb}header{border-bottom-color:rgba(255,255,255,.09)}nav a,nav .nav-more>button{color:#cfd3d6}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible,nav a[aria-current='page']{background:rgba(255,255,255,.08);color:#f9fafb}#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}#nav-menu button:hover{background:#2c2c2e}iframe{background:#151517}}[hidden]{display:none!important}iframe{flex:1;width:100%;min-height:0;border:0;background:#fff}.connection-state{flex:1;display:grid;align-content:center;justify-items:center;padding:24px;text-align:center;background:#f9fafb;color:#0f1115}.connection-state h1{font-size:20px;margin:0 0 12px}.connection-state p{max-width:420px;line-height:1.6;margin:0 0 12px}.connection-state a,.connection-state button{margin:5px;padding:9px 14px;color:#fff;background:#4176e6;border:0;border-radius:8px;text-decoration:none;font:inherit}</style></head><body><header><strong>DeepSeek Harness</strong><nav aria-label="应用导航"><button type="button" id="console-open" aria-haspopup="dialog" aria-expanded="false">控制台</button><a id="dsh-nav"  href="${contentBase}/" target="dsh-frame">刷新 DSH</a><a id="settings-nav"  class="settings" href="${gatewayMode ? gatewayManagePrefix : `${appOrigin}/__fnos`}/" target="dsh-frame">应用设置</a></nav></header>${connectionState}<iframe name="dsh-frame" title="DeepSeek Harness 内容" ${frameAttributes} allow="clipboard-read; clipboard-write"></iframe>${consoleScript}</body></html>`;
   body = body.replace('>刷新 DSH</a>', '>强制刷新 DSH</a>')
-    .replace('</head>', '<style>dialog.refresh-confirm{max-width:min(92vw,420px);padding:24px;border:1px solid #475467;border-radius:12px;background:#1d2939;color:#fff;box-shadow:0 20px 60px #0008}dialog.refresh-confirm::backdrop{background:#0009}dialog.refresh-confirm h2{margin:0 0 10px;font-size:20px}dialog.refresh-confirm p{line-height:1.6}dialog.refresh-confirm form{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}dialog.refresh-confirm button{padding:9px 16px;border:1px solid #667085;border-radius:7px;background:#344054;color:#fff;font:inherit;cursor:pointer}dialog.refresh-confirm button.confirm{background:#175cd3;border-color:#175cd3}</style></head>')
-    .replace('</head>', '<style>#console-panel{position:fixed;left:0;right:0;bottom:0;max-height:60vh;display:flex;flex-direction:column;background:#0b1220f7;color:#e4e7ec;border-top:1px solid #344054;z-index:60}#console-panel[hidden]{display:none}#boot-status{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#101828f2;color:#e4e7ec;z-index:90;padding:24px}#boot-status[hidden]{display:none}#boot-status .bs-card{max-width:340px;text-align:center}#boot-status h2{font-size:17px;margin:14px 0 8px}#boot-status p{margin:0;font-size:13px;line-height:1.6;color:#98a2b3}#boot-status .bs-hint{margin-top:12px;font-size:12px;color:#667085}#boot-status .bs-spin{width:30px;height:30px;margin:0 auto;border:3px solid #344054;border-top-color:#4ebdff;border-radius:50%;animation:bs-spin .9s linear infinite}@keyframes bs-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){#boot-status .bs-spin{animation:none}}#console-log .row.known{opacity:.55}#console-log .row .tag{display:inline-block;margin-left:6px;padding:1px 6px;border:1px solid #475467;border-radius:5px;font-size:11px;color:#98a2b3;white-space:nowrap}#console-head .cbx{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#98a2b3;cursor:pointer;user-select:none}#console-head .cbx input{accent-color:#4ebdff;margin:0}#console-toast{position:absolute;left:12px;right:12px;bottom:12px;padding:10px 12px;background:#1d2939;border:1px solid #475467;border-radius:10px;box-shadow:0 12px 30px #000a;font-size:12px;line-height:1.6;color:#e4e7ec;z-index:5}#console-toast[hidden]{display:none}#console-toast strong{color:#4ebdff}#console-panel{position:relative}#console-log .row.hint{color:#98a2b3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px dashed #344054;padding-top:6px;margin-top:6px}#console-log .row.hint button{padding:2px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}header{position:relative}.nav-more{position:relative;display:flex}#nav-more{display:inline-flex;align-items:center;justify-content:center;min-height:32px;min-width:48px;padding:5px 10px;border:1px solid #475467;border-radius:7px;background:transparent;color:#fff;font-size:13px;cursor:pointer}#nav-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:180px;background:#1d2939;border:1px solid #475467;border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:4px;box-shadow:0 14px 34px #000a;z-index:70}#nav-menu[hidden]{display:none}#nav-menu a,#nav-menu button{display:block;width:100%;text-align:left;min-height:38px;padding:9px 12px;border:0;border-radius:7px;background:transparent;color:#fff;font-size:13px;text-decoration:none;white-space:nowrap;cursor:pointer}#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:#344054}nav a,nav button{font-size:13px!important}#console-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #344054;font-weight:600}#console-head .count{margin-left:auto;font-weight:400;color:#98a2b3;font-size:12px}#console-head button{padding:5px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}#console-head button:hover{background:#344054}#console-log{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:8px 12px 16px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}#console-log .row{padding:4px 0;border-bottom:1px solid #1d2939}#console-log .row.error{color:#fda29b}#console-log .row.warn{color:#fec84b}#console-log .row.info{color:#84caff}#console-log .row.log{color:#d0d5dd}#console-log .t{color:#667085;margin-right:6px}#console-empty{color:#667085;padding:12px 0}</style></head>')
+    .replace('</head>', '<style>dialog.refresh-confirm{max-width:min(92vw,420px);padding:24px;border:.5px solid rgba(15,17,21,.16);border-radius:20px;background:#fff;color:#0f1115;box-shadow:0 18px 50px rgba(15,17,21,.22)}dialog.refresh-confirm::backdrop{background:rgba(15,17,21,.4)}dialog.refresh-confirm h2{margin:0 0 10px;font-size:20px}dialog.refresh-confirm p{line-height:1.6}dialog.refresh-confirm form{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}dialog.refresh-confirm button{padding:9px 16px;border:1px solid rgba(15,17,21,.16);border-radius:10px;background:#fff;color:#0f1115;font:inherit;cursor:pointer}dialog.refresh-confirm button.confirm{background:#4176e6;border-color:#4176e6;color:#fff}</style></head>')
+    .replace('</head>', '<style>#console-panel{position:fixed;left:0;right:0;bottom:0;max-height:60vh;display:flex;flex-direction:column;background:#0b1220f7;color:#e4e7ec;border-top:1px solid #344054;z-index:60}#console-panel[hidden]{display:none}#boot-status{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#101828f2;color:#e4e7ec;z-index:90;padding:24px}#boot-status[hidden]{display:none}#boot-status .bs-card{max-width:340px;text-align:center}#boot-status h2{font-size:17px;margin:14px 0 8px}#boot-status p{margin:0;font-size:13px;line-height:1.6;color:#98a2b3}#boot-status .bs-hint{margin-top:12px;font-size:12px;color:#667085}#boot-status .bs-spin{width:30px;height:30px;margin:0 auto;border:3px solid #344054;border-top-color:#4ebdff;border-radius:50%;animation:bs-spin .9s linear infinite}@keyframes bs-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){#boot-status .bs-spin{animation:none}}#console-log .row.known{opacity:.55}#console-log .row .tag{display:inline-block;margin-left:6px;padding:1px 6px;border:1px solid #475467;border-radius:5px;font-size:11px;color:#98a2b3;white-space:nowrap}#console-head .cbx{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#98a2b3;cursor:pointer;user-select:none}#console-head .cbx input{accent-color:#4ebdff;margin:0}#console-toast{position:absolute;left:12px;right:12px;bottom:12px;padding:10px 12px;background:#1d2939;border:1px solid #475467;border-radius:10px;box-shadow:0 12px 30px #000a;font-size:12px;line-height:1.6;color:#e4e7ec;z-index:5}#console-toast[hidden]{display:none}#console-toast strong{color:#4ebdff}#console-panel{position:relative}#console-log .row.hint{color:#98a2b3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px dashed #344054;padding-top:6px;margin-top:6px}#console-log .row.hint button{padding:2px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}header{position:relative}.nav-more{position:relative;display:flex}#nav-more{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px clamp(7px,1.6vw,13px);border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation}#nav-more:hover,#nav-more:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-more:hover,#nav-more:focus-visible{background:rgba(255,255,255,.08)}}#nav-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:180px;background:var(--dsh-shell-menu,#fff);border:.5px solid rgba(15,17,21,.16);border-radius:14px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 34px rgba(15,17,21,.14);z-index:70}@media(prefers-color-scheme:dark){#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}}#nav-menu[hidden]{display:none}#nav-menu a,#nav-menu button{display:block;width:100%;text-align:left;min-height:38px;padding:9px 12px;border:0;border-radius:9px;background:transparent;color:var(--dsh-shell-text,#0f1115);font:inherit;font-size:14px;text-decoration:none;white-space:nowrap;cursor:pointer}#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(255,255,255,.08)}}#console-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #344054;font-weight:600}#console-head .count{margin-left:auto;font-weight:400;color:#98a2b3;font-size:12px}#console-head button{padding:5px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}#console-head button:hover{background:#344054}#console-log{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:8px 12px 16px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}#console-log .row{padding:4px 0;border-bottom:1px solid #1d2939}#console-log .row.error{color:#fda29b}#console-log .row.warn{color:#fec84b}#console-log .row.info{color:#84caff}#console-log .row.log{color:#d0d5dd}#console-log .t{color:#667085;margin-right:6px}#console-empty{color:#667085;padding:12px 0}</style></head>')
       // ⚠ 面板**必须**注入在 consoleScript 之前（0.3.62 修复）。
       // 脚本第一件事就是 getElementById('console-panel'/'console-log')，
       // 拿不到就 `if (!panel || ...) return` 静默退出 —— 表现为「按钮点了没反应」。
@@ -1896,6 +1957,10 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     if (typeof refreshConfirm.showModal === 'function') refreshConfirm.showModal();
     else if (window.confirm('强制刷新 DSH？未保存的输入可能丢失。')) hardRefreshDsh();
   });
+
+
+
+
   document.getElementById('refresh-accept').addEventListener('click', hardRefreshDsh);
   settingsNav.addEventListener('click', () => setView('settings'));
   if (logsNav) logsNav.addEventListener('click', () => setView('settings'));   // 元素已并入「更多」菜单（0.3.62）
@@ -1997,7 +2062,7 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     'X-Content-Type-Options': 'nosniff',
     'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}'; connect-src 'self'; img-src ${appOrigin || "'self'"}; frame-src 'self'${appOrigin ? ` ${appOrigin}` : ''}; base-uri 'none'; form-action 'none'`
   });
-  response.end(body.replace('<nav aria-label="应用导航"><button type="button" id="console-open"', '<nav aria-label="应用导航"><div class="nav-more"><button type="button" id="nav-more" aria-haspopup="true" aria-expanded="false">更多 ▾</button><div id="nav-menu" hidden><button type="button" id="console-open"').replace('</button><a id="dsh-nav"', '</button><button type="button" id="diagnose">诊断（记录并查看）</button></div></div><a id="dsh-nav"').replace('</body>', `${clientScript}${navScript}${connectionScript}</body>`).replace('</style>', 'button{display:inline-flex;align-items:center;justify-content:center;min-height:32px;padding:5px 12px;border:1px solid #475467;border-radius:7px;color:#fff;background:transparent;font:inherit;cursor:pointer}button:hover,button:focus-visible{background:#344054}button.is-working{position:relative;isolation:isolate;box-shadow:0 0 0 1px #77cfff,0 0 9px #4ebdff55}button.is-working::after{content:"";position:absolute;inset:-2px;border-radius:inherit;padding:2px;background:conic-gradient(from 0deg,transparent 0deg 250deg,#50baff 295deg,#f3fcff 324deg,#75d2ff 340deg,transparent 360deg);-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:edge-spin 1.35s linear infinite;pointer-events:none}@keyframes edge-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){button.is-working::after{animation:none;background:#84d6ff}}@media(max-width:420px){header{padding:6px;gap:5px}strong{display:none}nav{gap:4px}a,button{padding:5px 7px;font-size:12px}}</style>'));
+  response.end(body.replace('<nav aria-label="应用导航"><button type="button" id="console-open"', '<nav aria-label="应用导航"><div class="nav-more"><button type="button" id="nav-more" aria-haspopup="true" aria-expanded="false">更多 ▾</button><div id="nav-menu" hidden><button type="button" id="console-open"').replace('</button><a id="dsh-nav"', '</button><button type="button" id="diagnose">诊断（记录并查看）</button></div></div><a id="dsh-nav"').replace('</body>', `${clientScript}${navScript}${connectionScript}<script nonce="${scriptNonce}">(${require("./shell-appearance").installShellAppearance.toString()})(window, document);</script></body>`).replace('</style>', 'button{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px 13px;border:0;border-radius:999px;color:inherit;background:transparent;font:inherit;cursor:pointer;touch-action:manipulation}#boot-status button,#console-head button{color:#e4e7ec}button:hover,button:focus-visible{background:rgba(15,17,21,.06)}button.is-working{position:relative;isolation:isolate;box-shadow:0 0 0 1px #77cfff,0 0 9px #4ebdff55}button.is-working::after{content:"";position:absolute;inset:-2px;border-radius:inherit;padding:2px;background:conic-gradient(from 0deg,transparent 0deg 250deg,#50baff 295deg,#f3fcff 324deg,#75d2ff 340deg,transparent 360deg);-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:edge-spin 1.35s linear infinite;pointer-events:none}@keyframes edge-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){button.is-working::after{animation:none;background:#84d6ff}}@media(max-width:420px){header{padding:6px;gap:5px}strong{display:none}nav{gap:4px}a,button{padding:5px 7px;font-size:12px}}</style>'));
 }
 
 async function main() {
@@ -2029,7 +2094,7 @@ async function main() {
   }
   try { fs.unlinkSync(guideSocket); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   guideServer = http.createServer(handleGuide);
-  guideServer.on('upgrade', upgradeGuideDsh);
+  guideServer.on('upgrade', (request, socket, head) => { void upgradeGuideDsh(request, socket, head).catch(() => socket.destroy()); });
   guideServer.listen(guideSocket, () => {
     if (process.platform !== 'win32') fs.chmodSync(guideSocket, 0o660);
     console.log(`fnOS guide socket ready: ${guideSocket}`);

@@ -13,6 +13,7 @@ FPK layout produced (verified against an fnpack 1.2.3 build):
   manifest.checksum = MD5 of app.tgz
 """
 import argparse
+import importlib.util
 import hashlib
 import io
 import json
@@ -69,95 +70,150 @@ def fresh_member(name, path, mode=0o644, mtime=None):
     return m
 
 
-def build_app_tgz(ref, app_dir, patch_script, out_path, extra_dirs=None):
-    src = tarfile.open(ref, "r:gz")
-    members = src.getmembers()
-    old_names = {m.name for m in members}
+def staged_source_bytes(name, path):
+    """Apply the Linux AI-context policy to bytes, never rewrite the source tree."""
+    with open(path, "rb") as source:
+        data = source.read()
+    if name not in {"AI-CONTEXT.md", "CHANGELOG-AI.md"}:
+        return data
+    sanitizer_path = os.path.join(ROOT, "scripts", "sanitize-ai-context.py")
+    spec = importlib.util.spec_from_file_location("fpk_context_sanitizer", sanitizer_path)
+    if spec is None or spec.loader is None:
+        die("AI context sanitizer unavailable; refusing to repack")
+    sanitizer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sanitizer)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        die("AI context is not UTF-8; refusing to repack")
+    cleaned = sanitizer.sanitize(text)
+    if sanitizer.find_leaks(cleaned):
+        die("AI context still contains private identifiers; refusing to repack")
+    return cleaned.encode("utf-8")
 
-    src_files, src_dirs = rel_files(app_dir)
-    # Build-generated directories (the bundled plugin tarballs) are layered on
-    # top of the source tree so they ship without being written into fnos/app.
-    for prefix, directory in (extra_dirs or {}).items():
-        extra_files, extra_dirs = rel_files(directory)
-        for rel, absolute in extra_files.items():
-            src_files[f"{prefix}/{rel}"] = absolute
-        for rel in extra_dirs:
-            src_dirs.add(f"{prefix}/{rel}")
-        src_dirs.add(prefix)
-    if "runtime" not in old_names:
-        die("reference FPK has no app/runtime; a full Linux build is required")
 
-    # Native reaper is part of the application contract, not a host-generated
-    # executable. Reuse only the reference binary whose source+binary hashes
-    # match; a native change requires a real Linux build. Never copy a Windows
-    # executable or a stale local helper under its Linux name.
-    native_names = {'cli-supervisor', 'cli-supervisor.json'}
-    if not native_names <= old_names:
-        die('reference lacks CLI containment helper; full Linux rebuild required')
-    native_meta = json.load(src.extractfile('cli-supervisor.json'))
-    with open(os.path.join(ROOT, 'fnos', 'native', 'cli-supervisor.c'), 'rb') as f:
-        native_source_hash = hashlib.sha256(f.read()).hexdigest()
-    native_binary = src.extractfile('cli-supervisor').read()
-    if (native_meta.get('protocol') != 1 or native_meta.get('sourceSha256') != native_source_hash
-            or native_meta.get('binarySha256') != hashlib.sha256(native_binary).hexdigest()
-            or not native_binary.startswith(b'\x7fELF') or not src.getmember('cli-supervisor').mode & 0o111):
-        die('CLI containment source/binary differs from reference; full Linux rebuild required')
+def add_staged_source(out, name, path):
+    data = staged_source_bytes(name, path)
+    member = fresh_member(name, path)
+    member.size = len(data)
+    out.addfile(member, io.BytesIO(data))
 
-    # guards: runtime must match current lockfile and patch script
-    for name, repo in (
-        ("runtime/package.json", os.path.join(ROOT, "package.json")),
-        ("runtime/package-lock.json", os.path.join(ROOT, "package-lock.json")),
-    ):
-        m = src.extractfile(name) if name in old_names else None
-        old = m.read() if m else b""
-        with open(repo, "rb") as f:
-            cur = f.read()
-        if old != cur:
-            die(f"{name} differs from {repo}; full Linux rebuild required")
-    pm = src.extractfile("patch-dsh.mjs") if "patch-dsh.mjs" in old_names else None
-    with open(patch_script, "rb") as f:
-        cur_patch = f.read()
-    if pm is None or pm.read() != cur_patch:
-        die("patch-dsh.mjs differs from reference runtime; full Linux rebuild required")
-    # The frontend compatibility shim is read by patch-dsh.mjs at build time from
-    # its own directory; keep it consistent with the reference too.
-    compat_repo = os.path.join(os.path.dirname(patch_script), "legacy-compat.js")
-    cm = src.extractfile("legacy-compat.js") if "legacy-compat.js" in old_names else None
-    with open(compat_repo, "rb") as f:
-        cur_compat = f.read()
-    if cm is None or cm.read() != cur_compat:
-        die("legacy-compat.js differs from reference runtime; full Linux rebuild required")
 
-    with tarfile.open(out_path, "w:gz", compresslevel=9) as out:
-        for m in members:
-            if m.name in native_names or m.name == "runtime" or m.name.startswith("runtime/"):
-                out.addfile(m, src.extractfile(m) if m.isfile() else None)
-            elif m.name == "patch-dsh.mjs":
-                with open(patch_script, "rb") as payload:
-                    out.addfile(fresh_member(m.name, patch_script), payload)
-            elif m.name == "legacy-compat.js":
-                with open(compat_repo, "rb") as payload:
-                    out.addfile(fresh_member(m.name, compat_repo), payload)
-            elif m.isfile() and m.name in src_files:
-                with open(src_files[m.name], "rb") as payload:
-                    out.addfile(fresh_member(m.name, src_files[m.name]), payload)
-            elif m.isdir() and m.name in src_dirs:
-                dm = tarfile.TarInfo(m.name)
-                dm.type = tarfile.DIRTYPE
-                dm.mode = 0o755
-                dm.mtime = m.mtime
-                dm.uid = dm.gid = 0
-                dm.uname = dm.gname = "root"
-                out.addfile(dm)
-            # else: file removed from fnos/app -> dropped
-        # files added since the reference build
-        for name in sorted(set(src_files) - old_names):
-            parent = os.path.dirname(name)
-            if parent and parent not in old_names and parent not in src_dirs:
-                continue  # unreachable in practice
-            with open(src_files[name], "rb") as payload:
-                out.addfile(fresh_member(name, src_files[name]), payload)
-    src.close()
+def build_app_tgz(ref, app_dir, patch_script, out_path, extra_dirs=None, context_version=None):
+    with tarfile.open(ref, "r:gz") as src:
+        members = src.getmembers()
+        old_names = {m.name for m in members}
+
+        src_files, src_dirs = rel_files(app_dir)
+        # The wrapper grant does not replace the licenses inside runtime/plugins.
+        for filename, archive_name in (("LICENSE", "LICENSE.PowerHarness"), ("LICENSING.md", "LICENSING.md")):
+            notice = os.path.join(ROOT, filename)
+            if not os.path.isfile(notice) or os.path.getsize(notice) == 0:
+                die(f"required wrapper license missing or empty: {filename}")
+            src_files[archive_name] = notice
+        context_spec = importlib.util.spec_from_file_location(
+            "fpk_build_context", os.path.join(ROOT, "scripts", "build-context.py"))
+        if context_spec is None or context_spec.loader is None:
+            die("Build context resolver unavailable")
+        context_module = importlib.util.module_from_spec(context_spec)
+        context_spec.loader.exec_module(context_module)
+        try:
+            src_files.update(context_module.resolve_context_sources(ROOT, app_dir, context_version))
+        except (OSError, ValueError) as error:
+            die(str(error))
+        # Build-generated directories (the bundled plugin tarballs) are layered on
+        # top of the source tree so they ship without being written into fnos/app.
+        for prefix, directory in (extra_dirs or {}).items():
+            extra_files, extra_dirs = rel_files(directory)
+            for rel, absolute in extra_files.items():
+                src_files[f"{prefix}/{rel}"] = absolute
+            for rel in extra_dirs:
+                src_dirs.add(f"{prefix}/{rel}")
+            parent = prefix
+            while parent:
+                src_dirs.add(parent)
+                parent = parent.rpartition("/")[0]
+        if "runtime" not in old_names:
+            die("reference FPK has no app/runtime; a full Linux build is required")
+
+        # Native reaper is part of the application contract, not a host-generated
+        # executable. Reuse only the reference binary whose source+binary hashes
+        # match; a native change requires a real Linux build. Never copy a Windows
+        # executable or a stale local helper under its Linux name.
+        native_names = {'cli-supervisor', 'cli-supervisor.json'}
+        if not native_names <= old_names:
+            die('reference lacks CLI containment helper; full Linux rebuild required')
+        native_meta = json.load(src.extractfile('cli-supervisor.json'))
+        with open(os.path.join(ROOT, 'fnos', 'native', 'cli-supervisor.c'), 'rb') as f:
+            native_source_hash = hashlib.sha256(f.read()).hexdigest()
+        native_binary = src.extractfile('cli-supervisor').read()
+        if (native_meta.get('protocol') != 1 or native_meta.get('sourceSha256') != native_source_hash
+                or native_meta.get('binarySha256') != hashlib.sha256(native_binary).hexdigest()
+                or not native_binary.startswith(b'\x7fELF') or not src.getmember('cli-supervisor').mode & 0o111):
+            die('CLI containment source/binary differs from reference; full Linux rebuild required')
+
+        # The adapter is generated from the installed Linux runtime, not the stale
+        # source skeleton. Reuse it only with the exact reference runtime.
+        adapter = json.load(src.extractfile("adapter.json"))
+        core_meta = json.load(src.extractfile("runtime/node_modules/@deepseek-ai/dsh/package.json"))
+        assert adapter["contract"] == 1 and adapter["version"] == core_meta["version"]
+        assert adapter["bin"] == "runtime/node_modules/@deepseek-ai/dsh/lib/bin.js"
+        assert adapter["args"] == ["web", "--no-open", "--host", "{{host}}", "--port", "{{port}}"]
+        assert adapter["readyPrefix"] == "dsh web:"
+
+        # guards: runtime must match current lockfile and patch script
+        for name, repo in (
+            ("runtime/package.json", os.path.join(ROOT, "package.json")),
+            ("runtime/package-lock.json", os.path.join(ROOT, "package-lock.json")),
+        ):
+            m = src.extractfile(name) if name in old_names else None
+            old = m.read() if m else b""
+            with open(repo, "rb") as f:
+                cur = f.read()
+            if old != cur:
+                die(f"{name} differs from {repo}; full Linux rebuild required")
+        pm = src.extractfile("patch-dsh.mjs") if "patch-dsh.mjs" in old_names else None
+        with open(patch_script, "rb") as f:
+            cur_patch = f.read()
+        if pm is None or pm.read() != cur_patch:
+            die("patch-dsh.mjs differs from reference runtime; full Linux rebuild required")
+        # The frontend compatibility shim is read by patch-dsh.mjs at build time from
+        # its own directory; keep it consistent with the reference too.
+        compat_repo = os.path.join(os.path.dirname(patch_script), "legacy-compat.js")
+        cm = src.extractfile("legacy-compat.js") if "legacy-compat.js" in old_names else None
+        with open(compat_repo, "rb") as f:
+            cur_compat = f.read()
+        if cm is None or cm.read() != cur_compat:
+            die("legacy-compat.js differs from reference runtime; full Linux rebuild required")
+
+        with tarfile.open(out_path, "w:gz", compresslevel=9) as out:
+            for m in members:
+                if m.name == "adapter.json" or m.name in native_names or m.name == "runtime" or m.name.startswith("runtime/"):
+                    out.addfile(m, src.extractfile(m) if m.isfile() else None)
+                elif m.name == "patch-dsh.mjs":
+                    with open(patch_script, "rb") as payload:
+                        out.addfile(fresh_member(m.name, patch_script), payload)
+                elif m.name == "legacy-compat.js":
+                    with open(compat_repo, "rb") as payload:
+                        out.addfile(fresh_member(m.name, compat_repo), payload)
+                elif m.isfile() and m.name in src_files:
+                    add_staged_source(out, m.name, src_files[m.name])
+                elif m.isdir() and m.name in src_dirs:
+                    dm = tarfile.TarInfo(m.name)
+                    dm.type = tarfile.DIRTYPE
+                    dm.mode = 0o755
+                    dm.mtime = m.mtime
+                    dm.uid = dm.gid = 0
+                    dm.uname = dm.gname = "root"
+                    out.addfile(dm)
+                # else: file removed from fnos/app -> dropped
+            # files added since the reference build
+            for name in sorted(set(src_files) - old_names):
+                parent = os.path.dirname(name)
+                if parent and parent not in old_names and parent not in src_dirs:
+                    continue  # unreachable in practice
+                add_staged_source(out, name, src_files[name])
+
 
 
 def build_fpk(app_tgz, fnos_dir, out_path, version=None):
@@ -276,7 +332,7 @@ def bundle_plugins(out_dir, source):
     script = os.path.join(ROOT, "scripts", "bundle-plugins.py")
     os.makedirs(out_dir, exist_ok=True)
     try:
-        subprocess.run([sys.executable, script, source, out_dir], check=True)
+        subprocess.run([sys.executable, script, source, out_dir, "--require-licenses"], check=True)
     except subprocess.CalledProcessError as error:
         die(f"bundling plugins failed: {(error.stderr or error.stdout or '').strip()}")
     return out_dir
@@ -325,6 +381,7 @@ def audit_reference_runtime(ref_app, directory):
 
 
 def main():
+    subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "check-deployment-entrypoints.py")], check=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--reference", default=os.path.join(ROOT, "dist", "dsh-fnos.fpk"))
     ap.add_argument("--out", default=os.path.join(ROOT, "dist", "dsh-fnos.fpk"))
@@ -347,9 +404,13 @@ def main():
         with tarfile.open(args.reference, "r:gz") as t:
             extract_member(t, "app.tgz", td)
         bundled_dir = bundle_plugins(os.path.join(td, "plugins-bundled"), args.plugins_from)
-        extra = {"plugins-bundled": bundled_dir} if bundled_dir else None
+        notices_dir = os.path.join(td, "runtime-notices")
+        subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "audit-runtime-licenses.py"), "--app-tgz", ref_app, "--out", notices_dir], check=True)
+        extra = {"third-party/runtime": notices_dir}
+        if bundled_dir:
+            extra["plugins-bundled"] = bundled_dir
         build_app_tgz(ref_app, os.path.join(fnos, "app"), patch,
-                      os.path.join(td, "new-app.tgz"), extra_dirs=extra)
+                      os.path.join(td, "new-app.tgz"), extra_dirs=extra, context_version=target_version)
         audit_reference_runtime(ref_app, os.path.join(td, 'prepack-audit'))
         digest = build_fpk(os.path.join(td, "new-app.tgz"), fnos, args.out,
                            version=target_version)
@@ -367,7 +428,16 @@ def main():
         with t.extractfile("app.tgz") as f:
             with tarfile.open(fileobj=f, mode="r:gz") as inner:
                 inner_names = inner.getnames()
-                assert "runtime/node_modules/@img/sharp-linux-x64/lib/sharp-linux-x64-0.35.4.node" in inner_names
+                sharp_root = "runtime/node_modules/@img/sharp-linux-x64"
+                sharp_meta = json.load(inner.extractfile(sharp_root + "/package.json"))
+                assert sharp_meta["name"] == "@img/sharp-linux-x64"
+                assert sharp_meta["os"] == ["linux"] and sharp_meta["cpu"] == ["x64"]
+                sharp_version = sharp_meta["version"]
+                assert all(part.isdigit() for part in sharp_version.split(".")) and len(sharp_version.split(".")) == 3
+                sharp_binary = sharp_root + "/lib/sharp-linux-x64-" + sharp_version + ".node"
+                assert sharp_binary in inner_names
+                native = inner.extractfile(sharp_binary).read()
+                assert native[:4] == b"\x7fELF" and native[4] == 2 and native[18:20] == b"\x3e\x00"
                 assert "docker-access.js" in inner_names
                 assert "config/privilege" not in inner_names
     with open(args.out, "rb") as f:

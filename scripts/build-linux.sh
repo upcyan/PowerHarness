@@ -47,6 +47,8 @@ command -v node >/dev/null || { echo "Node.js 24 is required." >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required." >&2; exit 1; }
 command -v cc >/dev/null || { echo "A C compiler with static libc is required for the CLI subreaper." >&2; exit 1; }
 
+python3 "$root/scripts/check-deployment-entrypoints.py"
+
 version_py="$root/scripts/version.py"
 current_version="$(python3 "$version_py" show)"
 if [[ -n "$set_version" ]]; then
@@ -84,6 +86,14 @@ chmod 0755 "$stage/cmd/"*
 # Static libc avoids introducing a build-host glibc version dependency on NAS.
 bash "$root/scripts/build-cli-supervisor.sh" "$stage/app"
 mkdir -p "$stage/app/runtime"
+# BEGIN WRAPPER LICENSE STAGING
+for notice in LICENSE LICENSING.md; do
+  [[ -s "$root/$notice" ]] || { echo "required wrapper license missing or empty: $notice" >&2; exit 1; }
+done
+cp "$root/LICENSE" "$stage/app/LICENSE.PowerHarness"
+cp "$root/LICENSING.md" "$stage/app/LICENSING.md"
+chmod 0644 "$stage/app/LICENSE.PowerHarness" "$stage/app/LICENSING.md"
+# END WRAPPER LICENSE STAGING
 cp "$root/package.json" "$root/package-lock.json" "$stage/app/runtime/"
 cp "$root/scripts/patch-dsh.mjs" "$stage/app/patch-dsh.mjs"
 # patch-dsh.mjs resolves legacy-compat.js next to itself (path.dirname(runtime)),
@@ -99,6 +109,8 @@ python3 "$version_py" set "$target_version" --manifest "$stage/manifest" >/dev/n
 # installed NAS can read the architecture, the debugging guide and the change
 # history. Fail loudly if one went missing: a package without them silently loses
 # the only in-band explanation of why this code looks the way it does.
+# Missing local working notes use reviewed public inputs; malformed existing notes fail.
+python3 "$root/scripts/build-context.py" "$root" "$root/fnos/app" "$stage/app" --version "$target_version"
 for required in app/AI-CONTEXT.md app/CHANGELOG-AI.md; do
   [[ -s "$stage/$required" ]] || { echo "required AI context file missing or empty: fnos/$required" >&2; exit 1; }
 done
@@ -119,13 +131,18 @@ grep -q "^## \[$target_version\]" "$stage/app/CHANGELOG-AI.md" \
 # source profile is read only; --plugins-from overrides it for a build machine
 # that has no live profile.
 if [[ -n "${DSH_BUNDLE_PLUGINS_FROM:-}" ]]; then
-  python3 "$root/scripts/bundle-plugins.py" "$DSH_BUNDLE_PLUGINS_FROM" "$stage/app/plugins-bundled"
+  python3 "$root/scripts/bundle-plugins.py" "$DSH_BUNDLE_PLUGINS_FROM" "$stage/app/plugins-bundled" --require-licenses
 elif [[ -d "${HOME:-/nonexistent}/.dsh/profiles/web/node_modules" ]]; then
-  python3 "$root/scripts/bundle-plugins.py" "${HOME}/.dsh/profiles/web" "$stage/app/plugins-bundled"
+  python3 "$root/scripts/bundle-plugins.py" "${HOME}/.dsh/profiles/web" "$stage/app/plugins-bundled" --require-licenses
+elif [[ "${DSH_ALLOW_EMPTY_BUNDLED_PLUGINS:-0}" == 1 ]]; then
+  echo "warning: explicitly building without recovery plugins" >&2
 else
-  echo "note: no plugin source profile found; building without bundled plugins" >&2
-  echo "      set DSH_BUNDLE_PLUGINS_FROM=<profile dir> to include them" >&2
+  echo "error: plugin recovery source missing; set DSH_BUNDLE_PLUGINS_FROM=<profile dir>" >&2
+  echo "       use DSH_ALLOW_EMPTY_BUNDLED_PLUGINS=1 only for an intentional empty package" >&2
+  exit 1
 fi
+
+python3 "$root/scripts/generate-install-wizard.py" "$stage"
 
 npm ci --omit=dev --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
 # npm ci only warns about advisories: it is NOT a release security gate.
@@ -136,6 +153,9 @@ node "$root/scripts/verify-mcp-runtime.mjs" "$stage/app/runtime"
 node "$root/scripts/patch-dsh.mjs" "$stage/app/runtime"
 # Generate from the installed staged runtime, never copy a stale source declaration.
 node "$root/scripts/generate-adapter.cjs" "$stage/app"
+# Inventory the installed payload, not the build host or a prior candidate.
+python3 "$root/scripts/audit-runtime-licenses.py" --runtime "$stage/app/runtime" --out "$stage/app/third-party/runtime"
+cp "$stage/app/third-party/runtime/runtime-licenses.json" "$root/dist/runtime-licenses.json"
 cache_target="$(realpath -m -- "${stage:?}/.npm-cache")"
 [[ "$cache_target" == "$stage/.npm-cache" ]] || { echo "unsafe staging cache path" >&2; exit 1; }
 rm -rf -- "$cache_target"

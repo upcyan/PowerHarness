@@ -19,7 +19,7 @@
 
 // supervisor 能执行的 action（也是 gateway 应转发的集合）。
 const SUPERVISOR_ACTIONS = [
-  'backup', 'restore', 'retry', 'safe-mode', 'check-update',
+  'backup', 'restore', 'retry', 'safe-mode', 'check-update', 'inspect-restore-integrity', 'inspect-core-capabilities',
   'install-core', 'switch-core', 'use-bundled',
   'set-registry', 'set-backup-settings', 'set-docker-mode', 'set-core-port', 'set-public-port',
   'create-profile', 'switch-profile',
@@ -34,7 +34,7 @@ const SUPERVISOR_ACTIONS = [
 
 // gateway 自己处理、不需要 supervisor 参与的 action。
 const GATEWAY_ACTIONS = [
-  'probe-workspace',
+  'probe-workspace', 'set-connection-settings',
   'start-network-debug', 'stop-network-debug',
   'allow-plugin-path', 'dismiss-plugin-path', 'revoke-plugin-path'
 ];

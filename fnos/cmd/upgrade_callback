@@ -1,2 +1,11 @@
 #!/bin/bash
-exit 0
+set -Eeuo pipefail
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+upgrade_callback_error() {
+  local rc=$?
+  printf "DeepSeek Harness 升级后迁移未确认（退出码 %s）；保留数据，不自动重试。\n" "$rc" >&2
+  exit "$rc"
+}
+trap upgrade_callback_error ERR
+# New app files are now available. Do not initialise new defaults on upgrade.
+node "${TRIM_APPDEST:?}/install-migration-cli.js" --preserve-existing > "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1

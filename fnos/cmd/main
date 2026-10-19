@@ -6,6 +6,11 @@ export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
 DATA_DIR="$(readlink -m -- "${TRIM_PKGVAR:?}")" || exit 1
 APP_DIR="$(readlink -e -- "${TRIM_APPDEST:?}")" || exit 1
 [ "$DATA_DIR" != / ] && [ "$APP_DIR" != / ] || exit 1
+if [ -f "$APP_DIR/install-options-cli.js" ]; then
+  DATA_DIR="$(node "$APP_DIR/install-options-cli.js" get-data)" || exit 1
+  FNOS_BACKUP_DIR="$(node "$APP_DIR/install-options-cli.js" get-backup)" || exit 1
+  [ -z "$FNOS_BACKUP_DIR" ] || export FNOS_BACKUP_DIR
+fi
 PID_FILE="$DATA_DIR/supervisor.pid"
 PID_START_FILE="$DATA_DIR/supervisor.pid.starttime"
 LOG_FILE="$DATA_DIR/supervisor.log"
@@ -246,6 +251,10 @@ case "${1:-}" in
     # flock locks a persistent inode (never delete this file). Close fd 9 in
     # spawned supervisor so a daemon cannot keep the instance lock forever.
     if [ "${1}" = stop ] && [ ! -d "$DATA_DIR" ]; then exit 0; fi
+    # Authorization must precede mkdir, chmod, lifecycle lock and log creation.
+    if [ "$1" = start ] && [ -f "$APP_DIR/install-options-cli.js" ]; then
+      node "$APP_DIR/install-options-cli.js" check > "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1 || exit 1
+    fi
     mkdir -p -- "$DATA_DIR" && chmod 700 "$DATA_DIR" || exit 1
     [ ! -L "$DATA_DIR/lifecycle.lock" ] || exit 1
     exec 9>"$DATA_DIR/lifecycle.lock" || exit 1

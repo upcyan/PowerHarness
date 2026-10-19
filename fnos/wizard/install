@@ -1,10 +1,45 @@
 [
   {
-    "stepTitle": "安装说明",
+    "stepTitle": "运行环境",
     "items": [
       {
         "type": "tips",
-        "helpText": "本应用依赖 fnOS 应用中心的「Node.js v24」（nodejs_v24）运行时，安装时系统会自动安装该依赖。安装完成后若应用无法启动或提示插件加载失败，请到应用中心确认 nodejs_v24 已安装且为最新版本，再重启本应用。"
+        "helpText": "需要Node.js v24。核心基础功能随包提供，可选插件在后续步骤自行选择，默认不安装。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "数据与备份目录",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "推荐使用两个独立NAS用户目录。首次安装后请在应用中心 → DeepSeek Harness → 访问权限中授予两目录父目录读写权限。未授权将明确提示并阻止启动，不会自动修改ACL或换用临时目录；已有安装保留原目录。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "数据目录",
+        "initValue": "/vol1/1000/DSH-Data/dsh-fnos",
+        "helpText": "包含设置、会话、私有工作区及插件数据；支持自定义NAS绝对路径。",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入数据目录"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_backup_dir",
+        "label": "备份目录",
+        "initValue": "/vol1/1000/DSH-Recovery/dsh-fnos",
+        "helpText": "必须与数据目录独立，不得相同或互相包含。支持自定义NAS绝对路径。",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入备份目录"
+          }
+        ]
       }
     ]
   }

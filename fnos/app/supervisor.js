@@ -492,7 +492,7 @@ function probePortBusy(port) {
   });
 }
 
-function staleCoreIdentities() { return portOwner.ownedProcesses(dataDir, appDir).filter(identity => identity.role === 'core'); }
+function staleCoreIdentities() { return portOwner.ownedProcesses(dataDir, appDir).filter(identity => ['core', 'market-recovery'].includes(identity.role)); }
 function staleCorePids() { return staleCoreIdentities().map(identity => identity.pid); }
 
 async function releaseOwnedCorePort() {
@@ -549,6 +549,8 @@ async function startDshLocked(directory, profileName, createProfile) {
   // later), so the broken shape appears *after* boot-time checks. Starting with
   // a bare `[]` plus appended rows makes dsh refuse to load the profile at all.
   normalizeProfilePatch(profileName);
+  // Market must not spawn a second core/recovery listener beside supervisor.
+  require('./market-supervision.js').prepare(profiles.directory(dataDir, profileName));
   // 解析卫生（0.3.61，见 MEMORY 二十六）：先归档遮蔽回退层的旧版核心包，再同步
   // 回退层（缺链/旧链 → 指向运行 runtime）。两者任一出问题都会让核心自身的行被
   // 判不兼容而禁用 → 消费者永久 pending → 启动永不就绪（90 秒超时）。
@@ -618,15 +620,16 @@ async function startDshLocked(directory, profileName, createProfile) {
     return await spawnDsh(directory, profileName, createProfile);
   } catch (error) {
     if (!error?.startupTimeout || stopping) throw error;
-    // 冷启动加时（0.3.61）：10-01 15:49（NAS 重启后首拉）核心 90 秒零输出被看门狗
-    // 击杀，而紧接着的手动重试 36 秒就绪——第一次失败的读取恰好暖了缓存。与其把
-    // 冷启动误判成故障送进 safe mode，不如自动加时重试一次；仍超时才按原语义失败。
-    log('dsh startup timed out; retrying once with a 180 seconds budget (cold start)');
-    eventLog('dsh_startup_retry', { firstWaitedMs: 90_000, retryTimeoutMs: 180_000 });
+    // 冷启动加时（0.3.61，10-15 预算提至 600s）：10-01 15:49（NAS 重启后首拉）核心
+    // 90 秒零输出被看门狗击杀；10-15 冷启动实测 115 秒才出首行、185 秒才就绪——
+    // 180 秒重试预算在 HDD+ZFS 冷缓存下不够，砍在 ready 前几秒。按原设计意图
+    // （90s 空转 + 600s 硬上限）放宽重试预算；仍超时才按原语义失败。
+    log('dsh startup timed out; retrying once with a 600 seconds budget (cold start)');
+    eventLog('dsh_startup_retry', { firstWaitedMs: 90_000, retryTimeoutMs: 600_000 });
     await stopDsh();
     await reclaimCorePort();
     configCoordination.assertNoProfileLocks(ops.dataPath(dataDir, 'dsh-home'));
-    return spawnDsh(directory, profileName, createProfile, { startupTimeoutMs: 180_000, attempt: 2 });
+    return spawnDsh(directory, profileName, createProfile, { startupTimeoutMs: 600_000, attempt: 2 });
   }
 }
 
@@ -919,6 +922,25 @@ async function backup(kind, { automatic = kind === 'daily', source = kind === 'd
       coreHandlePresent: Boolean(dsh), coreStopConfirmed, restartPending: Boolean(cleanExitTimer),
       stopping, shuttingDown, cliActive: plugins.cliOperationStatus().length > 0 });
     if (!decision.allowed) return deferAutomaticBackup(source, decision.reason);
+    if (decision.online) {
+      const lastDaily = kind === 'daily' ? ops.listBackups(dataDir).find(item => item.kind === 'daily') : null;
+      if (kind === 'daily' && settings.dailyMode === 'changed' && lastDaily?.fingerprint === ops.snapshotFingerprint(dataDir, configDir)) {
+        clearAutomaticBackupDeferred(source);
+        return { skipped: 'unchanged' };
+      }
+      let snapshot;
+      try { snapshot = ops.createSnapshot(dataDir, configDir, kind, state.activeVersion, { online: true }); }
+      catch (error) {
+        if (error.code === 'ERR_BACKUP_SOURCE_CHANGED') return deferAutomaticBackup(source, 'source-changing');
+        throw error;
+      }
+      // Commit the inventory actually copied, not files written after the snapshot.
+      ops.markSessionsArchived(dataDir, { snapshotId: snapshot.id, inventory: snapshot.sessions });
+      clearAutomaticBackupDeferred();
+      publish({ lastBackup: snapshot.createdAt });
+      eventLog('automatic_backup_created', { source, snapshotId: snapshot.id, consistency: snapshot.consistency });
+      return snapshot;
+    }
   }
   const wasSafe = state.mode === 'safe';
   if (plugins.cliOperationStatus().length) {
@@ -1247,7 +1269,15 @@ async function runCommand(message) {
   let result;
   eventLog('operation_started', { action: message.action });
   try {
-    if (message.action === 'check-update') result = await checkUpdate();
+    if (message.action === 'inspect-restore-integrity') {
+      result = await require('./restore-integrity.js').inspect(dataDir, activeDir, profiles.selected(dataDir));
+      ops.writeJson(ops.dataPath(dataDir, 'restore-integrity.json'), result);
+    }
+    else if (message.action === 'inspect-core-capabilities') {
+      result = require('./core-capabilities.js').inspect(activeDir, cores.adapterFor(activeDir, corePort));
+      ops.writeJson(ops.dataPath(dataDir, 'core-capabilities.json'), result);
+    }
+    else if (message.action === 'check-update') result = await checkUpdate();
     else if (message.action === 'install-core') result = await installCore(message.version);
     else if (message.action === 'switch-core') {
       if (!cores.listCores(dataDir).includes(message.version)) throw new Error('Selected dsh version is not installed');
@@ -1715,8 +1745,9 @@ async function checkSessionArchive({ force = false } = {}) {
     if (!force) deferAutomaticBackup('session', 'scan-incomplete');
     return { ...status, snapshotId: null, skipped: 'scan-incomplete' };
   }
-  // 空基线：只落一个"当前确实为空"的账本，完全不触碰核心。
-  if (!status.known && status.baselineEmpty && !force) {
+  // 空会话也必须先保住配置：没有任何备份时创建首份在线快照。
+  // 已有备份时，空基线仅初始化账本，不触碰核心。
+  if (!status.known && status.baselineEmpty && !force && ops.listBackups(dataDir).length > 0) {
     ops.initEmptySessionArchive(dataDir);
     clearAutomaticBackupDeferred('session');
     log('session archive baseline initialized (0 sessions; core left running)');
@@ -1728,7 +1759,7 @@ async function checkSessionArchive({ force = false } = {}) {
     clearAutomaticBackupDeferred('session');
     return { ...status, snapshotId: null, skipped: 'up-to-date' };
   }
-  const created = await backup('manual', { automatic: !force, source: 'session' });
+  const created = await backup(force ? 'manual' : 'session', { automatic: !force, source: 'session' });
   const after = ops.sessionArchiveStatus(dataDir);
   return {
     ...after,
@@ -1745,7 +1776,7 @@ function scheduleSessionCheck() {
   clearTimeout(sessionTimer);
   sessionTimer = null;
   const settings = (() => { try { return ops.backupSettings(dataDir); } catch { return null; } })();
-  if (!settings || settings.sessionMode !== 'timer') return;
+  if (!settings || !['timer', 'auto'].includes(settings.sessionMode)) return;
   const intervalMs = settings.sessionInterval * 60 * 1000;
   sessionTimer = setTimeout(() => {
     operation = operation.catch(() => {}).then(async () => {

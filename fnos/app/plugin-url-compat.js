@@ -15,8 +15,10 @@
   }
 
   function report(pathname) {
-    const path = '/' + (pathname.split('/')[1] || '');
-    if (!/^\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(path) || reported.has(path) || typeof originalFetch !== 'function') return;
+    const parts = pathname.split(/[?#]/, 1)[0].split('/');
+    const path = parts[1] === '_dsh' ? '/_dsh/' + (parts[2] || '') : '/' + (parts[1] || '');
+    const valid = /^\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(path) || /^\/_dsh\/[a-z0-9][a-z0-9-]{0,31}$/.test(path);
+    if (!valid || reported.has(path) || typeof originalFetch !== 'function') return;
     reported.add(path);
     void originalFetch.call(globalThis, prefix + '/__fnos-plugin-url-candidate', {
       method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path })
@@ -35,8 +37,9 @@
       if (value.startsWith('/app/') || value.startsWith('/_fnos/') || value.startsWith('/__fnos/')) return value;
       if (value === prefix || value.startsWith(prefix + '/')) return value;
       const url = new URL(value, location.origin);
+      const allowed = permitted(url.pathname);
       url.pathname = mapPath(url.pathname);
-      url.search = permitted(new URL(value, location.origin).pathname) ? url.search : '';
+      if (!allowed) { url.search = ''; url.hash = ''; }
       return url.pathname + url.search + url.hash;
     }
     try {

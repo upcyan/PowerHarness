@@ -118,8 +118,8 @@ function stageTarballs(entries, { appDir, profileDir }) {
  * optional plugin need not block startup. Unconfirmed CLI/config transactions
  * instead throw and retain the profile lock; they must not be treated as safe.
  */
-async function installInto({ appDir, dataDir, profile, logFile, onProgress = null }) {
-  const entries = available(appDir);
+async function installInto({ appDir, dataDir, profile, logFile, onProgress = null, selectedNames = null }) {
+  const entries = available(appDir).filter(entry => selectedNames === null || selectedNames.includes(entry.name));
   if (!entries.length) return { installed: [], skipped: [], failed: [] };
 
   const profileDir = profiles.directory(dataDir, profile);
@@ -162,12 +162,21 @@ async function installIntoLocked({ appDir, dataDir, profile, logFile, onProgress
  * - already seeded → do nothing, so an administrator who removed every plugin
  *   keeps that choice.
  */
-async function seed({ appDir, dataDir, profile, logFile }) {
+async function seed({ appDir, dataDir, profile, logFile, selectedNames: explicitSelection }) {
   const state = readSeedState(dataDir);
   if (state.seeded) return { seeded: true, ...{ installed: [], skipped: [], failed: [] } };
-  const summary = await installInto({ appDir, dataDir, profile, logFile });
+  const control = process.env.TRIM_PKGETC || process.env.TRIM_PKGVAR;
+  const choices = control ? require('./install-options.js').read(control) : null;
+  const selectedNames = explicitSelection === undefined ? choices?.selectedPlugins : explicitSelection;
+  if (!Array.isArray(selectedNames)) {
+    state.seeded = true; state.results = {legacy:'no-install-selection-preserve-profile'};
+    writeSeedState(dataDir, state); return {seeded:true,installed:[],skipped:[],failed:[]};
+  }
+  const unknown = selectedNames.filter(name=>!available(appDir).some(entry=>entry.name===name));
+  if (unknown.length) throw new Error('Selected bundled plugins are unavailable; refusing install');
+  const summary = await installInto({ appDir, dataDir, profile, logFile, selectedNames });
   for (const done of summary.installed) {
-    const name = done.split('@')[0];
+    const name = done.slice(0, done.lastIndexOf('@'));
     state.results[name] = 'installed';
   }
   for (const name of summary.skipped) state.results[name] = 'already-present';

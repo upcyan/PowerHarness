@@ -29,3 +29,4 @@ tests/
 # 仍然随 FPK 分发给已安装的 NAS，但不进公开仓库
 fnos/app/AI-CONTEXT.md
 fnos/app/CHANGELOG-AI.md
+.candidate-build.lock

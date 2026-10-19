@@ -1,2 +1,10 @@
 #!/bin/bash
-exit 0
+set -eu
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+"$(dirname "$0")/main" stop
+DATA_DIR="$(node "${TRIM_APPDEST:?}/install-options-cli.js" get-data)" || exit 1
+FNOS_BACKUP_DIR="$(node "${TRIM_APPDEST:?}/install-options-cli.js" get-backup)" || exit 1
+[ -z "$FNOS_BACKUP_DIR" ] || export FNOS_BACKUP_DIR
+wizard_keep_data="${wizard_keep_data:-true}" wizard_delete_confirmation="${wizard_delete_confirmation:-}" \
+FNOS_APP_DIR="${TRIM_APPDEST:?}" FNOS_DATA_DIR="${DATA_DIR:?}" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
+  node "${TRIM_APPDEST}/uninstall-retention.js" >> "${TRIM_PKGVAR}/supervisor.log" 2>&1

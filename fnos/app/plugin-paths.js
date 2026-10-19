@@ -8,6 +8,8 @@ const builtins = [
 const maxPaths = 50;
 
 function normalize(value) {
+  // Shared plugin namespaces are approved per plugin, never as the whole /_dsh tree.
+  if (typeof value === 'string' && /^\/_dsh\/[a-z0-9][a-z0-9-]{0,31}$/.test(value)) return value;
   if (typeof value !== 'string' || !/^\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) throw new Error('无效的插件 API 路径');
   const segment = value.slice(1).toLowerCase();
   if (['.', '..', 'app', 'api', 'plugins', 'assets', 'index.html', 'favicon.svg', 'manifest.webmanifest'].includes(segment) ||
@@ -17,7 +19,9 @@ function normalize(value) {
 
 function firstSegment(pathname) {
   if (typeof pathname !== 'string' || !pathname.startsWith('/') || pathname.startsWith('//')) return null;
-  try { return normalize('/' + (pathname.split('/')[1] || '')); }
+  const parts = pathname.split(/[?#]/, 1)[0].split('/');
+  const candidate = parts[1] === '_dsh' ? '/_dsh/' + (parts[2] || '') : '/' + (parts[1] || '');
+  try { return normalize(candidate); }
   catch { return null; }
 }
 

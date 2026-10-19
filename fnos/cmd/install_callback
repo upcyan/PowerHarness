@@ -1,2 +1,29 @@
 #!/bin/bash
-exit 0
+set -Eeuo pipefail
+export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+export wizard_data_dir="${wizard_data_dir:-}" wizard_backup_dir="${wizard_backup_dir:-}"
+MIGRATE_STAGE="初始化安装设置"
+MIGRATION_ARGS=()
+# Existing configured user data is authoritative; never re-merge a stale legacy copy.
+if [ -f "${TRIM_PKGETC:-${TRIM_PKGVAR:?}}/install-options.json" ]; then
+  MIGRATION_ARGS+=(--preserve-existing)
+fi
+migrate_error() {
+  local rc=$?
+  [ "$rc" -ne 0 ] || rc=1
+  local message="DeepSeek Harness 安装后处理失败：${MIGRATE_STAGE}（退出码 ${rc}）。旧数据目录未改动，请保留现场不要卸载重装。"
+  printf "%s\n" "$message" >&2
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then printf "%s\n" "$message" > "$TRIM_TEMP_LOGFILE"; fi
+  exit "$rc"
+}
+trap migrate_error ERR
+# fnOS exports wizard fields; keep values out of shell evaluation.
+node "${TRIM_APPDEST:?}/install-options-cli.js" init > "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1
+# A pre-existing install keeps its data in TRIM_PKGVAR. When the wizard chose a
+# new data directory, carry the old user data over before the first boot; the
+# old directory is preserved untouched as a rollback.
+MIGRATE_STAGE="迁移旧数据目录到所选位置"
+if [ -n "${TRIM_PKGVAR:-}" ]; then
+  FNOS_APP_DIR="${TRIM_APPDEST}" FNOS_DATA_DIR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC:-}" \
+    node "${TRIM_APPDEST}/install-migration-cli.js" "${MIGRATION_ARGS[@]}" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1
+fi

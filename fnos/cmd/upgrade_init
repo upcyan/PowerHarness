@@ -1,6 +1,36 @@
 #!/bin/bash
-set -eu
+set -Eeuo pipefail
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
+STAGE="校验旧安装"
+upgrade_error() {
+  local rc=$?
+  [ "$rc" -ne 0 ] || rc=1
+  local message="DeepSeek Harness 升级前保护失败：${STAGE}（退出码 ${rc}）。升级已中止，未删除或迁移数据；请保留应用日志，不要卸载重装。"
+  printf "%s\n" "$message" >&2
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then printf "%s\n" "$message" > "$TRIM_TEMP_LOGFILE"; fi
+  exit "$rc"
+}
+trap upgrade_error ERR
+APP_DIR="${TRIM_APPDEST:?}"
+DATA_DIR="$(readlink -m -- "${TRIM_PKGVAR:?}")"
+[ "$DATA_DIR" != / ] && [ -d "$DATA_DIR" ]
+[ -f "$APP_DIR/upgrade-snapshot.js" ]
+# fnOS runs the NEW upgrade hook against the OLD, not-yet-replaced app tree.
+# A 0.3.89 app has no install-options-cli.js; preserve its existing data root.
+if [ -f "$APP_DIR/install-options-cli.js" ]; then
+  STAGE="读取已有存储设置"
+  DATA_DIR="$(node "$APP_DIR/install-options-cli.js" get-data)"
+  FNOS_BACKUP_DIR="$(node "$APP_DIR/install-options-cli.js" get-backup)"
+  [ -z "$FNOS_BACKUP_DIR" ] || export FNOS_BACKUP_DIR
+else
+  CONTROL_DIR="${TRIM_PKGETC:-${TRIM_PKGVAR}}"
+  if [ -e "$CONTROL_DIR/install-options.json" ]; then
+    STAGE="旧安装缺少存储解析器但已有自定义设置，拒绝误回退数据目录"
+    false
+  fi
+fi
+STAGE="停止旧应用"
 "$(dirname "$0")/main" stop
-FNOS_APP_DIR="${TRIM_APPDEST}" FNOS_DATA_DIR="${TRIM_PKGVAR}" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
-  node "${TRIM_APPDEST}/upgrade-snapshot.js" >> "${TRIM_PKGVAR}/supervisor.log" 2>&1
+STAGE="创建并校验升级前独立冷备"
+FNOS_APP_DIR="$APP_DIR" FNOS_DATA_DIR="$DATA_DIR" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
+  node "$APP_DIR/upgrade-snapshot.js" >> "$DATA_DIR/supervisor.log" 2>&1

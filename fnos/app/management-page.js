@@ -10,6 +10,8 @@ const plugins = require('./plugins.js');
 const pluginPaths = require('./plugin-paths.js');
 const grants = require('./grants.js');
 const automaticBackups = require('./automatic-backup-policy.js');
+const managementTheme = require('./management-theme.js');
+const reliabilityPanel = require('./reliability-panel.js');
 const actions = require('./actions.js');   // 破坏性 action 的唯一定义处（见该文件头注释）
 
 const groups = [
@@ -115,7 +117,7 @@ function automaticBackupCard(state, action) {
     (source === 'daily' ? '每日备份' : '会话存档') + '：' + automaticBackups.reasonText(entry.reason)).join('；');
   return '<div id="automatic-backup-notice" class="card remediation"' + (deferred ? '' : ' hidden') + '><h3>自动备份已延期</h3>'
     + '<p id="automatic-backup-reasons">' + escapeHtml(detail) + '</p>'
-    + '<p>为避免中断业务，核心运行或停止未确认时不会自动停服备份。长期运行可能一直无法自动备份，请按需手动操作。</p>'
+    + '<p>自动备份不会停服：就绪核心在线复制并校验源与副本，数据变化或恢复中则延期重试。</p>'
     + '<p class="hint">手动备份会暂停 DSH，正在进行的任务可能中断；完成后自动重新启动核心。</p>'
     + '<div class="actions">' + action('backup', '手动备份（将暂停 DSH）') + '</div></div>';
 }
@@ -128,8 +130,8 @@ function sessionArchiveCard(archive, action, settings) {
     : intervalMin >= 60 ? (intervalMin % 60 === 0 ? intervalMin / 60 + ' 小时' : intervalMin + ' 分钟')
     : intervalMin + ' 分钟';
   const modeText = {
-    auto: '自动：核心启动后检查会话，运行中保守延期',
-    timer: '定时：每 ' + humanInterval + ' 检查一次，运行中延期；确认停止后才快照',
+    auto: '自动：启动后及每 ' + humanInterval + ' 检查会话，在线校验备份',
+    timer: '定时：每 ' + humanInterval + ' 检查一次，在线校验一致后提交快照',
     manual: '手动：仅在点击下方按钮时检查',
   }[mode];
   const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1) + ' MB';
@@ -245,7 +247,11 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const settings = ops.readJson(ops.dataPath(dataDir, 'update-settings.json'), {});
   const registry = cores.registryUrl(settings.registry);
   const installedCores = cores.listCores(dataDir);
-  const backups = ops.listBackups(dataDir);
+  let backups = [], backupReadError = '';
+  try { backups = ops.listBackups(dataDir); } catch (error) {
+    const code = typeof error.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(error.code) ? error.code : '';
+    backupReadError = '备份列表暂不可用' + (code ? '（' + code + '）' : '') + '；请检查数据目录与备份存储。当前无法确认可用备份。';
+  }
   const backupSettings = ops.backupSettings(dataDir);
   const profileNames = profiles.list(dataDir);
   const activeProfile = profiles.selected(dataDir);
@@ -307,7 +313,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const select = (name, values, selected) => `<select name="${name}">${values.map(([value, label]) => `<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`;
   const coreOptions = installedCores.map((version) => [version, `DSH ${version}${version === state.activeVersion ? '（运行中）' : ''}`]);
   const profileOptions = profileNames.map((name) => [name, `${name}${name === activeProfile ? '（运行中）' : ''}`]);
-  const backupRows = backups.map((item) => `<tr><td>${escapeHtml(item.createdAt)}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.version)}</td><td>${action('restore', '恢复此备份', `<input type="hidden" name="backupId" value="${escapeHtml(item.id)}">`)}</td></tr>`).join('');
+  const backupRows = backupReadError ? '<tr><td colspan="4" class="error">' + escapeHtml(backupReadError) + '</td></tr>' : backups.map((item) => `<tr><td>${escapeHtml(item.createdAt)}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.version)}</td><td>${action('restore', '恢复此备份', `<input type="hidden" name="backupId" value="${escapeHtml(item.id)}">`)}</td></tr>`).join('');
   const pluginCards = installedPlugins.map((item) => {
     const field = `<input type="hidden" name="packageName" value="${escapeHtml(item.name)}">`;
     if (item.enablementError) return `<article class="plugin-card"><div><strong>${escapeHtml(item.name)}</strong><span>启用状态记录损坏，操作已锁定</span></div><p class="error">${escapeHtml(item.enablementError)}。请从备份页恢复配置；安装文件未被删除。</p></article>`;
@@ -365,7 +371,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     profiles: `<h2>DSH 配置档</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。新配置档从 DSH 官方 Web 模板创建，切换前自动备份。</p>${form('switch-profile', `<label>已有配置档 ${select('profile', profileOptions, activeProfile)}</label>`, '切换配置档')}${form('create-profile', '<label>新配置档名称 <input name="profile" required pattern="[a-z][a-z0-9_-]{0,31}" maxlength="32" placeholder="例如 work"></label>', '新建并切换')}`,
     grants: `<h2>目录权限</h2><p>在 fnOS 应用中心找到 DeepSeek Harness，打开访问权限并授予需要使用的 NAS 文件夹。授权后重新启动应用，再刷新此页。</p><p>已授权且可读取的目录会在 DSH 工作区的 <code>${escapeHtml(grants.shortcutFolder)}</code> 中显示为快捷入口。文件操作仍受 fnOS 对应用账号授予的权限限制。</p><div class="table-scroll"><table><thead><tr><th>fnOS 授权目录</th><th>当前访问</th></tr></thead><tbody>${grantRows || '<tr><td colspan="2">当前未收到 fnOS 授权目录。请在 fnOS 应用中心授予访问权限。</td></tr>'}</tbody></table></div><div class="divider"></div><h3>检测工作区写入权限</h3><p>输入在 DSH 中选择的完整目录，例如 <code>/vol1/共享文件夹/项目目录</code>。检测会在该目录短暂创建并删除一个空文件夹，与 DSH 的工作区检查一致。</p>${form('probe-workspace', '<label>工作区绝对路径 <input name="workspacePath" required placeholder="/vol1/共享文件夹/项目目录"></label>', '检测实际写入权限')}<p class="hint">上表只显示授权根目录的基础权限；子目录可能有不同 ACL。若刚授权仍未显示，请在 fnOS 应用中心停止并重新启动本应用。</p>`,
     containers: dockerPanel,
-    backups: `<h2>备份与恢复</h2>${automaticBackupCard(state, action)}${sessionArchiveCard(sessionArchive, action, backupSettings)}<p>备份包含 DSH 设置、会话和私有工作区；恢复会覆盖当前数据。</p><p>自动备份条件：${{ always: '每天 03:00', changed: '每天 03:00，仅内容有改动', updates: '仅在更新或切换前' }[backupSettings.dailyMode]}。核心运行或停止未确认时，自动检查会延期，不会主动停服；用户发起更新或切换前的回滚快照仍执行。</p>${action('backup', '立即备份（将暂停 DSH）')}<div class="divider"></div><h3>备份策略</h3>${form('set-backup-settings', `<label>每日保留 <input type="number" name="dailyLimit" min="1" max="30" value="${backupSettings.daily}" required></label><label>手动保留 <input type="number" name="manualLimit" min="1" max="30" value="${backupSettings.manual}" required></label><label>更新前保留 <input type="number" name="upgradeLimit" min="1" max="10" value="${backupSettings['pre-upgrade']}" required></label><label>自动备份 ${select('dailyMode', [['always', '每天'], ['changed', '仅内容有改动'], ['updates', '仅更新或切换前']], backupSettings.dailyMode)}</label><label>会话存档 ${select('sessionMode', [['auto', '自动检查（运行中延期）'], ['timer', '定时检查（运行中延期）'], ['manual', '仅手动']], backupSettings.sessionMode)}</label><label>检查周期（分钟）<input type="number" name="sessionInterval" min="5" max="10080" value="${backupSettings.sessionInterval}" required></label>`, '保存备份策略')}<p class="hint">会话存档策略只影响「是否/何时为会话新建快照」：自动模式在核心启动后检查；定时模式按检查周期执行（5 分钟 ~ 7 天，默认 60 分钟）。核心运行、停止未确认或管理命令仍活动时均延期，仅在已确认停止的安全模式下自动快照。长期运行可能一直无法自动备份；手动备份会暂停任务并重新启动核心。</p>}<h3>已有备份</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>DSH 版本</th><th>操作</th></tr></thead><tbody>${backupRows || '<tr><td colspan="4">暂无备份</td></tr>'}</tbody></table></div>`,
+    backups: `<h2>备份与恢复</h2>${automaticBackupCard(state, action)}${sessionArchiveCard(sessionArchive, action, backupSettings)}<p>备份包含 DSH 设置、会话和私有工作区；恢复会覆盖当前数据。</p><p>自动备份条件：${{ always: '每天 03:00', changed: '每天 03:00，仅内容有改动', updates: '仅在更新或切换前' }[backupSettings.dailyMode]}。就绪核心在线校验备份，不主动停服；数据变化、恢复或停止未确认时延期重试。会话快照单独保留 48 份，不占用手动备份名额。</p>${action('backup', '立即备份（将暂停 DSH）')}<div class="divider"></div><h3>备份策略</h3>${form('set-backup-settings', `<label>每日保留 <input type="number" name="dailyLimit" min="1" max="30" value="${backupSettings.daily}" required></label><label>手动保留 <input type="number" name="manualLimit" min="1" max="30" value="${backupSettings.manual}" required></label><label>更新前保留 <input type="number" name="upgradeLimit" min="1" max="10" value="${backupSettings['pre-upgrade']}" required></label><label>自动备份 ${select('dailyMode', [['always', '每天'], ['changed', '仅内容有改动'], ['updates', '仅更新或切换前']], backupSettings.dailyMode)}</label><label>会话存档 ${select('sessionMode', [['auto', '自动检查（运行中延期）'], ['timer', '定时检查（运行中延期）'], ['manual', '仅手动']], backupSettings.sessionMode)}</label><label>检查周期（分钟）<input type="number" name="sessionInterval" min="5" max="10080" value="${backupSettings.sessionInterval}" required></label>`, '保存备份策略')}<p class="hint">会话存档策略只影响「是否/何时为会话新建快照」：自动模式在核心启动后检查；定时模式按检查周期执行（5 分钟 ~ 7 天，默认 60 分钟）。核心运行、停止未确认或管理命令仍活动时均延期，仅在已确认停止的安全模式下自动快照。长期运行可能一直无法自动备份；手动备份会暂停任务并重新启动核心。</p>}<h3>已有备份</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>DSH 版本</th><th>操作</th></tr></thead><tbody>${backupRows || '<tr><td colspan="4">暂无备份</td></tr>'}</tbody></table></div>`,
     runtime: `${state.mode === 'safe' ? remediationGuide({
       action,
       error: state.error,
@@ -382,7 +388,17 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     terminal: `<h2>命令行</h2><p>在当前配置档目录直接执行 <code>dsh</code>、<code>npm</code>、<code>pnpm</code> 命令（例如 <code>dsh plugin --profile web list</code>、<code>pnpm ls --depth 0</code>）。仅管理员可用；不经过 shell，60 秒超时，输出保留最近 20 条。</p>${form('run-terminal-command', '<label>命令 <input name="command" required autocomplete="off" spellcheck="false" placeholder="dsh plugin --profile web list" style="width:100%;min-width:0"></label>', '执行')}${terminalHistory.length ? `<h3>最近执行</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>命令</th><th>退出码</th></tr></thead><tbody>${terminalHistory.map((item) => `<tr><td>${escapeHtml(item.time)}</td><td><code>${escapeHtml(item.command)}</code></td><td>${item.code}</td></tr>`).join('')}</tbody></table></div><h3>最近一次输出</h3><pre class="patch-readonly">${escapeHtml(terminalHistory[0]?.output || '（无输出）')}</pre>` : '<p class="hint">还没有执行记录。</p>'}`
   };
 
-  const primaryNav = groups.map((item) => `<a href="/__fnos/?view=${item.items[0][0]}"${item.id === group.id ? ' aria-current="page"' : ''}>${item.label}</a>`).join('');
+  let integrityReport = null;
+  try { integrityReport = ops.readJson(ops.dataPath(dataDir, 'restore-integrity.json')); } catch { integrityReport = {status:'unknown',issues:[{code:'report-unreadable'}]}; }
+  if (view === 'versions') {
+    let capability = null; try { capability = ops.readJson(ops.dataPath(dataDir, 'core-capabilities.json')); } catch {}
+    panels[view] += `<section class="reliability-status"><h3>实际启动能力</h3><p>${capability ? escapeHtml(capability.status === 'compatible' ? '实际参数能力匹配；仍需完整启动验收' : '参数能力不兼容或未确认') : '尚未检查当前核心的实际 CLI 参数'}</p>${action('inspect-core-capabilities', '只读检查实际参数（不重启）')}</section>`;
+  }
+  if (view === 'runtime') panels[view] += require('./connection-settings').render(dataDir, form);
+  if (['overview', 'backups', 'logs'].includes(view)) panels[view] += reliabilityPanel.render({dataDir,state,backups,backupReadError,profile:activeProfile,authorizedCount:authorizedDirectories.length,action,report:integrityReport});
+
+  const navIcons = {overview:"M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",core:"M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 3v9m8-4.5L12 12 4 7.5m8 4.5v9",data:"M3 6h7l2 3h9v11H3z M3 6V4h7l2 2",diagnostics:"M3 12h4l3-7 4 14 3-7h4"};
+  const primaryNav = groups.map((item) => `<a href="/__fnos/?view=${item.items[0][0]}"${item.id === group.id ? ' aria-current="page"' : ''}><svg class="nav-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="${navIcons[item.id]}"></path></svg><span class="nav-label">${escapeHtml(item.label)}</span></a>`).join('');
   const secondaryNav = group.items.map(([id, label]) => `<a href="/__fnos/?view=${id}"${id === view ? ' aria-current="page"' : ''}>${label}</a>`).join('');
   // 标题栏重启：点击先弹窗二选一（0.3.62）。
   // 起因：原来只有一个按钮直接走 `retry`——它**只重启 core**。改了 supervisor /
@@ -970,24 +986,24 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   });
   </script>` : '';
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DeepSeek Harness 应用设置</title><style>
-*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#1c2333;font:15px/1.55 system-ui,sans-serif}.shell{max-width:980px;margin:auto;padding:24px 18px 64px}.notice{position:sticky;top:0;z-index:10;padding:12px max(18px,calc((100vw - 944px)/2));background:#e6f5eb;color:#14522e;border-bottom:1px solid #b8ddc4;box-shadow:0 3px 12px #17224715}.notice-error{background:#fff0ee;color:#9b2424;border-color:#edc0ba}.pending{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;margin:0 0 18px;padding:14px 16px;background:#fff8e6;border:1px solid #e8cf95;border-left:4px solid #c8901a;border-radius:10px}.pending strong{display:block;margin-bottom:6px;color:#7a5200}.pending p{margin:0 0 6px}.pending .hint{margin:0}.pending .actions{display:flex;gap:8px;flex:none;flex-wrap:wrap}/* 宽屏下 form 是 inline-flex（按钮排一行用的），会让它按内容收缩 —— 实测
+*{box-sizing:border-box}body{margin:0;background:var(--mg-bg,#fff);color:var(--mg-text,#0f1115);font:15px/1.55 system-ui,sans-serif}.shell{max-width:980px;margin:auto;padding:24px 18px 64px}.notice{position:sticky;top:0;z-index:10;padding:12px max(18px,calc((100vw - 944px)/2));background:#e6f5eb;color:#14522e;border-bottom:1px solid #b8ddc4;box-shadow:0 3px 12px #17224715}.notice-error{background:#fff0ee;color:#9b2424;border-color:#edc0ba}.pending{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;margin:0 0 18px;padding:14px 16px;background:#fff8e6;border:1px solid #e8cf95;border-left:4px solid #c8901a;border-radius:10px}.pending strong{display:block;margin-bottom:6px;color:#7a5200}.pending p{margin:0 0 6px}.pending .hint{margin:0}.pending .actions{display:flex;gap:8px;flex:none;flex-wrap:wrap}/* 宽屏下 form 是 inline-flex（按钮排一行用的），会让它按内容收缩 —— 实测
    944px 的卡片里 form 只有 318px，patch 编辑器因此极窄。含编辑器的 form
    单独改成块级撑满，编辑器才拿得到全宽。 */
 form:has(.patch-editor){display:block;width:100%;margin:8px 0}
 form:has(.patch-editor) textarea{width:100%}
-.patch-editor{width:100%;min-height:56vh;padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:1px solid #cdd6e4;border-radius:10px;background:#fbfcfe;color:#1c2333;resize:vertical;white-space:pre;overflow:auto}
+.patch-editor{width:100%;min-height:56vh;padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;border:1px solid #cdd6e4;border-radius:10px;background:#fbfcfe;color:var(--mg-text,#0f1115);resize:vertical;white-space:pre;overflow:auto}
 /* 只读展示块同理，避免长行被容器压窄 */
-.patch-readonly{width:100%}.patch-readonly{margin:8px 0 0;padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f4f6fb;border:1px solid #e3e8f2;border-radius:10px;white-space:pre-wrap;overflow-wrap:anywhere;color:#44506b}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}h1{font-size:23px;margin:0}header .state{font-size:13px;padding:6px 10px;border-radius:999px;background:#e6ecfa;color:#244b95;white-space:nowrap}.primary,.secondary{display:flex;gap:7px;overflow-x:auto;white-space:nowrap}.primary{padding:5px 0 12px}.secondary{padding:12px 0 18px;border-top:1px solid #e3e7ef}.primary a,.secondary a{display:inline-flex;align-items:center;min-height:36px;padding:7px 13px;border-radius:9px;color:#344054;text-decoration:none}.primary a{font-weight:600}.primary a[aria-current],.secondary a[aria-current]{background:#175cd3;color:#fff}.secondary a:not([aria-current]):hover,.primary a:not([aria-current]):hover{background:#e8edf7}.card{background:#fff;border:1px solid #e5e9f1;border-radius:15px;padding:24px;box-shadow:0 4px 20px #1722470b;min-height:300px}h2{font-size:21px;margin:0 0 14px}h3{font-size:16px;margin:24px 0 10px}p{margin:12px 0}.hint{color:#667085;font-size:14px}.error{color:#a52222}.divider{border-top:1px solid #e5e9f1;margin:22px 0}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.summary div{background:#f5f8ff;padding:16px;border-radius:10px}.summary span{display:block;color:#667085;font-size:13px}.summary strong{display:block;margin-top:5px;overflow-wrap:anywhere;font-size:17px}form{display:inline-flex;align-items:end;flex-wrap:wrap;gap:8px;margin:5px 10px 5px 0;max-width:100%}form label{display:flex;flex-direction:column;gap:4px;font-size:14px;min-width:0}input,select{font:inherit;min-height:38px;max-width:100%;padding:7px 9px;border:1px solid #cbd2df;border-radius:8px;background:#fff;color:#1c2333}input[type=number]{width:86px}input[type=url],inpu... (line truncated to 2000 chars)
+.patch-readonly{width:100%}.patch-readonly{margin:8px 0 0;padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f4f6fb;border:1px solid #e3e8f2;border-radius:10px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--mg-muted,#61666b)}header{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}h1{font-size:23px;margin:0}header .state{font-size:13px;padding:6px 10px;border-radius:999px;background:#e6ecfa;color:var(--mg-accent,#4176e6);white-space:nowrap}.primary,.secondary{display:flex;gap:7px;overflow-x:auto;white-space:nowrap}.primary{padding:5px 0 12px}.secondary{padding:12px 0 18px;border-top:1px solid #e3e7ef}.primary a,.secondary a{display:inline-flex;align-items:center;min-height:36px;padding:7px 13px;border-radius:9px;color:var(--mg-muted,#61666b);text-decoration:none}.primary a{font-weight:600}.primary a[aria-current],.secondary a[aria-current]{background:var(--mg-active,#f2f3f5);color:var(--mg-text,#0f1115)}.secondary a:not([aria-current]):hover,.primary a:not([aria-current]):hover{background:var(--mg-soft,#f7f8fa)}.card{background:#fff;border:1px solid #e5e9f1;border-radius:15px;padding:24px;box-shadow:0 4px 20px #1722470b;min-height:300px}h2{font-size:21px;margin:0 0 14px}h3{font-size:16px;margin:24px 0 10px}p{margin:12px 0}.hint{color:var(--mg-muted,#61666b);font-size:14px}.error{color:#a52222}.divider{border-top:1px solid #e5e9f1;margin:22px 0}.summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.summary div{background:#f5f8ff;padding:16px;border-radius:10px}.summary span{display:block;color:var(--mg-muted,#61666b);font-size:13px}.summary strong{display:block;margin-top:5px;overflow-wrap:anywhere;font-size:17px}form{display:inline-flex;align-items:end;flex-wrap:wrap;gap:8px;margin:5px 10px 5px 0;max-width:100%}form label{display:flex;flex-direction:column;gap:4px;font-size:14px;min-width:0}input,select{font:inherit;min-height:38px;max-width:100%;padding:7px 9px;border:1px solid #cbd2df;border-radius:8px;background:#fff;color:var(--mg-text,#0f1115)}input[type=number]{width:86px}input[type=url],inpu... (line truncated to 2000 chars)
   button.is-working{box-shadow:inset 0 0 0 1px #a3dfff}
   button.is-working::after{inset:0;padding:2px;background:conic-gradient(from var(--edge-angle),transparent 0deg 190deg,#58bfff33 220deg,#6bceffb3 260deg,#f5fdff 300deg,#8cdeff 325deg,transparent 360deg);animation-duration:1.8s}
   @media(prefers-reduced-motion:reduce){button.is-working::after{background:#84d6ff}}
   .debug-info{display:grid;gap:10px;padding:15px;margin:14px 0;background:#f5f8ff;border:1px solid #dfe8fb;border-radius:10px;overflow-wrap:anywhere}.debug-info code{user-select:all}
   /* 全局按钮基础样式（曾被误删 → 所有按钮回退浏览器默认外观；HEAD 版本恢复） */
-  button,.primary-link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;border:0;border-radius:8px;background:#175cd3;color:#fff;padding:8px 13px;font:inherit;text-decoration:none;cursor:pointer}
+  button,.primary-link{display:inline-flex;align-items:center;justify-content:center;min-height:38px;border:0;border-radius:8px;background:var(--mg-accent,#4176e6);color:#fff;padding:8px 13px;font:inherit;text-decoration:none;cursor:pointer}
   button:hover,.primary-link:hover{background:#1248a4}
   button.danger{background:#fff3f2;color:#a52828;border:1px solid #e8b5b1}
   button.danger:hover{background:#ffe6e3}
-  header .header-actions{display:flex;align-items:center;gap:8px;flex:none}header .header-actions form{display:block;width:auto;margin:0}button.restart-icon{width:34px;height:34px;min-height:34px;padding:0;border:1px solid #cbd7ef;border-radius:9px;background:#fff;color:#175cd3;display:flex;align-items:center;justify-content:center}button.restart-icon:hover,button.restart-icon:focus-visible{background:#e8f0ff;border-color:#82a9ed}button.restart-icon svg{display:block}
+  header .header-actions{display:flex;align-items:center;gap:8px;flex:none}header .header-actions form{display:block;width:auto;margin:0}button.restart-icon{width:34px;height:34px;min-height:34px;padding:0;border:1px solid #cbd7ef;border-radius:9px;background:#fff;color:var(--mg-accent,#4176e6);display:flex;align-items:center;justify-content:center}button.restart-icon:hover,button.restart-icon:focus-visible{background:#e8f0ff;border-color:#82a9ed}button.restart-icon svg{display:block}
 /* 图标绕自身中心旋转。用 transform-box:view-box + transform-origin:center，
    轴心是 24x24 视口中心；该图标的墨迹在视口内四边等距，所以轴心即图形中心。
    改用 fill-box 会以包围盒为轴，图形一变就抖。 */
@@ -1000,16 +1016,16 @@ button.restart-icon .restart-glyph{transform-box:view-box;transform-origin:cente
 .restart-dialog-backdrop{position:absolute;inset:0;background:#0f172a99}
 .restart-dialog-card{position:relative;width:100%;max-width:560px;background:#fff;border-radius:14px;padding:22px;box-shadow:0 18px 48px #0f172a33;max-height:90vh;overflow:auto}.notice-busy{background:#fffaeb;border-color:#fedf89;color:#7a2e0e}.op-line{display:block;margin-top:6px;font-weight:600}.op-hint{display:block;margin-top:4px;font-size:12px;opacity:.85;font-weight:400}.restart-caveat{display:block;margin-top:8px;padding:7px 9px;background:#fffaeb;border:1px solid #fedf89;border-radius:7px;font-size:12px;line-height:1.5;color:#7a2e0e;font-style:normal}
 .restart-dialog-card h3{margin:0 0 6px;font-size:18px}
-.restart-dialog-hint{margin:0 0 16px;color:#667085;font-size:13px}
+.restart-dialog-hint{margin:0 0 16px;color:var(--mg-muted,#61666b);font-size:13px}
 .restart-options{display:grid;gap:10px}
 .restart-options form{margin:0}
-button.restart-option{display:block;width:100%;text-align:left;padding:14px;border:1px solid #cbd7ef;border-radius:11px;background:#fff;color:#1c2333;cursor:pointer;font:inherit}
+button.restart-option{display:block;width:100%;text-align:left;padding:14px;border:1px solid #cbd7ef;border-radius:11px;background:#fff;color:var(--mg-text,#0f1115);cursor:pointer;font:inherit}
 button.restart-option:hover,button.restart-option:focus-visible{background:#f2f6ff;border-color:#82a9ed}
-button.restart-option strong{display:block;margin-bottom:4px;font-size:15px;color:#175cd3}
-button.restart-option span{display:block;font-size:13px;color:#475467;line-height:1.5}
-button.restart-option em{font-style:normal;color:#175cd3}
+button.restart-option strong{display:block;margin-bottom:4px;font-size:15px;color:var(--mg-accent,#4176e6)}
+button.restart-option span{display:block;font-size:13px;color:var(--mg-tertiary,#81858c);line-height:1.5}
+button.restart-option em{font-style:normal;color:var(--mg-accent,#4176e6)}
 .restart-dialog-foot{margin-top:14px;text-align:right}
-button.restart-cancel{padding:9px 16px;border:1px solid #cbd7ef;border-radius:9px;background:#fff;color:#475467;cursor:pointer;font:inherit}
+button.restart-cancel{padding:9px 16px;border:1px solid #cbd7ef;border-radius:9px;background:#fff;color:var(--mg-tertiary,#81858c);cursor:pointer;font:inherit}
 button.restart-cancel:hover{background:#f5f7fb}
 body.restart-dialog-open{overflow:hidden}
 /* 分级排障引导（0.3.62）：把平铺的修复按钮按破坏性分成四级，
@@ -1020,7 +1036,7 @@ body.restart-dialog-open{overflow:hidden}
 .guide .guide-row.tone-danger{border-left-color:#d0553f;background:#fdf4f2}
 .guide .guide-text{flex:1 1 320px;min-width:0}
 .guide .guide-text strong{display:block;margin-bottom:4px}
-.guide .guide-text span{display:block;font-size:13px;color:#475467;line-height:1.55}
+.guide .guide-text span{display:block;font-size:13px;color:var(--mg-tertiary,#81858c);line-height:1.55}
 .guide .guide-actions{display:flex;gap:8px;flex-wrap:wrap;flex:1 1 100%;min-width:0;max-width:100%;align-items:center}
 .guide .guide-actions form{margin:0;min-width:0;max-width:100%}
 .guide button{max-width:100%;white-space:normal;overflow-wrap:anywhere}
@@ -1028,7 +1044,7 @@ body.restart-dialog-open{overflow:hidden}
 .card code{overflow-wrap:anywhere}
 .ai-fields{display:grid;gap:10px;min-width:0}.ai-diagnosis label{display:block;min-width:0}.ai-diagnosis input,.ai-diagnosis select,.ai-diagnosis textarea{width:100%;max-width:100%;min-width:0}.ai-diagnosis textarea{padding:10px;resize:vertical}.ai-diagnosis #ai-log{max-height:320px;overflow:auto;overflow-wrap:anywhere}
 @media(max-width:560px){.guide .guide-actions{display:grid;grid-template-columns:minmax(0,1fr);width:100%}.guide .guide-actions form,.guide .guide-actions button,.guide .guide-actions a{width:100%;min-width:0}.notice{overflow-wrap:anywhere}}
-.guide .guide-foot{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid #e4e9f2;font-size:13px;color:#667085}
+.guide .guide-foot{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid #e4e9f2;font-size:13px;color:var(--mg-muted,#61666b)}
 button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear infinite}
   /* 重启按钮不叠加按钮级边缘流光：图标旋转 + 整页边框流光已经足够表达忙态，
      按钮太小，两层流光叠在一起只会互相糊。 */
@@ -1047,7 +1063,7 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
       linear-gradient(to top, #6db8f233, transparent 46px),
       linear-gradient(to right, #6db8f233, transparent 46px),
       linear-gradient(to left, #6db8f233, transparent 46px)}
-  @media(prefers-reduced-motion:reduce){body.page-busy::after{animation:none;background:#84d6ff33}body.page-busy::before{background:none}}.group-description{margin:0;padding:0 2px 10px;color:#667085;font-size:13px}@media(max-width:620px){header{align-items:flex-start}header .header-actions{gap:6px}button.restart-icon{width:34px}header .state{font-size:12px}}
+  @media(prefers-reduced-motion:reduce){body.page-busy::after{animation:none;background:#84d6ff33}body.page-busy::before{background:none}}.group-description{margin:0;padding:0 2px 10px;color:var(--mg-muted,#61666b);font-size:13px}@media(max-width:620px){header{align-items:flex-start}header .header-actions{gap:6px}button.restart-icon{width:34px}header .state{font-size:12px}}
     /* ===== 0.3.61 界面完善：补齐缺失元素样式 + 响应式 + 无障碍 ===== */
   /* 指标卡：原先固定 3 列，而概览实际有 4 个指标（状态/核心/配置档/应用版本），
      第 4 个会单独换行、宽度与上面三个不齐 —— 改成按可用宽度自适应。 */
@@ -1056,7 +1072,7 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
      管理员看不出「这张卡需要我做点什么」。左侧强调边 + 浅底把它区分出来。 */
   .card.remediation{border-left:4px solid #c8901a;background:#fffdf7}
   .card.remediation h3{margin-top:0;color:#7a5200}
-  .card.remediation h4{margin:14px 0 6px;font-size:14px;color:#44506b}
+  .card.remediation h4{margin:14px 0 6px;font-size:14px;color:var(--mg-muted,#61666b)}
   .card.remediation ul{margin:6px 0;padding-left:22px}
   .card.remediation li{margin:6px 0}
   /* 卡片内动作区：原先只靠 form 自身的 margin 撑开，多个按钮间距不一致。 */
@@ -1069,7 +1085,7 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
   .plugin-card{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;padding:13px 15px;background:#fbfcfe;border:1px solid #e5e9f1;border-radius:11px}
   .plugin-card>div:first-child{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1 1 200px}
   .plugin-card strong{font-size:15px;overflow-wrap:anywhere}
-  .plugin-card span{color:#667085;font-size:13px}
+  .plugin-card span{color:var(--mg-muted,#61666b);font-size:13px}
   .plugin-card .actions{margin:0;flex:none}
   .plugin-card .actions form{margin:0}
   @media(max-width:560px){.plugin-card{flex-direction:column;align-items:stretch}.plugin-card .actions{width:100%}.plugin-card .actions>form{flex:1 1 auto}.plugin-card .actions button{width:100%}}
@@ -1079,21 +1095,21 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
   .table-scroll table{margin:0}
   table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
   th,td{padding:9px 10px;text-align:left;border-bottom:1px solid #e9edf5;vertical-align:middle}
-  th{color:#667085;font-weight:600;background:#f7f9fd}
+  th{color:var(--mg-muted,#61666b);font-weight:600;background:#f7f9fd}
   tbody tr:hover{background:#fafcff}
   /* 折叠块：诊断卡的「核心最后输出」等 details 此前是默认外观。 */
   details{margin:10px 0;border:1px solid #e3e8f2;border-radius:10px;background:#fbfcfe}
-  summary{padding:9px 12px;cursor:pointer;font-size:14px;color:#344054}
+  summary{padding:9px 12px;cursor:pointer;font-size:14px;color:var(--mg-muted,#61666b)}
   details[open] summary{border-bottom:1px solid #e9edf5}
   details>pre{margin:0;border:0;border-radius:0 0 10px 10px}
   /* 代码块：日志、patch 片段、输出尾部的统一呈现。 */
-  pre{margin:10px 0;padding:12px;background:#f4f6fb;border:1px solid #e3e8f2;border-radius:10px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:#44506b;max-height:420px;overflow:auto}
+  pre{margin:10px 0;padding:12px;background:#f4f6fb;border:1px solid #e3e8f2;border-radius:10px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--mg-muted,#61666b);max-height:420px;overflow:auto}
   /* 状态徽标语义色：原先只有蓝色一种，运行中/安全模式/维护中长得一样。 */
   header .state.ok{background:#e6f5eb;color:#14522e}
   header .state.warn{background:#fff4e0;color:#7a5200}
   header .state.bad{background:#fff0ee;color:#9b2424}
   /* 键盘可达性：此前只有重启按钮有焦点样式，其余控件见不到焦点。 */
-  a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #175cd3;outline-offset:2px}
+  a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--mg-accent,#4176e6);outline-offset:2px}
   /* 平板/窄屏：原本 620px 以外没有任何适配，24px 卡片内边距在平板上偏挤。 */
   @media(max-width:1024px){.shell{padding:20px 14px 48px}.card{padding:20px}}
   @media(max-width:760px){
@@ -1143,7 +1159,7 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
   .plugin-card strong,.debug-info code,.card code{overflow-wrap:anywhere}
   /* 防止横向滚动条：页面级兜底。 */
   html,body{max-width:100%;overflow-x:hidden}
-</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${statusBanner}${pendingBar}${restartDialog}<div class="shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><nav class="primary" aria-label="设置分类">${primaryNav}</nav><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div>${busyScript}</body></html>`;
+${managementTheme.css}</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${statusBanner}${pendingBar}${restartDialog}<div class="shell settings-shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><div class="settings-layout"><aside class="settings-sidebar"><nav class="primary" aria-label="设置分类">${primaryNav}</nav></aside><div class="settings-content"><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div></div></div>${busyScript}${nonce ? `<script nonce="${nonce}">(${managementTheme.installNavigation.toString()})();</script>` : ''}</body></html>`;
 }
 
 module.exports = { render, selectedView };

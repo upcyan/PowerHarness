@@ -1,0 +1,40 @@
+[
+  {
+    "stepTitle": "卸载 DeepSeek Harness",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "默认先将设置、会话、私有工作区与插件完整保全到独立存储并校验。fnOS 会移除应用私有数据，保全失败将拒绝卸载；已有独立备份不会被本应用自动删除。"
+      },
+      {
+        "type": "select",
+        "field": "wizard_keep_data",
+        "label": "数据处理",
+        "initValue": "true",
+        "options": [
+          {
+            "label": "独立保全数据（推荐）",
+            "value": "true"
+          },
+          {
+            "label": "明确删除应用私有数据（不创建本次保全）",
+            "value": "false"
+          }
+        ],
+        "rules": [
+          {
+            "required": true,
+            "message": "请选择数据处理方式"
+          }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_delete_confirmation",
+        "label": "删除确认",
+        "helpText": "只有选择删除且输入 DELETE DSH DATA 才跳过本次保全。留空或输入不匹配一律保全。",
+        "initValue": ""
+      }
+    ]
+  }
+]
