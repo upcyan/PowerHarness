@@ -998,6 +998,7 @@ async function backup(kind, { automatic = kind === 'daily', source = kind === 'd
 }
 
 async function switchProfile(name, create = false) {
+  if (name === 'fnos-diagnostic') throw new Error('fnos-diagnostic 是网关专用诊断配置档，不能作为主核心配置档切换或创建');
   const selected = create ? profiles.create(dataDir, name) : profiles.validateName(name);
   if (!create && !profiles.list(dataDir).includes(selected)) throw new Error('dsh profile does not exist');
   const previous = profiles.selected(dataDir);
@@ -1020,20 +1021,24 @@ async function switchProfile(name, create = false) {
   }
 }
 
-async function installPlugin(spec) {
+async function installPlugin(spec, updateName = null) {
   const profile = profiles.selected(dataDir);
   const registry = updateSettings().registry;
-  publishMaintenance(`正在安装插件 ${spec}（含依赖解析，可能需要下载）`, 120);
+  publishMaintenance(`正在${updateName ? "更新" : "安装"}插件 ${updateName || spec}（含依赖解析，可能需要下载）`, 120);
   await stopDsh();
   const snapshot = ops.createSnapshot(dataDir, configDir, 'pre-upgrade', state.activeVersion);
   try {
-    const result = await plugins.install(dataDir, profile, spec, registry);
+    const result = updateName ? await plugins.update(dataDir, profile, updateName, registry) : await plugins.install(dataDir, profile, spec, registry);
     await startDsh(activeDir);
     await probeWeb();
     clearPendingRestore();
     publish({ mode: readyMode(), lastBackup: snapshot.createdAt, error: null });
     return result;
   } catch (error) {
+    if (configCoordination.isUnconfirmed(error)) {
+      publish({ mode: 'safe', lastBackup: snapshot.createdAt, error: `插件事务未确认，保留现场且不启动核心：${error.message}` });
+      throw error;
+    }
     // Try the data as it stands before offering to roll it back: a refused
     // install usually leaves the tree untouched, and the snapshot is older
     // than everything the user has done since.
@@ -1160,6 +1165,18 @@ async function uninstallPlugin(name, label, profile) {
   return { ...result, pendingRestore: true, warning: `${reason}。可在下方选择是否恢复到操作前的快照。` };
 }
 
+async function disablePluginBatch(names) {
+  return require('./plugin-batch-operation.js').run({
+    plugins, dataDir, profile: profiles.selected(dataDir), names, wasSafe: state.mode === 'safe',
+    stop: () => stopDsh(),
+    start: async () => { await startDsh(activeDir); await probeWeb(); },
+    maintenance: text => publishMaintenance(text),
+    ready: warning => { clearPendingRestore(); publish({ mode: readyMode(), error: warning || null }); },
+    safe: error => publish({ mode: 'safe', error }),
+    isUnconfirmed: error => configCoordination.isUnconfirmed(error),
+  });
+}
+
 async function managePlugin(action, spec) {
   const wasSafe = state.mode === 'safe';
   const profile = profiles.selected(dataDir);
@@ -1167,6 +1184,10 @@ async function managePlugin(action, spec) {
   const installed = plugins.list(dataDir, profile).find((item) => item.name === name);
   if (requestedVersion || !installed) throw new Error('Plugin is not installed in this profile');
   if (installed.enablementError) throw new Error(`插件启用状态记录损坏，已拒绝操作且未停服；请从备份页恢复配置：${installed.enablementError}`);
+  if (action === 'update-plugin') {
+    const plan = plugins.planUpdate(dataDir, profile, name);
+    return installPlugin(plan.spec, name);
+  }
   const label = action === 'enable-plugin' ? '启用' : '禁用';
   return action === 'uninstall-plugin'
     ? uninstallPlugin(name, '卸载', profile)
@@ -1286,7 +1307,8 @@ async function runCommand(message) {
     else if (message.action === 'create-profile') result = await switchProfile(message.profile, true);
     else if (message.action === 'switch-profile') result = await switchProfile(message.profile);
     else if (message.action === 'install-plugin') result = await installPlugin(message.packageName);
-    else if (['disable-plugin', 'enable-plugin', 'uninstall-plugin'].includes(message.action)) result = await managePlugin(message.action, message.packageName);
+    else if (message.action === 'disable-plugins') result = await disablePluginBatch(message.packageNames);
+    else if (['disable-plugin', 'enable-plugin', 'uninstall-plugin', 'update-plugin'].includes(message.action)) result = await managePlugin(message.action, message.packageName);
     else if (message.action === 'set-backup-settings') {
       result = ops.saveBackupSettings(dataDir, {
         daily: message.dailyLimit, manual: message.manualLimit,
@@ -1446,8 +1468,8 @@ async function runCommand(message) {
       }
     }
     else if (message.action === 'enter-diagnosis') {
-      const diagnosis = require('./diagnosis-mode').enter(dataDir);
-      result = { ...state, diagnosis, note: '已打开只读 AI 辅助诊断；未修改配置、未重启核心。' };
+      const diagnosis = require('./diagnosis-mode').ensure(dataDir, patchYamlModule(), process.env.FNOS_APP_DIR);
+      result = { ...state, diagnosis, note: '专用诊断配置档已准备；未修改或切换主配置档、未重启核心。' };
     }
     else if (message.action === 'exit-diagnosis') {
       const recovery = require('./diagnosis-mode').exit(dataDir, patchYamlModule());

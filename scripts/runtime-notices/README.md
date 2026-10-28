@@ -1,0 +1,9 @@
+# Exact-version upstream notice supplements
+
+These are verbatim upstream legal texts for exact package versions, not new license grants or a redistribution approval. The manifest binds each installed package root, name/version and original package.json SHA256 to the text digest and public source URL.
+
+The Linux build stages these only into its private FPK staging tree before generating the runtime inventory. Missing/changed packages, modified texts, symlinks and conflicting existing notices abort before any notice is written. Identical existing texts are left unchanged. Installed app paths are rejected.
+
+The source set currently covers 28 package roots and 29 legal documents. The three @aws-sdk packages are bound to the monorepo Apache-2.0 LICENSE (fixed Git blob 0322cba2; no per-package tag exists upstream). The same-version Koffi project notice is bound to its generated native subpackage by the publisher manifest and version-enforcing loader. imurmurhash binds its exact published-tarball README, which carries the complete MIT grant. The inspector binds the deepseek-harness project MIT text shipped with the same-version profile package. The set also includes exact npm tarball texts, fixed npm gitHead repository texts, verified npm SLSA provenance for two pi packages, and a fixed-commit README containing the complete data-uri-to-buffer MIT grant. Original copyright and text bytes are preserved.
+
+This supplementation does not resolve the remaining package attribution/text gaps, copyleft corresponding-source, combination/relink conditions or optional plugin obligations. Runtime audit remains required; legalClearance is not-assessed and distributable is false. Updating a dependency requires fresh version-bound evidence, not relaxing the checks or replacing it with latest-branch text.

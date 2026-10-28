@@ -1,0 +1,434 @@
+{
+  "schema": 1,
+  "legalClearance": "not-assessed",
+  "distributable": false,
+  "packages": [
+    {
+      "packagePath": "node_modules/@xterm/addon-serialize/package.json",
+      "name": "@xterm/addon-serialize",
+      "version": "0.14.0",
+      "manifestSha256": "48b1c275c67f141828765fbf188457c430827c333dba069fe4520cbedb729763",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd.txt",
+          "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+          "sourceUrl": "https://github.com/xtermjs/xterm.js/blob/f447274f430fd22513f6adbf9862d19524471c04/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@xterm/headless/package.json",
+      "name": "@xterm/headless",
+      "version": "6.0.0",
+      "manifestSha256": "6c39530ee759998113bd8bcc306d1b725c0b1d5b0cdc04e071f6945a5f5edf1a",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd.txt",
+          "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd",
+          "sourceUrl": "https://github.com/xtermjs/xterm.js/blob/f447274f430fd22513f6adbf9862d19524471c04/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/@npmcli/fs/package.json",
+      "name": "@npmcli/fs",
+      "version": "4.0.0",
+      "manifestSha256": "028cce261f1b1840efa893492a88911e0f4832e29b46ae0dd38eb6ba5ae85856",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/27d998b503b18cdb16c49e93da04069a99ba8a1d7e18d67146de8e242f9a6d21.txt",
+          "sha256": "27d998b503b18cdb16c49e93da04069a99ba8a1d7e18d67146de8e242f9a6d21",
+          "sourceUrl": "https://registry.npmjs.org/@npmcli/fs/-/fs-4.0.0.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/balanced-match/package.json",
+      "name": "balanced-match",
+      "version": "1.0.2",
+      "manifestSha256": "b30c328501dead1870b894ad604405b2284b571c1f12664cdc61d92a2e3397c2",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/a1bd5deadb6a06dd74efa852c1b8b23f63b67f2214fbe9c8bd591da51da69268.txt",
+          "sha256": "a1bd5deadb6a06dd74efa852c1b8b23f63b67f2214fbe9c8bd591da51da69268",
+          "sourceUrl": "https://registry.npmjs.org/balanced-match/-/balanced-match-1.0.2.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/cacache/package.json",
+      "name": "cacache",
+      "version": "19.0.1",
+      "manifestSha256": "3b4d9ce8c3a3f853d903c06b5ec38a06c8ac9a2ccb236bf6a532d92cfe1b07de",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/720836c9bdad386485a492ab41fe08007ecf85ca278ddd8f9333494dcac4949d.txt",
+          "sha256": "720836c9bdad386485a492ab41fe08007ecf85ca278ddd8f9333494dcac4949d",
+          "sourceUrl": "https://registry.npmjs.org/cacache/-/cacache-19.0.1.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/chownr/package.json",
+      "name": "chownr",
+      "version": "3.0.0",
+      "manifestSha256": "4300e90fdd91ec7035047473c60f880251a9801bd786302729d4277751d3b948",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09.txt",
+          "sha256": "a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09",
+          "sourceUrl": "https://registry.npmjs.org/chownr/-/chownr-3.0.0.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/jackspeak/package.json",
+      "name": "jackspeak",
+      "version": "3.4.3",
+      "manifestSha256": "3379e9c1be25729a6c7fc160e840108e15895c368e8060e42f68598f9f3065cd",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/2c7c5d22ed5a8ee968c64757710979afcd77438c48b4a265b94e615babd8a901.txt",
+          "sha256": "2c7c5d22ed5a8ee968c64757710979afcd77438c48b4a265b94e615babd8a901",
+          "sourceUrl": "https://registry.npmjs.org/jackspeak/-/jackspeak-3.4.3.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/minipass-flush/package.json",
+      "name": "minipass-flush",
+      "version": "1.0.7",
+      "manifestSha256": "00eb6d6a76a29658c56bfc079f9e5ec008ae6ba136b83467777948280077185c",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004.txt",
+          "sha256": "8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004",
+          "sourceUrl": "https://registry.npmjs.org/minipass-flush/-/minipass-flush-1.0.7.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/minipass/package.json",
+      "name": "minipass",
+      "version": "7.1.3",
+      "manifestSha256": "b8ab116187d5e9375d494f17437eb862cbee4b329c21f15412c6a5170ec2f55c",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004.txt",
+          "sha256": "8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004",
+          "sourceUrl": "https://registry.npmjs.org/minipass/-/minipass-7.1.3.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/ms/package.json",
+      "name": "ms",
+      "version": "2.1.3",
+      "manifestSha256": "1a6b4d9739790c0b94ab96c8cc0507e281c164c311ff4fbf5e57fb8d26290b40",
+      "documents": [
+        {
+          "target": "license.md",
+          "text": "texts/1662fae9b5314d11cf51284e2dcd1f006a354f7343f08712a730fcff9a359801.txt",
+          "sha256": "1662fae9b5314d11cf51284e2dcd1f006a354f7343f08712a730fcff9a359801",
+          "sourceUrl": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/package-json-from-dist/package.json",
+      "name": "package-json-from-dist",
+      "version": "1.0.1",
+      "manifestSha256": "38fdaf168bc63a6422a7dbe7e41a7b52b02326edef8b14019e0333ef60b37b47",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09.txt",
+          "sha256": "a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09",
+          "sourceUrl": "https://registry.npmjs.org/package-json-from-dist/-/package-json-from-dist-1.0.1.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/path-scurry/package.json",
+      "name": "path-scurry",
+      "version": "1.11.1",
+      "manifestSha256": "eda5ff683c26f88a134198fa2700b371abc9092c61a81474226bdfc6f9348c14",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004.txt",
+          "sha256": "8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004",
+          "sourceUrl": "https://registry.npmjs.org/path-scurry/-/path-scurry-1.11.1.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/ssri/package.json",
+      "name": "ssri",
+      "version": "12.0.0",
+      "manifestSha256": "5c18917c39afce09b6ebdfd212c736c390d74d1a72db8bd1561117f949669252",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/3749709146345fa15546aaba4e3ab1b3b92a4d930077b5bc32d90815cb63afaf.txt",
+          "sha256": "3749709146345fa15546aaba4e3ab1b3b92a4d930077b5bc32d90815cb63afaf",
+          "sourceUrl": "https://registry.npmjs.org/ssri/-/ssri-12.0.0.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/tar/package.json",
+      "name": "tar",
+      "version": "7.5.19",
+      "manifestSha256": "fcf76ebf77de20fe58d1359debefc072577d0321f530f91100399609568b75de",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004.txt",
+          "sha256": "8a1af140fdfbf5afd3df27f7e662f989c5b963a300020dfafce42033cae9e004",
+          "sourceUrl": "https://registry.npmjs.org/tar/-/tar-7.5.19.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/yallist/package.json",
+      "name": "yallist",
+      "version": "5.0.0",
+      "manifestSha256": "1b9d47057ce39814531ff93f668823b4fa03e7d23945449c274a1ff6d4cc297f",
+      "documents": [
+        {
+          "target": "LICENSE.md",
+          "text": "texts/a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09.txt",
+          "sha256": "a49c9ba464796f65b59fca3f1e6ca40912df1e859f575383223f7ec6c5baae09",
+          "sourceUrl": "https://registry.npmjs.org/yallist/-/yallist-5.0.0.tgz",
+          "identityCheck": "npm-exact-version-SRI-and-published-manifest"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/saxes/package.json",
+      "name": "saxes",
+      "version": "6.0.0",
+      "manifestSha256": "32052572b41c2a890ed0854798c48454cc5991dcaafe5fb1718a4253046acfd3",
+      "documents": [
+        {
+          "target": "AUTHORS",
+          "text": "texts/4e9bfee1d0ed0a8bdacbdc1acf0a999b17054aa7bfc52eff00e869472be2a5cc.txt",
+          "sha256": "4e9bfee1d0ed0a8bdacbdc1acf0a999b17054aa7bfc52eff00e869472be2a5cc",
+          "sourceUrl": "https://github.com/lddubeau/saxes/blob/211fa0ebec9b628affc09219199639887174bfc3/AUTHORS",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        },
+        {
+          "target": "LICENSE",
+          "text": "texts/0fac2374380621b22e6b50451057721a9c52935b02d16d106a9f04897f061d0e.txt",
+          "sha256": "0fac2374380621b22e6b50451057721a9c52935b02d16d106a9f04897f061d0e",
+          "sourceUrl": "https://github.com/lddubeau/saxes/blob/211fa0ebec9b628affc09219199639887174bfc3/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/sherpa-onnx-linux-x64/package.json",
+      "name": "sherpa-onnx-linux-x64",
+      "version": "1.13.8",
+      "manifestSha256": "1f968d74c36a44be07872cf5d3a8d9f6e9589928e3763632aed81a03127ac096",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "sourceUrl": "https://github.com/csukuangfj/sherpa-onnx/blob/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/sherpa-onnx-node/package.json",
+      "name": "sherpa-onnx-node",
+      "version": "1.13.8",
+      "manifestSha256": "e93e192e89e06d62e45ba583600af3c2f87b01a58f1dff121906714f06d703aa",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "sourceUrl": "https://github.com/csukuangfj/sherpa-onnx/blob/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/standardwebhooks/package.json",
+      "name": "standardwebhooks",
+      "version": "1.1.1",
+      "manifestSha256": "686397f0f0202e0b693cfd3f6241d7a8da3df326f9642867a484fbbd295690b6",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4.txt",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+          "sourceUrl": "https://github.com/standard-webhooks/standard-webhooks/blob/b4d2c14fc5b4ccff3ff271e3b087dff812254c59/LICENSE",
+          "identityCheck": "npm-gitHead-pinned-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@earendil-works/pi-ai/package.json",
+      "name": "@earendil-works/pi-ai",
+      "version": "1.3.0",
+      "manifestSha256": "4e9ed07b06a91d844485874c251f312b610d015a4a4fd32c78cde58a7862a3f1",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48.txt",
+          "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+          "sourceUrl": "https://github.com/earendil-works/pi/blob/71023aec1546d6d677a65669c5665c0927ce0dd0/LICENSE",
+          "identityCheck": "verified-SLSA-subject-and-workflow-plus-fixed-source-package-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@earendil-works/pi-telemetry/package.json",
+      "name": "@earendil-works/pi-telemetry",
+      "version": "1.3.0",
+      "manifestSha256": "386479e7767a2aff572fea6339558405b1b23e9e7951504731515fc71b7db6ae",
+      "documents": [
+        {
+          "target": "LICENSE",
+          "text": "texts/0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48.txt",
+          "sha256": "0457f5bcec3b3b211605dfb5d1a49042fd638f3686a410fe099c24a25af13c48",
+          "sourceUrl": "https://github.com/earendil-works/pi/blob/71023aec1546d6d677a65669c5665c0927ce0dd0/LICENSE",
+          "identityCheck": "verified-SLSA-subject-and-workflow-plus-fixed-source-package-Git-blob"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/data-uri-to-buffer/package.json",
+      "name": "data-uri-to-buffer",
+      "version": "4.0.1",
+      "manifestSha256": "ad4f90a737ab5d8af4dad265e9218456e3779ca5beb70df38dd5feecf80121dd",
+      "documents": [
+        {
+          "target": "NOTICE.source-README.md",
+          "text": "texts/a7cc4332acfa1f9b6530e01aac77fefe74f2efa32579215fddaa473013f9a25c.txt",
+          "sha256": "a7cc4332acfa1f9b6530e01aac77fefe74f2efa32579215fddaa473013f9a25c",
+          "sourceUrl": "https://github.com/TooTallNate/node-data-uri-to-buffer/blob/85cd8c854aefbf1bb636789d80364cfac8ea1583/README.md",
+          "identityCheck": "npm-gitHead-and-fixed-source-Git-blob; full grant in README"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@koromix/koffi-linux-x64/package.json",
+      "name": "@koromix/koffi-linux-x64",
+      "version": "3.1.1",
+      "manifestSha256": "468c0748da5e9c74dfa58308dd23383c49505d29a911998bfac86edf9cba1d02",
+      "documents": [
+        {
+          "target": "LICENSE.Koffi-project.txt",
+          "text": "texts/22bcbbbacd739b026a8dc484f62a31484ce4c4e31f3408b60b29b4e41d62b290.txt",
+          "sha256": "22bcbbbacd739b026a8dc484f62a31484ce4c4e31f3408b60b29b4e41d62b290",
+          "sourceUrl": "https://registry.npmjs.org/koffi/-/koffi-3.1.1.tgz",
+          "identityCheck": "same-project exact koffi@3.1.1 parent; publisher SRI and original manifest/text match; exact optional native dependency and version-enforcing loader"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/pnpm/dist/node_modules/imurmurhash/package.json",
+      "name": "imurmurhash",
+      "version": "0.1.4",
+      "manifestSha256": "aa3b07e7fa3d63aa96e401c3842b8cca1dd3247954baf92377094766e903c185",
+      "documents": [
+        {
+          "target": "LICENSE.from-published-README.txt",
+          "text": "texts/4491517f7deb68d0b2a3bb590e785e276a60f12448447a9650d0bd50161a101c.txt",
+          "sha256": "4491517f7deb68d0b2a3bb590e785e276a60f12448447a9650d0bd50161a101c",
+          "sourceUrl": "https://registry.npmjs.org/imurmurhash/-/imurmurhash-0.1.4.tgz",
+          "identityCheck": "exact npm tarball SRI; published package.json byte-identical to frozen payload; README carries the complete MIT grant"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@deepseek-ai/dsh-experimental-inspector/package.json",
+      "name": "@deepseek-ai/dsh-experimental-inspector",
+      "version": "0.2.1-rc.2",
+      "manifestSha256": "8fa8b089e35ff0ee884c21e570006004d153489185d26f6c3f2afed8a9864aad",
+      "documents": [
+        {
+          "target": "LICENSE.DeepSeek-project.txt",
+          "text": "texts/ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be.txt",
+          "sha256": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be",
+          "sourceUrl": "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-inspector-profile/-/dsh-experimental-inspector-profile-0.2.1-rc.2.tgz",
+          "identityCheck": "same deepseek-harness project at 0.2.1-rc.2; profile tarball SRI; profile manifest byte-identical to frozen payload; profile LICENSE is the project MIT text already shipped with @deepseek-ai/dsh"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@aws-sdk/credential-provider-http/package.json",
+      "name": "@aws-sdk/credential-provider-http",
+      "version": "3.972.76",
+      "manifestSha256": "c79b69a2e9dba1f267d2605065dd0668a1e30bfaeeede5032f1f90767c1b36dc",
+      "documents": [
+        {
+          "target": "LICENSE.Apache-2.0.txt",
+          "text": "texts/edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d.txt",
+          "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+          "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
+          "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@aws-sdk/credential-provider-login/package.json",
+      "name": "@aws-sdk/credential-provider-login",
+      "version": "3.972.81",
+      "manifestSha256": "64f70b3dfc1ae18643b25157322aa4b38c4e02a47fbba95d08d7f421f5152b80",
+      "documents": [
+        {
+          "target": "LICENSE.Apache-2.0.txt",
+          "text": "texts/edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d.txt",
+          "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+          "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
+          "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
+        }
+      ]
+    },
+    {
+      "packagePath": "node_modules/@aws-sdk/nested-clients/package.json",
+      "name": "@aws-sdk/nested-clients",
+      "version": "3.997.48",
+      "manifestSha256": "3566438b4ebec512260cc6f52aa35e8bea3a67ba6f807bf8ef67dba647919dea",
+      "documents": [
+        {
+          "target": "LICENSE.Apache-2.0.txt",
+          "text": "texts/edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d.txt",
+          "sha256": "edea91454b811f127fbdea3d86f378f6719bd372ed440abf82b232f6fca06c3d",
+          "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
+          "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
+        }
+      ]
+    }
+  ]
+}

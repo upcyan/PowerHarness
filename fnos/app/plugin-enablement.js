@@ -108,60 +108,88 @@ function transform(text, ids, record, yaml, ops, name) {
   }
   return { text: apply(text, edits), rows: saved };
 }
-function commit(dataDir, profile, manifestFile, manifest, beforePatch, afterPatch, ops, beforeManifest, patchSnapshot) {
-  const patchFile = path.join(path.dirname(manifestFile), 'cordis.patch.yml');
-  const manifestRevision = coordination.revision(beforeManifest), patchRevision = coordination.revision(patchSnapshot);
-  coordination.assertRevision(manifestFile, manifestRevision);
-  coordination.assertRevision(patchFile, patchRevision);
-  const evidence = `${manifestFile}.enablement-backup-${randomBytes(8).toString('hex')}`;
-  fs.writeFileSync(evidence, beforeManifest, { flag: 'wx', mode: 0o600 });
-  const hadPatch = patchSnapshot !== null;
-  if (!hadPatch && afterPatch !== beforePatch) throw Object.assign(new Error('patch 已消失，拒绝创建未经确认的新配置'), { code: 'ERR_CONFIG_CONFLICT' });
-  const backup = hadPatch ? ops.backupPatchConfig(dataDir, patchFile, profile) : null;
-  if (hadPatch && !backup) throw new Error('patch 备份未确认，拒绝写入');
-  coordination.assertRevision(manifestFile, manifestRevision);
-  coordination.assertRevision(patchFile, patchRevision);
-  const manifestAfter = JSON.stringify(manifest, null, 2);
-  let patchWritten = false;
+// Rollback handles are process-local, opaque and bounded; old/forged handles fail closed.
+const rollbackHandles = new Map();
+const MAX_ROLLBACK_HANDLES = 64;
+function fileIdentity(file) {
+  const info = fs.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  return info ? [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(':') : null;
+}
+function saveRollback(directory, image, names) {
+  const token = randomBytes(24).toString('hex');
+  rollbackHandles.set(token, { directory: fs.realpathSync(directory), image, names: [...names], manifestIdentity: fileIdentity(path.join(directory, 'package.json')), patchIdentity: fileIdentity(path.join(directory, 'cordis.patch.yml')) });
+  while (rollbackHandles.size > MAX_ROLLBACK_HANDLES) rollbackHandles.delete(rollbackHandles.keys().next().value);
+  return token;
+}
+function discardEvidence(file, manifestFile) {
+  if (path.resolve(file) !== file || path.dirname(file) !== path.dirname(manifestFile) || !file.startsWith(manifestFile + '.enablement-backup-')) throw new Error('Invalid transaction evidence path');
+  try { fs.unlinkSync(file); } catch (failure) { if (failure.code !== 'ENOENT') throw failure; }
+}
+function keepUnknown(directory, details, cause, rollbackErrors = []) {
+  let retentionError;
+  try { coordination.retain(directory, details); } catch (failure) { retentionError = failure; }
+  throw Object.assign(new Error('UNKNOWN: 配置回滚所有权未确认；已保留锁与证据，请勿重复操作'), {
+    code: 'ERR_ENABLEMENT_UNKNOWN', cause, rollbackErrors, retentionError, ...details,
+  });
+}
+// A pair is published once, under the shared profile lease. Compensation only
+// touches exact images actually attempted by this transaction, including a write
+// that renamed successfully and then threw. Foreign bytes are never restored over.
+function publishPair(dataDir, profile, directory, image, ops, jsonManifest) {
+  const manifestFile = path.join(directory, 'package.json'), patchFile = path.join(directory, 'cordis.patch.yml');
+  const { beforeManifest, afterManifest, beforePatch, afterPatch } = image;
+  coordination.assertRevision(manifestFile, coordination.revision(beforeManifest));
+  coordination.assertRevision(patchFile, coordination.revision(beforePatch));
+  if (beforePatch === null && afterPatch !== null) throw Object.assign(new Error('patch 已消失，拒绝创建未经确认的新配置'), { code: 'ERR_CONFIG_CONFLICT' });
+  const evidence = manifestFile + '.enablement-backup-' + randomBytes(8).toString('hex');
+  fs.writeFileSync(evidence, JSON.stringify({ version: 1, profile, ...image }), { flag: 'wx', mode: 0o600 });
+  let backup = null, patchAttempted = false, manifestAttempted = false;
   try {
-    if (afterPatch !== beforePatch) {
-      ops.atomicPatchWrite(patchFile, afterPatch, { expectedRevision: patchRevision }); patchWritten = true;
+    if (beforePatch !== null) {
+      backup = ops.backupPatchConfig(dataDir, patchFile, profile);
+      if (!backup) throw new Error('patch 备份未确认，拒绝写入');
     }
-    ops.writeJson(manifestFile, manifest, { expectedRevision: manifestRevision });
-    coordination.assertRevision(manifestFile, coordination.revision(manifestAfter));
-    if (patchWritten) coordination.assertRevision(patchFile, coordination.revision(afterPatch));
+    coordination.assertRevision(manifestFile, coordination.revision(beforeManifest));
+    coordination.assertRevision(patchFile, coordination.revision(beforePatch));
+    if (afterPatch !== beforePatch) {
+      patchAttempted = true;
+      ops.atomicPatchWrite(patchFile, afterPatch, { expectedRevision: coordination.revision(beforePatch) });
+    }
+    if (afterManifest !== beforeManifest) {
+      manifestAttempted = true;
+      if (jsonManifest) ops.writeJson(manifestFile, jsonManifest, { expectedRevision: coordination.revision(beforeManifest) });
+      else ops.atomicPatchWrite(manifestFile, afterManifest, { expectedRevision: coordination.revision(beforeManifest) });
+    }
+    coordination.assertRevision(manifestFile, coordination.revision(afterManifest));
+    coordination.assertRevision(patchFile, coordination.revision(afterPatch));
   } catch (failure) {
     const failures = [];
-    // Never restore a file merely because it was read earlier. Only our own
-    // exact published image may be rolled back; newer foreign bytes survive.
-    let currentManifest;
-    try { currentManifest = coordination.snapshot(manifestFile); } catch (error) { failures.push(error); }
-    if (currentManifest === manifestAfter) {
-      try { ops.atomicPatchWrite(manifestFile, beforeManifest, { expectedRevision: coordination.revision(manifestAfter) }); } catch (error) { failures.push(error); }
-    } else if (currentManifest !== beforeManifest && patchWritten) {
-      failures.push(Object.assign(new Error('manifest 已被外部改写，拒绝回滚覆盖'), { code: 'ERR_CONFIG_CONFLICT' }));
+    for (const [file, original, published, attempted] of [
+      [manifestFile, beforeManifest, afterManifest, manifestAttempted],
+      [patchFile, beforePatch, afterPatch, patchAttempted],
+    ]) {
+      try {
+        const current = coordination.snapshot(file);
+        if (attempted && current === published && original !== published) ops.atomicPatchWrite(file, original, { expectedRevision: coordination.revision(published) });
+        else if ((patchAttempted || manifestAttempted) && current !== original) throw Object.assign(new Error(path.basename(file) + ' 已被外部改写，拒绝回滚覆盖'), { code: 'ERR_CONFIG_CONFLICT' });
+      } catch (error) { failures.push(error); }
     }
-    if (patchWritten) {
-      let currentPatch;
-      try { currentPatch = coordination.snapshot(patchFile); } catch (error) { failures.push(error); }
-      if (currentPatch === afterPatch) {
-        try { ops.atomicPatchWrite(patchFile, beforePatch, { expectedRevision: coordination.revision(afterPatch) }); } catch (error) { failures.push(error); }
-      } else if (currentPatch !== patchSnapshot) {
-        failures.push(Object.assign(new Error('patch 已被外部改写，拒绝回滚覆盖'), { code: 'ERR_CONFIG_CONFLICT' }));
-      }
-    }
-    if (failures.length) {
-      let retentionError;
-      try { coordination.retain(path.dirname(manifestFile), { evidence, backup, phase: 'rollback-unconfirmed' }); } catch (error) { retentionError = error; }
-      throw Object.assign(new Error('UNKNOWN: 配置回滚所有权未确认；已保留锁与备份，请勿重复操作'), { code: 'ERR_ENABLEMENT_UNKNOWN', cause: failure, rollbackErrors: failures, retentionError, evidence, backup });
-    }
-    discardEvidence(); throw failure;
+    if (failures.length) keepUnknown(directory, { evidence, backup, phase: 'rollback-unconfirmed' }, failure, failures);
+    try { discardEvidence(evidence, manifestFile); }
+    catch (error) { keepUnknown(directory, { evidence, backup, phase: 'evidence-cleanup-unconfirmed' }, failure, [error]); }
+    throw failure;
   }
-  discardEvidence(); return { backup };
-  function discardEvidence() {
-    if (path.resolve(evidence) !== evidence || path.dirname(evidence) !== path.dirname(manifestFile) || !evidence.startsWith(manifestFile + '.enablement-backup-')) throw new Error('Invalid transaction evidence path');
-    try { fs.unlinkSync(evidence); } catch { /* retained evidence is harmless */ }
-  }
+  try { discardEvidence(evidence, manifestFile); }
+  catch (failure) { keepUnknown(directory, { evidence, backup, phase: 'evidence-cleanup-unconfirmed' }, failure); }
+  return { backup };
+}
+function commit(dataDir, profile, manifestFile, manifest, beforePatch, afterPatch, ops, beforeManifest, patchSnapshot, options = {}) {
+  const directory = path.dirname(manifestFile);
+  const image = { beforeManifest, afterManifest: JSON.stringify(manifest, null, 2), beforePatch: patchSnapshot, afterPatch: patchSnapshot === null ? null : afterPatch };
+  if (patchSnapshot === null && beforePatch !== afterPatch) throw Object.assign(new Error('patch 已消失，拒绝创建未经确认的新配置'), { code: 'ERR_CONFIG_CONFLICT' });
+  const result = publishPair(dataDir, profile, directory, image, ops, manifest);
+  if (options.rollbackNames) result.rollbackToken = saveRollback(directory, image, options.rollbackNames);
+  return result;
 }
 function set(dataDir, profile, state, enabled, ops, options = {}) {
   if (options.preflightOnly === true) {
@@ -240,4 +268,89 @@ function forgetLocked(dataDir, profile, name, ops, options) {
   commit(dataDir, profile, manifestFile, manifest, before, next, ops, beforeManifest, patchSnapshot);
   return true;
 }
-module.exports = { KEY, intents, set, forget, ownedIds };
+function batchFailure(failures) {
+  return Object.assign(new Error('批量禁用预检失败：' + failures.map(item => item.name + '：' + item.reason).join('；')), { code: 'ERR_PLUGIN_BATCH_PREFLIGHT', failures });
+}
+function disableBatch(dataDir, profile, directory, names, ops, options = {}) {
+  const applyBatch = () => {
+    const manifestFile = path.join(directory, 'package.json'), patchFile = path.join(directory, 'cordis.patch.yml');
+    const beforeManifest = coordination.snapshot(manifestFile), patchSnapshot = coordination.snapshot(patchFile);
+    let manifest, disabled, yaml;
+    try {
+      manifest = JSON.parse(beforeManifest);
+      if (!manifest || !Array.isArray(manifest.dsh?.profile?.bundles)) throw new Error('dsh profile manifest is incompatible');
+      disabled = intents(manifest); yaml = parser(options);
+    } catch (failure) { throw batchFailure(names.map(name => ({ name, reason: failure.message, code: failure.code || 'ERR_PLUGIN_BINDING' }))); }
+    const before = patchSnapshot ?? ops.PATCH_EMPTY;
+    let next = before;
+    const changed = [], skipped = [], failures = [], owners = new Map();
+    for (const [owner, record] of Object.entries(disabled)) for (const id of record.ids) {
+      if (!owners.has(id)) owners.set(id, owner);
+      else owners.set(id, null);
+    }
+    for (const name of names) {
+      try {
+        if (!Object.hasOwn(manifest.dependencies || {}, name)) throw new Error('Plugin is not installed in this profile');
+        const record = Object.hasOwn(disabled, name) ? disabled[name] : undefined;
+        const ids = ownedIds(directory, name, yaml, ops);
+        if (record && (record.ids.length !== ids.length || ids.some(id => !record.ids.includes(id)))) throw new Error('bundle entry 声明已变化，拒绝不精确禁用/恢复');
+        if (ids.some(id => owners.has(id) && owners.get(id) !== name)) throw new Error('entry 归属与其他 package 冲突，拒绝禁用');
+        const bundled = manifest.dsh.profile.bundles.includes(name);
+        if (record) {
+          transform(next, ids, record, yaml, ops, name); // verify without restoring
+          if (!bundled) { skipped.push(name); continue; }
+        } else if (!bundled && locate(next, ids, yaml, ops, name).every(hit => hit.pair?.value?.value === true)) {
+          skipped.push(name); continue;
+        }
+        if (!record) {
+          const result = transform(next, ids, null, yaml, ops, name);
+          next = result.text; disabled[name] = { ids, rows: result.rows };
+        }
+        for (const id of ids) owners.set(id, name);
+        manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(item => item !== name);
+        changed.push(name);
+      } catch (failure) { failures.push({ name, reason: failure.message, code: failure.code || 'ERR_PLUGIN_BINDING' }); }
+    }
+    if (failures.length) throw batchFailure(failures);
+    const check = ops.validatePatchText(next, yaml);
+    if (!check.ok) throw batchFailure(names.map(name => ({ name, reason: check.error, code: 'ERR_PLUGIN_BINDING' })));
+    coordination.assertRevision(manifestFile, coordination.revision(beforeManifest));
+    coordination.assertRevision(patchFile, coordination.revision(patchSnapshot));
+    if (options.preflightOnly === true || !changed.length) return { changed, skipped, preflightOnly: options.preflightOnly === true, rollbackToken: null };
+    manifest[KEY] = { version: 1, disabled };
+    return { changed, skipped, preflightOnly: false, ...commit(dataDir, profile, manifestFile, manifest, before, next, ops, beforeManifest, patchSnapshot, { rollbackNames: changed }) };
+  };
+  if (options.preflightOnly === true) { if (options.admissionChecked !== true) coordination.assertCanStart(dataDir); return applyBatch(); }
+  return coordination.withLock(directory, applyBatch);
+}
+function restoreDisabledBatch(dataDir, profile, directory, result, ops) {
+  return coordination.withLock(directory, () => {
+    if (result?.preflightOnly === true) throw new Error('预检结果没有可恢复的提交');
+    if (Array.isArray(result?.changed) && result.changed.length === 0 && result.rollbackToken === null) return { changed: [], restored: true };
+    const entry = rollbackHandles.get(result?.rollbackToken);
+    if (!entry || entry.directory !== fs.realpathSync(directory)) throw Object.assign(new Error('批量禁用恢复 token 无效、过期或不属于此 profile'), { code: 'ERR_ENABLEMENT_TOKEN' });
+    const { image } = entry, manifestFile = path.join(directory, 'package.json'), patchFile = path.join(directory, 'cordis.patch.yml');
+    try {
+      coordination.assertRevision(manifestFile, coordination.revision(image.afterManifest));
+      coordination.assertRevision(patchFile, coordination.revision(image.afterPatch));
+      if (fileIdentity(manifestFile) !== entry.manifestIdentity || fileIdentity(patchFile) !== entry.patchIdentity) throw Object.assign(new Error('已发布文件的身份或版本变化，拒绝恢复同字节外部重发布'), { code: 'ERR_CONFIG_CONFLICT' });
+    } catch (failure) {
+      const evidence = manifestFile + '.enablement-backup-' + randomBytes(8).toString('hex');
+      let evidenceError;
+      try { fs.writeFileSync(evidence, JSON.stringify({ version: 1, profile, ...image }), { flag: 'wx', mode: 0o600 }); } catch (error) { evidenceError = error; }
+      keepUnknown(directory, { evidence, phase: 'restore-conflict' }, failure, evidenceError ? [evidenceError] : []);
+    }
+    publishPair(dataDir, profile, directory, { beforeManifest: image.afterManifest, afterManifest: image.beforeManifest, beforePatch: image.afterPatch, afterPatch: image.beforePatch }, ops);
+    rollbackHandles.delete(result.rollbackToken);
+    return { changed: [...entry.names], restored: true };
+  });
+}
+function packageIds(directory, name, ops, options = {}) { return ownedIds(directory, name, parser(options), ops); }
+function packageBindings(directory, name, ops, options = {}) {
+  const yaml = parser(options);
+  ownedIds(directory, name, yaml, ops);
+  const root = path.join(directory, 'node_modules', ...name.split('/'));
+  const pkg = ops.readJson(path.join(root, 'package.json'));
+  return entries(document(fs.readFileSync(path.join(root, pkg.dsh.bundle.patch), 'utf8'), yaml, ops).contents, yaml).map(row => [value(row, 'id'), value(row, 'name') ?? null]);
+}
+module.exports = { KEY, intents, set, forget, ownedIds, packageIds, packageBindings, disableBatch, restoreDisabledBatch };

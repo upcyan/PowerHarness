@@ -23,6 +23,9 @@ __pycache__/
 docs/*.md
 !docs/design.md
 !docs/decoupled-runtime.md
+!docs/USAGE.md
+!docs/BUILD.md
+!docs/MAINTENANCE.md
 tests/
 
 # 给 AI 助手读的工作记录（含私有仓库名与内部版本矩阵）：

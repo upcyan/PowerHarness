@@ -6,6 +6,77 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const context = new AsyncLocalStorage();
 const LOCK = '.powerharness-config.lock';
 function error(code, message, extra = {}) { return Object.assign(new Error(message), { code, ...extra }); }
+// Only a snapshot copies live data without publishing changes back into it.
+// Generic 'active' locks may instead represent a half-restored home/profile or
+// an unconfirmed CLI subtree; death of their supervisor is NOT commit evidence.
+function processIdentity(pid) {
+  try {
+    const bootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+    if (stat.slice(0, stat.indexOf(' ')) !== String(pid)) return null;
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    if (!/^[a-f0-9-]{36}$/i.test(bootId) || !/^[0-9]+$/.test(fields[19] || '')) return null;
+    const pidNamespace = fs.readlinkSync('/proc/self/ns/pid');
+    return { bootId, startTime: fields[19], pidNamespace };
+  } catch { return null; }
+}
+function ownerIsGone(owner) {
+  const identity = owner.processIdentity;
+  if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !identity ||
+      !/^[a-f0-9-]{36}$/i.test(identity.bootId || '') || !/^[0-9]+$/.test(identity.startTime || '')) return false;
+  try { if (identity.pidNamespace !== fs.readlinkSync('/proc/self/ns/pid')) return false; } catch { return false; }
+  try { process.kill(owner.pid, 0); }
+  catch (failure) { return failure.code === 'ESRCH'; } // EPERM is unknown, not dead.
+  const current = processIdentity(owner.pid);
+  return !!current && (current.bootId !== identity.bootId || current.startTime !== identity.startTime);
+}
+function sameInode(a, b) { return !!a && !!b && a.dev === b.dev && a.ino === b.ino; }
+function recoverSnapshotLock(directory, mutate) {
+  const real = fs.realpathSync(directory), lock = path.join(real, LOCK);
+  let directoryFd, claimFd, claimInfo, anchored, moved = false;
+  try {
+    const original = fs.lstatSync(lock);
+    if (process.platform !== 'linux' || !original.isDirectory() || original.isSymbolicLink()) return false;
+    // Anchor all work to this inode, not a lock pathname that another process
+    // could replace while a contender is suspended.
+    directoryFd = fs.openSync(lock, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    if (!sameInode(original, fs.fstatSync(directoryFd))) return false;
+    anchored = '/proc/self/fd/' + directoryFd;
+    const names = fs.readdirSync(anchored);
+    if (names.length !== 1 || names[0] !== 'owner.json') return false;
+    const ownerPath = path.join(anchored, 'owner.json');
+    const ownerInfo = fs.lstatSync(ownerPath);
+    if (!ownerInfo.isFile() || ownerInfo.isSymbolicLink() || ownerInfo.nlink !== 1 || ownerInfo.size > 8192) return false;
+    const bytes = fs.readFileSync(ownerPath, 'utf8'), owner = JSON.parse(bytes);
+    if (owner.schemaVersion !== 2 || owner.operation !== 'snapshot' || owner.phase !== 'active' || owner.recoveryBlocked ||
+        !/^[a-f0-9]{32}$/.test(owner.token || '') || !ownerIsGone(owner)) return false;
+    if (!mutate) return true; // Admission/preflight is deliberately read-only.
+    claimFd = fs.openSync(path.join(anchored, 'recovery.json'), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    claimInfo = fs.fstatSync(claimFd);
+    fs.writeFileSync(claimFd, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), operation: 'archive-orphan-snapshot', token: owner.token }));
+    fs.fsyncSync(claimFd);
+    const current = fs.lstatSync(lock, { throwIfNoEntry: false });
+    if (!sameInode(current, original) || fs.readFileSync(ownerPath, 'utf8') !== bytes || !ownerIsGone(owner) ||
+        fs.readdirSync(anchored).sort().join(',') !== 'owner.json,recovery.json') return false;
+    const archive = path.join(real, '.powerharness-config.recovered-' + Date.now() + '-' + randomBytes(8).toString('hex'));
+    if (path.dirname(archive) !== real || fs.existsSync(archive)) return false;
+    fs.renameSync(lock, archive); moved = true; // Preserve owner and claim, never recursively remove evidence.
+    const parentFd = fs.openSync(real, 'r');
+    try { fs.fsyncSync(parentFd); } finally { fs.closeSync(parentFd); }
+    return true;
+  } catch { return false; }
+  finally {
+    try {
+      if (!moved && claimInfo && anchored) {
+        const claim = path.join(anchored, 'recovery.json');
+        if (sameInode(fs.lstatSync(claim, { throwIfNoEntry: false }), claimInfo)) fs.unlinkSync(claim);
+      }
+    } finally {
+      try { if (claimFd !== undefined) fs.closeSync(claimFd); }
+      finally { if (directoryFd !== undefined) fs.closeSync(directoryFd); }
+    }
+  }
+}
 function snapshot(file) {
   try {
     const info = fs.lstatSync(file);
@@ -42,7 +113,7 @@ function retain(directory, details = {}) {
   if (!lease) throw error('ERR_CONFIG_UNKNOWN', '没有本事务配置锁，不能确认回滚所有权');
   verify(lease); lease.retained = true;
   const previous = JSON.parse(fs.readFileSync(lease.owner, 'utf8'));
-  fs.writeFileSync(lease.owner, JSON.stringify({ ...previous, pid: process.pid, token: lease.token, phase: 'unknown', ...details }), { mode: 0o600 });
+  fs.writeFileSync(lease.owner, JSON.stringify({ ...previous, pid: process.pid, token: lease.token, phase: 'unknown', ...details, recoveryBlocked: true }), { mode: 0o600 });
 }
 function dataDirectoryForProfile(directory) {
   if (path.basename(path.dirname(directory)) !== 'profiles' || path.basename(path.dirname(path.dirname(directory))) !== 'dsh-home') return null;
@@ -52,10 +123,13 @@ function assertDataBarrier(directory, boundRoot) {
   const root = boundRoot || dataDirectoryForProfile(directory);
   if (!root || !fs.lstatSync(path.join(root, LOCK), { throwIfNoEntry: false })) return;
   const own = context.getStore()?.get(root);
-  if (!own || own.finished || own.retained) throw error('ERR_CONFIG_LOCKED', '数据快照或恢复持有配置屏障，拒绝并发写入');
+  if (!own || own.finished || own.retained) {
+    if (recoverSnapshotLock(root, true)) return;
+    throw error('ERR_CONFIG_LOCKED', '数据快照或恢复持有配置屏障，拒绝并发写入');
+  }
   verify(own);
 }
-function withLock(directory, callback) {
+function withLock(directory, callback, options = {}) {
   const logical = path.resolve(directory), logicalRoot = dataDirectoryForProfile(logical);
   if (path.basename(path.dirname(logical)) === 'profiles' && !logicalRoot) throw error('ERR_CONFIG_CONFLICT', '配置目录缺少可绑定的数据根，拒绝绕过快照屏障');
   const boundRoot = logicalRoot ? fs.realpathSync(logicalRoot) : null;
@@ -66,8 +140,11 @@ function withLock(directory, callback) {
   const lock = path.join(real, LOCK), token = randomBytes(16).toString('hex');
   try { fs.mkdirSync(lock, { mode: 0o700 }); }
   catch (failure) {
-    if (failure.code === 'EEXIST') throw error('ERR_CONFIG_LOCKED', '配置锁已存在：可能仍在写入或结果未知；请勿重复操作，需确认原操作及证据后处理', { lock });
-    throw failure;
+    if (failure.code !== 'EEXIST') throw failure;
+    if (!recoverSnapshotLock(real, true)) throw error('ERR_CONFIG_LOCKED', '配置锁已存在：活锁、旧格式或事务结果不明均需保留；不得只凭PID已死删锁', { lock });
+    // A different writer may win after the archive. Retry acquisition only once.
+    try { fs.mkdirSync(lock, { mode: 0o700 }); }
+    catch (cause) { throw error('ERR_CONFIG_LOCKED', '孤儿备份锁已归档，但另一写入者已取得配置锁', { cause, lock }); }
   }
   const owner = path.join(lock, 'owner.json');
   let info;
@@ -76,8 +153,13 @@ function withLock(directory, callback) {
   try {
     fs.chmodSync(lock, 0o700);
     info = fs.lstatSync(lock);
-    fs.writeFileSync(owner, JSON.stringify({ pid: process.pid, token, phase: 'active' }), { flag: 'wx', mode: 0o600 });
+    fs.writeFileSync(owner, JSON.stringify({ schemaVersion: 2, pid: process.pid, token, phase: 'active',
+      operation: options.operation === 'snapshot' && !logicalRoot ? 'snapshot' : 'exclusive', processIdentity: processIdentity(process.pid) }), { flag: 'wx', mode: 0o600 });
     fs.chmodSync(owner, 0o600);
+    const ownerFd = fs.openSync(owner, 'r');
+    try { fs.fsyncSync(ownerFd); } finally { fs.closeSync(ownerFd); }
+    const lockFd = fs.openSync(lock, 'r');
+    try { fs.fsyncSync(lockFd); } finally { fs.closeSync(lockFd); }
   } catch (cause) { throw error('ERR_CONFIG_UNKNOWN', '配置锁初始化未确认；已保留目录，未执行配置操作', { cause, lock }); }
   const lease = { lock, owner, token, dev: info.dev, ino: info.ino, retained: false };
   const store = new Map([...(inherited || [])].filter(([, entry]) => !entry.finished || entry.retained)); store.set(real, lease);
@@ -116,11 +198,11 @@ function assertNoProfileLocks(home) {
     }
   }
 }
-function withDataLock(dataDir, callback) {
-  return withLock(dataDir, () => { assertNoProfileLocks(path.join(dataDir, 'dsh-home')); return callback(); });
+function withDataLock(dataDir, callback, options = {}) {
+  return withLock(dataDir, () => { assertNoProfileLocks(path.join(dataDir, 'dsh-home')); return callback(); }, options);
 }
 function assertCanStart(dataDir) {
-  if (fs.lstatSync(path.join(dataDir, LOCK), { throwIfNoEntry: false })) throw error('ERR_CONFIG_LOCKED', '数据事务持有屏障或结果未知，拒绝启动核心');
+  if (fs.lstatSync(path.join(dataDir, LOCK), { throwIfNoEntry: false }) && !recoverSnapshotLock(dataDir, false)) throw error('ERR_CONFIG_LOCKED', '数据事务持有屏障或结果未知，拒绝启动核心');
   assertNoProfileLocks(path.join(dataDir, 'dsh-home'));
 }
 function isUnconfirmed(failure) {

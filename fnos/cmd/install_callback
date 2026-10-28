@@ -13,7 +13,7 @@ migrate_error() {
   [ "$rc" -ne 0 ] || rc=1
   local message="DeepSeek Harness 安装后处理失败：${MIGRATE_STAGE}（退出码 ${rc}）。旧数据目录未改动，请保留现场不要卸载重装。"
   printf "%s\n" "$message" >&2
-  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then printf "%s\n" "$message" > "$TRIM_TEMP_LOGFILE"; fi
+  if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then printf "%s\n" "$message" >> "$TRIM_TEMP_LOGFILE"; fi
   exit "$rc"
 }
 trap migrate_error ERR

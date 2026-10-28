@@ -18,6 +18,9 @@ Outputs, all from the same source and geometry:
     fnos/app/ui/images/icon_64.png     fnos/ICON.PNG        (64x64)
     fnos/app/ui/images/icon_256.png    fnos/ICON_256.PNG    (256x256)
 
+Use ``--preserve-layout --sizes 512,1024`` for the full-layout blue artwork.
+Additional sizes only produce UI assets, never FPK root icon replacements.
+
 ``fnos/app/ui/config`` references ``images/icon_{0}.png`` for in-app use, while
 the two ``ICON*.PNG`` files at the FPK root are what the fnOS desktop shows.
 """
@@ -286,6 +289,23 @@ def build_icon(
     return np.dstack([np.clip(rgb, 0.0, 1.0), alpha])
 
 
+def build_artwork_icon(
+    logo: np.ndarray, size: int, background: tuple[float, float, float]
+) -> np.ndarray:
+    """Preserve square-master geometry, resampling once in premultiplied alpha."""
+    height, width = logo.shape[:2]
+    if height != width or size > width:
+        raise ValueError("source must be square and at least the requested resolution")
+    if not np.any(logo[:, :, 3] > 0):
+        raise ValueError("icon source has no visible pixels")
+    premultiplied = np.dstack([logo[:, :, :3] * logo[:, :, 3:4], logo[:, :, 3:4]])
+    mark = np.clip(resize(premultiplied, size, size), 0.0, 1.0)
+    alpha = mark[:, :, 3:4]
+    rgb = mark[:, :, :3] + np.asarray(background).reshape(1, 1, 3) * (1.0 - alpha)
+    mask = rounded_mask(size, CORNER_RADIUS_RATIO * size)[:, :, None]
+    return np.dstack([np.clip(rgb, 0.0, 1.0), mask])
+
+
 def main(argv: list[str] | None = None) -> int:
     root = pathlib.Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -309,28 +329,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--background",
-        default="255,255,255",
-        help="opaque background colour as R,G,B (default: 255,255,255)",
+        default=None,
+        help="opaque R,G,B (default: white; preserved-layout mode: 32,102,239)",
     )
+    parser.add_argument("--preserve-layout", action="store_true",
+                        help="preserve square master placement instead of legacy crop/fit")
+    parser.add_argument("--sizes", default="64,256",
+                        help="comma-separated edges: 64,128,256,512,1024")
     args = parser.parse_args(argv)
-
-    background = tuple(
-        int(part) / 255.0 for part in args.background.split(",")
-    )
-    if len(background) != 3:
-        parser.error("--background must be R,G,B")
+    try:
+        sizes = tuple(int(part) for part in args.sizes.split(","))
+        if not sizes or len(set(sizes)) != len(sizes) or any(
+            size not in (64, 128, 256, 512, 1024) for size in sizes
+        ):
+            raise ValueError("unsupported or duplicate icon size")
+        if not args.preserve_layout and max(sizes) > 256:
+            raise ValueError("--preserve-layout is required for high-resolution exports")
+        colour = args.background or ("32,102,239" if args.preserve_layout else "255,255,255")
+        channels = tuple(int(part) for part in colour.split(","))
+        if len(channels) != 3 or any(value < 0 or value > 255 for value in channels):
+            raise ValueError("background must contain three 0..255 channels")
+        background = tuple(value / 255.0 for value in channels)
+    except ValueError as error:
+        parser.error(str(error))
 
     logo = read_png(args.source)
+    if args.preserve_layout and (logo.shape[0] != logo.shape[1] or max(sizes) > logo.shape[1]):
+        parser.error("preserved-layout source must be square and at least the largest requested size")
     images_dir = args.outdir or (args.app_root / "app" / "ui" / "images")
     images_dir.mkdir(parents=True, exist_ok=True)
     if args.outdir is None:
         args.app_root.mkdir(parents=True, exist_ok=True)
 
-    for size in (64, 256):
-        icon = build_icon(logo, size, background)
+    renderer = build_artwork_icon if args.preserve_layout else build_icon
+    for size in sizes:
+        icon = renderer(logo, size, background)
         write_png(images_dir / f"icon_{size}.png", icon)
-        if args.outdir is None:
-            # fnOS looks for ICON.PNG (64 px) and ICON_256.PNG at the FPK root.
+        if args.outdir is None and size in (64, 256):
+            # Only the declared FPK sizes may write root icon names.
             name = "ICON_256.PNG" if size == 256 else "ICON.PNG"
             write_png(args.app_root / name, icon)
         print(f"icon_{size}.png  ({size}x{size}, R={CORNER_RADIUS_RATIO * size:.1f}px)")

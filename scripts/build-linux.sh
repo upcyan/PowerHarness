@@ -151,8 +151,13 @@ npm ci --omit=dev --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage
 npm audit --omit=dev --audit-level=low --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
 node "$root/scripts/verify-mcp-runtime.mjs" "$stage/app/runtime"
 node "$root/scripts/patch-dsh.mjs" "$stage/app/runtime"
+# Data-only platform catalogue and read-only post-patch gate share the UI inspector.
+node "$root/scripts/export-platform-patches.mjs" "$stage/app/platform-patches.json"
+node "$root/scripts/platform-patch-status.mjs" "$stage/app/runtime" "$stage/app/platform-patches.json" > "$stage/platform-patch-status.json"
 # Generate from the installed staged runtime, never copy a stale source declaration.
 node "$root/scripts/generate-adapter.cjs" "$stage/app"
+# Preserve exact-version upstream notices only in this private staging tree.
+python3 "$root/scripts/stage-runtime-notices.py" --staging-root "$stage" --runtime "$stage/app/runtime"
 # Inventory the installed payload, not the build host or a prior candidate.
 python3 "$root/scripts/audit-runtime-licenses.py" --runtime "$stage/app/runtime" --out "$stage/app/third-party/runtime"
 cp "$stage/app/third-party/runtime/runtime-licenses.json" "$root/dist/runtime-licenses.json"

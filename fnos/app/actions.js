@@ -23,7 +23,7 @@ const SUPERVISOR_ACTIONS = [
   'install-core', 'switch-core', 'use-bundled',
   'set-registry', 'set-backup-settings', 'set-docker-mode', 'set-core-port', 'set-public-port',
   'create-profile', 'switch-profile',
-  'install-plugin', 'disable-plugin', 'enable-plugin', 'uninstall-plugin',
+  'install-plugin', 'disable-plugin', 'disable-plugins', 'enable-plugin', 'uninstall-plugin', 'update-plugin',
   'confirm-restore', 'dismiss-restore',
   'save-patch-config', 'disable-patch-config', 'restore-patch-config',
   'heal-patch-layer', 'dedupe-patch-layer', 'disable-third-party-plugins',
@@ -42,6 +42,9 @@ const GATEWAY_ACTIONS = [
 // 高破坏性操作：会在弹窗里显式列出"将执行什么"，并要求用户确认。
 // 键是 action，值是要在确认框里写的具体后果。
 const DESTRUCTIVE = {
+  'disable-plugins': '批量禁用所选插件：先整体预检，再一次重启 DSH 核心生效；正在进行的对话会中断，插件文件保留。',
+  'update-plugin': '检查并更新此插件：保留安装来源和原禁用意图，会停止并重启 DSH 核心；正在进行的对话会中断。',
+  'exit-diagnosis': '处理旧诊断流程的退出请求：若曾修改主配置，将从已绑定备份恢复，可能需要重启主核心。常驻诊断配置档不会删除。',
   'restart-all': '完全重启整个程序：核心、网关与管理页会一起重启，页面短暂断连（约 20–90 秒）。',
   'heal-patch-layer': '重置 patch 配置：cordis.patch.yml 里的插件启用/禁用与插入声明会被清空（插件本体不受影响）。原文件会先备份到 patch-backups。',
   'dedupe-patch-layer': '清理重复声明：cordis.patch.yml 里同一 id 的重复条目会被删除，只保留第一份。',

@@ -563,7 +563,7 @@ function pruneBackups(dataDir) {
 
 function createSnapshot(dataDir, configDir, kind, version, options = {}) {
   if (!['daily', 'manual', 'session', 'pre-upgrade', 'uninstall'].includes(kind)) throw new Error('Invalid backup kind');
-  return configCoordination.withDataLock(dataDir, () => createSnapshotLocked(dataDir, configDir, kind, version, options));
+  return configCoordination.withDataLock(dataDir, () => createSnapshotLocked(dataDir, configDir, kind, version, options), { operation: 'snapshot' });
 }
 function createSnapshotLocked(dataDir, configDir, kind, version, { online = false } = {}) {
   const root = backupStore.root(dataDir);

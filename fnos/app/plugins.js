@@ -1,5 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { spawn } = require('node:child_process');
 const cliProcessGroup = require('./cli-process-group.js');
 const cliContainment = require('./cli-containment.js');
@@ -12,10 +14,10 @@ const cores = require('./core-manager.js');
 const profiles = require('./profiles.js');
 const gitEnv = require('./git-transport.js');
 
-const packagePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?)?$/;
+const packagePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*(?:@(?:latest|[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?))?$/;
 function parseSpec(value) {
   const spec = String(value || '').trim();
-  if (!packagePattern.test(spec) || spec.length > 160) throw new Error('Only exact npm package names and versions are supported');
+  if (!packagePattern.test(spec) || spec.length > 160) throw new Error('插件来源无效：Only npm package names, exact versions and @latest are supported');
   const at = spec.lastIndexOf('@');
   return at > 0 ? { name: spec.slice(0, at), requestedVersion: spec.slice(at + 1) } : { name: spec, requestedVersion: null };
 }
@@ -59,12 +61,87 @@ function profilePackage(dataDir, profile, spec) {
   if (!Array.isArray(manifest.dsh?.profile?.bundles)) throw new Error('dsh profile manifest is incompatible');
   return { name, directory, manifestFile, manifest, beforeManifest };
 }
+function normalizeBatchNames(names) {
+  if (!Array.isArray(names) || !names.length || names.length > 50) throw Object.assign(new Error('批量禁用需要 1–50 个插件包名'), { code: 'ERR_PLUGIN_BATCH_INPUT', failures: [] });
+  const normalized = [], failures = [];
+  for (const input of names) {
+    try {
+      if (typeof input !== 'string') throw new Error('插件包名必须是字符串');
+      const name = input.trim(), parsed = parseSpec(name);
+      if (parsed.requestedVersion || parsed.name !== name) throw new Error('请使用不带版本的规范插件包名');
+      if (!normalized.includes(name)) normalized.push(name);
+    } catch (failure) { failures.push({ name: typeof input === 'string' ? input : String(input), reason: failure.message, code: 'ERR_PLUGIN_BATCH_INPUT' }); }
+  }
+  if (failures.length) throw Object.assign(new Error('批量禁用包名无效：' + failures.map(item => item.name + '：' + item.reason).join('；')), { code: 'ERR_PLUGIN_BATCH_INPUT', failures, validNames: normalized });
+  return normalized;
+}
+function disableBatch(dataDir, profile, names, options = {}) {
+  const enablement = require('./plugin-enablement.js'), directory = profiles.directory(dataDir, profile);
+  let normalized;
+  try { normalized = normalizeBatchNames(names); }
+  catch (failure) {
+    // Invalid names do not hide unsupported/missing valid selections. Never
+    // enter the mutating path when any input validation failed.
+    if (failure.validNames?.length) try { enablement.disableBatch(dataDir, profile, directory, failure.validNames, ops, { ...options, preflightOnly: true }); }
+    catch (bindingError) { failure.failures.push(...(bindingError.failures || failure.validNames.map(name => ({ name, reason: bindingError.message, code: bindingError.code })))); }
+    if (failure.failures?.length) failure.message = '批量禁用预检失败：' + failure.failures.map(item => item.name + '：' + item.reason).join('；');
+    throw failure;
+  }
+  return enablement.disableBatch(dataDir, profile, directory, normalized, ops, options);
+}
+function restoreDisabledBatch(dataDir, profile, result) {
+  return require('./plugin-enablement.js').restoreDisabledBatch(dataDir, profile, profiles.directory(dataDir, profile), result, ops);
+}
+function describeUpdateSource(requested) {
+  const source = typeof requested === 'string' ? requested.trim() : '';
+  if (/^file:/i.test(source)) return { kind: 'file', display: source };
+  if (/^(?:link|workspace|portal):/i.test(source) || /^(?:\.|\/|~\/|[A-Za-z]:[\\/])/.test(source)) return { kind: 'link', display: source };
+  if (/^(?:git(?:\+[a-z]+)?|github|gitlab|bitbucket|https?|ssh):/i.test(source) || /^[^\s/@]+@[^\s/:]+:/.test(source) || (!source.startsWith('@') && GITHUB_REPO.test(source))) return { kind: 'git', display: 'Git / URL 来源（保持原引用）' };
+  if (/^npm:/i.test(source)) return { kind: 'alias', display: 'npm 别名来源' };
+  try { updateSource(source); return { kind: 'registry', display: 'npm：' + source }; } catch { return { kind: 'unknown', display: '未识别的依赖来源' }; }
+}
+function updateSource(requested) {
+  if (typeof requested !== 'string' || !requested.trim()) throw new Error('依赖来源缺失，无法安全确定更新渠道');
+  const source = requested.trim();
+  if (/^(?:link|file|workspace|portal):/i.test(source) || /^(?:\.|\/|~\/|[A-Za-z]:[\\/])/.test(source)) throw new Error('本地 link/file 来源不支持自动更新；请从原本地来源重新导入，不能自动切换 npm');
+  if (/^(?:git(?:\+[a-z]+)?|github|gitlab|bitbucket|https?|ssh):/i.test(source) || /^[^\s/@]+@[^\s/:]+:/.test(source) || (!source.startsWith('@') && GITHUB_REPO.test(source))) throw new Error('Git/GitHub 来源无法保证原引用及安全恢复，暂不支持自动更新');
+  if (/^npm:/i.test(source)) throw new Error('npm alias 来源无法安全确定原包归属，暂不支持自动更新');
+  // Dependency values may be versions, ranges or registry tags; none is passed
+  // through to the CLI. Updates always resolve the same package's latest tag.
+  if (!/^(?:[A-Za-z][A-Za-z0-9._-]*|[vV~^<>=*xX0-9][0-9A-Za-z.*+<>=|~^\-\s]*)$/.test(source)) throw new Error('无法确认的依赖来源，不支持自动更新');
+  return 'registry';
+}
+function planUpdate(dataDir, profile, name) {
+  return planInstalledUpdate(dataDir, profile, profilePackage(dataDir, profile, name));
+}
+function planInstalledUpdate(dataDir, profile, state, layoutChecked = false) {
+  const source = updateSource(state.manifest.dependencies[state.name]);
+  const enablement = require('./plugin-enablement.js');
+  const disabled = enablement.intents(state.manifest);
+  const ids = enablement.packageIds(state.directory, state.name, ops);
+  const record = Object.hasOwn(disabled, state.name) ? disabled[state.name] : undefined;
+  if (record && (record.ids.length !== ids.length || ids.some(id => !record.ids.includes(id)))) throw new Error('bundle entry 声明已变化，无法精确保持原禁用意图');
+  // Also validates existing profile bindings/disabled fields without a write or
+  // admission lock. The caller performs the operation only after core stops.
+  enablement.disableBatch(dataDir, profile, state.directory, [state.name], ops, { preflightOnly: true, admissionChecked: true });
+  if (!layoutChecked) assertProfileLayout(state.directory);
+  return { name: state.name, spec: state.name + '@latest', source };
+}
+// The layout guard is profile-wide; its raw ENOENT names one unrelated
+// dangling bin entry and must not read as "this plugin is broken". Keep the
+// refusal (never swallow), but classify it as a shared scope limitation.
+function profileLayoutMessage(failure) {
+  if (failure?.code === 'ENOENT') return '整份配置档暂不能安全隔离更新（存在指向缺失目标的链接，如 node_modules/.bin 下的残留命令）；这不是该插件自身损坏';
+  return failure.message;
+}
 function list(dataDir, profile) {
   const directory = profiles.directory(dataDir, profile);
   const manifest = ops.readJson(path.join(directory, 'package.json'), {});
   let enablementError = null;
   try { require('./plugin-enablement.js').intents(manifest); }
   catch (error) { enablementError = error.message; } // Keep read-only management/backup views reachable.
+  let updateLayoutError = null;
+  if (!enablementError) try { assertProfileLayout(directory); } catch (failure) { updateLayoutError = profileLayoutMessage(failure); }
   const dependencies = manifest.dependencies || {};
   const bundles = Array.isArray(manifest.dsh?.profile?.bundles) ? manifest.dsh.profile.bundles : [];
   return Object.entries(dependencies).filter(([name]) => {
@@ -76,7 +153,18 @@ function list(dataDir, profile) {
     try { bundlePatch(installed); compatible = true; } catch {}
     let filesOk = false;
     try { filesOk = installed?.name === name && !!bundlePatch(installed); } catch { filesOk = false; }
-    return { name, version: installed?.version || requested, enabled: bundles.includes(name), compatible, filesOk, ...(enablementError ? { enablementError } : {}) };
+    const sourceInfo = describeUpdateSource(requested);
+    let disableReason = enablementError, updateReason = enablementError, updateScope = enablementError ? 'profile' : null;
+    if (!disableReason) try { disableBatch(dataDir, profile, [name], { preflightOnly: true }); } catch (failure) { disableReason = failure.failures?.map(item => item.reason).join('；') || failure.message; }
+    // Classify this package first; a shared layout failure must not hide its source.
+    if (!updateReason) try { planInstalledUpdate(dataDir, profile, { name, directory, manifest }, true); } catch (failure) { updateReason = failure.message; updateScope = sourceInfo.kind === 'registry' ? 'plugin' : 'source'; }
+    if (!updateReason && updateLayoutError) { updateReason = updateLayoutError; updateScope = 'profile'; }
+    return { name, version: installed?.version || requested, enabled: bundles.includes(name), compatible, filesOk,
+      description: typeof installed?.description === 'string' ? installed.description : '',
+      updateSupported: !updateReason, updateReason: updateReason || null,
+      updateScope, profileUpdateReason: enablementError || updateLayoutError, updateSourceKind: sourceInfo.kind, updateSourceDisplay: sourceInfo.display,
+      canDisable: !disableReason, disableReason: disableReason || null,
+      ...(enablementError ? { enablementError } : {}) };
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
 function setEnabled(dataDir, profile, spec, enabled, options = {}) {
@@ -93,7 +181,8 @@ async function metadata(name, registry) {
 async function inspect(spec, registry) {
   const { name, requestedVersion } = parseSpec(spec);
   const record = await metadata(name, registry);
-  const version = requestedVersion || record['dist-tags']?.latest;
+  const version = !requestedVersion || requestedVersion === 'latest' ? record['dist-tags']?.latest : requestedVersion;
+  if (typeof version !== 'string' || parseSpec(name + '@' + version).requestedVersion === 'latest') throw new Error('Package has no exact latest version');
   const manifest = record.versions?.[version];
   if (!manifest || manifest.name !== name || manifest.version !== version) throw new Error('Package version is unavailable');
   const integrity = manifest.dist?.integrity || '';
@@ -413,7 +502,7 @@ async function pnpmAuditWarn(dataDir, profile, registry, logFile) {
     }
   } catch (error) {
     // Optional audit failure is tolerable; an unclosed mutating CLI/shutdown is not.
-    if (error.code === 'ERR_CLI_UNCONFIRMED' || error.code === 'ERR_CLI_CANCELLED' || cliStopping) throw error;
+    if (configCoordination.isUnconfirmed(error) || error.code === 'ERR_CLI_CANCELLED' || cliStopping) throw error;
   }
   return null;
 }
@@ -435,7 +524,7 @@ async function installLocal(dataDir, profile, tgzPath) {
   const after = ops.readJson(manifestFile)?.dependencies || {};
   const changed = Object.keys(after).filter((key) => before[key] !== after[key]);
   if (changed.length !== 1) {
-    await runDshPlugin(['remove', changed.join(' ')], dataDir, profile, logFile).catch(() => {});
+    await runDshPlugin(['remove', changed.join(' ')], dataDir, profile, logFile).catch(failure => { if (configCoordination.isUnconfirmed(failure)) throw failure; });
     throw new Error('无法唯一确定导入包对应的插件包名（依赖清单变化异常）');
   }
   const name = changed[0];
@@ -450,7 +539,7 @@ async function installLocal(dataDir, profile, tgzPath) {
     const modulesDir = fs.realpathSync(path.join(profileDir, 'node_modules'));
     if (!resolvedDir.startsWith(modulesDir + path.sep) || !patchFile.startsWith(resolvedDir + path.sep) || !fs.statSync(patchFile).isFile()) throw new Error('Plugin patch escapes its package');
   } catch (error) {
-    await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(() => {});
+    await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(failure => { if (configCoordination.isUnconfirmed(failure)) throw failure; });
     throw error;
   }
 
@@ -477,6 +566,9 @@ async function install(dataDir, profile, spec, registry, options = {}) {
     return installLocal(dataDir, profile, spec);
   }
   const normalized = normalizePluginSpec(spec);
+  // Resolve before download: never let a mutable tag/range reach pnpm add.
+  const inspected = normalized.kind === 'registry' ? await inspect(normalized.spec, registry) : null;
+  const installSpec = inspected ? inspected.name + '@' + inspected.version : normalized.spec;
   const source = cores.registryUrl(registry);
   const profileDir = profiles.directory(dataDir, profile);
   const manifestFile = path.join(profileDir, 'package.json');
@@ -491,7 +583,7 @@ async function install(dataDir, profile, spec, registry, options = {}) {
     && normalized.kind === 'git' && GITHUB_REPO.test(rawSource);
   const sshIntent = Object.values(before).some((value) => typeof value === 'string'
     && /^(?:git\+ssh:|ssh:|[^\s/@]+@[^\s/:]+:)/i.test(value));
-  await runDshPlugin(['add', normalized.spec], dataDir, profile, logFile, {
+  await runDshPlugin(['add', installSpec], dataDir, profile, logFile, {
     registry: source, publicGithubShorthand, sshIntent,
   });
 
@@ -500,7 +592,7 @@ async function install(dataDir, profile, spec, registry, options = {}) {
   if (normalized.kind === 'registry') {
     name = parseSpec(normalized.spec).name;
     if (!Object.hasOwn(after, name)) {
-      await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(() => {});
+      await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(failure => { if (configCoordination.isUnconfirmed(failure)) throw failure; });
       throw new Error(`安装完成后依赖清单中未找到 ${name}`);
     }
   } else {
@@ -512,25 +604,27 @@ async function install(dataDir, profile, spec, registry, options = {}) {
   try {
     const packageDir = path.join(profileDir, 'node_modules', ...name.split('/'));
     const installed = ops.readJson(path.join(packageDir, 'package.json'));
-    if (installed?.name !== name) throw new Error('Installed package failed dsh bundle verification');
+    if (installed?.name !== name || (inspected && installed.version !== inspected.version)) throw new Error('Installed package failed dsh bundle verification');
     const patch = bundlePatch(installed);
     const patchFile = fs.realpathSync(path.join(packageDir, patch));
     const resolvedDir = fs.realpathSync(packageDir);
     const modulesDir = fs.realpathSync(path.join(profileDir, 'node_modules'));
     if (!resolvedDir.startsWith(modulesDir + path.sep) || !patchFile.startsWith(resolvedDir + path.sep) || !fs.statSync(patchFile).isFile()) throw new Error('Plugin patch escapes its package');
   } catch (error) {
-    await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(() => {});
+    await runDshPlugin(['remove', name], dataDir, profile, logFile).catch(failure => { if (configCoordination.isUnconfirmed(failure)) throw failure; });
     throw error;
   }
 
-  // Reinstall is a fresh enable action: remove prior management intent and
-  // restore its precise disabled fields before publishing the bundle list.
-  require('./plugin-enablement.js').forget(dataDir, profile, name, ops);
-  const profileManifest = ops.readJson(manifestFile);
-  const bundles = profileManifest?.dsh?.profile?.bundles;
-  if (!Array.isArray(bundles)) throw new Error('dsh profile manifest is incompatible');
-  if (!bundles.includes(name)) bundles.push(name);
-  ops.writeJson(manifestFile, profileManifest);
+  // A fresh install is an enable action; isolated updates restore the original
+  // whole intent after verifying the new declaration, never via forget().
+  if (options.preserveEnablement !== true) {
+    require('./plugin-enablement.js').forget(dataDir, profile, name, ops);
+    const profileManifest = ops.readJson(manifestFile);
+    const bundles = profileManifest?.dsh?.profile?.bundles;
+    if (!Array.isArray(bundles)) throw new Error('dsh profile manifest is incompatible');
+    if (!bundles.includes(name)) bundles.push(name);
+    ops.writeJson(manifestFile, profileManifest);
+  }
 
   const version = ops.readJson(path.join(profileDir, 'node_modules', ...name.split('/'), 'package.json'))?.version || '';
   if (normalized.kind === 'git') {
@@ -642,10 +736,130 @@ async function uninstall(dataDir, profile, spec, registry) {
   if (pruneMarketState(directory, name)) cleaned.push('插件市场状态');
   return { name, removed: true, cleaned, removedBy, degradeNote };
 }
+// Fingerprint the entire profile, including lockfiles and symlink bytes. A
+// failed isolated install never needs to guess ownership of live CLI output.
+function assertProfileLayout(directory, rejectAbsoluteLinks = false) {
+  const root = fs.realpathSync(directory);
+  if (!fs.lstatSync(directory).isDirectory()) throw new Error('profile 必须是普通目录，无法安全替换软链接配置档');
+  function visit(file) {
+    const info = fs.lstatSync(file);
+    if (info.isSymbolicLink()) {
+      const target = fs.realpathSync(file);
+      if (target !== root && !target.startsWith(root + path.sep)) throw new Error('profile 含外部软链接，无法保证隔离更新；请从原来源手动更新');
+      if (rejectAbsoluteLinks && path.isAbsolute(fs.readlinkSync(file))) throw new Error('更新生成绝对软链接，无法保证 profile 替换后仍安全可用');
+    } else if (info.isDirectory()) for (const item of fs.readdirSync(file)) visit(path.join(file, item));
+    else if (!info.isFile()) throw new Error('profile 含特殊文件，无法安全隔离更新');
+  }
+  visit(directory);
+}
+function profileRevision(directory) {
+  if (!fs.lstatSync(directory).isDirectory()) throw new Error('profile 必须是普通目录，无法安全替换软链接配置档');
+  const hash = createHash('sha256');
+  function visit(file, relative) {
+    const info = fs.lstatSync(file);
+    // NAS inherited ACL masks can change on a directory rename. CAS binds
+    // bytes and link topology, not incidental effective permission masks.
+    hash.update(JSON.stringify([relative, info.isDirectory() ? 'directory' : info.isSymbolicLink() ? 'link' : 'file']));
+    if (info.isSymbolicLink()) {
+      hash.update('link:' + fs.readlinkSync(file));
+    }
+    else if (info.isFile()) hash.update('file:' + createHash('sha256').update(fs.readFileSync(file)).digest('hex'));
+    else if (info.isDirectory()) { hash.update('directory'); for (const item of fs.readdirSync(file).sort()) visit(path.join(file, item), path.join(relative, item)); }
+    else throw new Error('profile 含特殊文件，无法安全隔离更新');
+  }
+  visit(directory, ''); return hash.digest('hex');
+}
+function copyProfile(source, destination) {
+  const root = fs.realpathSync(source);
+  function visit(from, to) {
+    const info = fs.lstatSync(from);
+    if (info.isSymbolicLink()) {
+      const target = fs.realpathSync(from);
+      if (target !== root && !target.startsWith(root + path.sep)) throw new Error('profile 含外部软链接，无法保证隔离更新；请从原来源手动更新');
+      const rebound = path.join(destination, path.relative(root, target));
+      fs.symlinkSync(path.relative(path.dirname(to), rebound), to);
+    } else if (info.isDirectory()) {
+      fs.mkdirSync(to, { mode: info.mode & 0o777 });
+      for (const item of fs.readdirSync(from)) visit(path.join(from, item), path.join(to, item));
+    } else if (info.isFile()) { fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL); fs.chmodSync(to, info.mode & 0o777); }
+    else throw new Error('profile 含特殊文件，无法安全隔离更新');
+  }
+  visit(root, destination);
+}
+async function update(dataDir, profile, name, registry) {
+  // Keep the barrier outside the profile directory: publication swaps that
+  // directory, whereas the data lease must remain the same inode throughout.
+  return configCoordination.withDataLock(dataDir, async () => {
+    const directory = profiles.directory(dataDir, profile), manifestFile = path.join(directory, 'package.json');
+    const plan = planUpdate(dataDir, profile, name), enablement = require('./plugin-enablement.js');
+    name = plan.name;
+    const original = ops.readJson(manifestFile), originalPatch = configCoordination.snapshot(path.join(directory, 'cordis.patch.yml'));
+    const originalIds = enablement.packageIds(directory, name, ops), originalBindings = enablement.packageBindings(directory, name, ops), beforeRevision = profileRevision(directory);
+    const stageData = fs.mkdtempSync(path.join(path.resolve(dataDir), '.plugin-update-'));
+    const stageDirectory = profiles.directory(stageData, profile), previous = path.join(stageData, 'original-profile');
+    let originalMoved = false, publishedRevision, result;
+    function cleanup() {
+      if (path.dirname(stageData) !== path.resolve(dataDir) || !path.basename(stageData).startsWith('.plugin-update-')) throw new Error('Invalid update evidence path');
+      fs.rmSync(stageData, { recursive: true });
+    }
+    function unknown(cause) {
+      let retentionError;
+      try { configCoordination.retain(dataDir, { phase: 'plugin-update-unconfirmed', staging: stageData, profile, name }); } catch (failure) { retentionError = failure; }
+      throw Object.assign(new Error('UNKNOWN: 插件更新或发布所有权未确认；已保留屏障与隔离副本，不得启动核心'), { code: 'ERR_ENABLEMENT_UNKNOWN', cause, retentionError, staging: stageData });
+    }
+    try {
+      fs.chmodSync(stageData, 0o700);
+      fs.mkdirSync(path.dirname(stageDirectory), { recursive: true, mode: 0o700 });
+      copyProfile(directory, stageDirectory);
+      if (profileRevision(directory) !== beforeRevision) throw Object.assign(new Error('profile 在复制期间被外部修改，拒绝更新'), { code: 'ERR_CONFIG_CONFLICT' });
+      result = await install(stageData, profile, plan.spec, registry, { preserveEnablement: true });
+      const updated = ops.readJson(path.join(stageDirectory, 'package.json'));
+      const ids = enablement.packageIds(stageDirectory, name, ops);
+      if (ids.length !== originalIds.length || ids.some(id => !originalIds.includes(id)) || !isDeepStrictEqual(enablement.packageBindings(stageDirectory, name, ops), originalBindings)) throw new Error('更新改变了 bundle entry 集合，拒绝为新条目自动授予启用权限');
+      if (configCoordination.snapshot(path.join(stageDirectory, 'cordis.patch.yml')) !== originalPatch) throw new Error('更新更改了原 patch，无法精确保留禁用意图');
+      enablement.intents(updated);
+      const expected = structuredClone(original);
+      expected.dependencies[name] = updated.dependencies?.[name];
+      if (!Array.isArray(updated.dsh?.profile?.bundles)) throw new Error('更新后的 profile manifest 不兼容');
+      updated.dsh.profile.bundles = [...original.dsh.profile.bundles];
+      if (!isDeepStrictEqual(updated, expected)) throw new Error('更新修改了目标依赖以外的 profile metadata，拒绝发布');
+      ops.writeJson(path.join(stageDirectory, 'package.json'), updated);
+      // Validate exact recorded disabled fields against the new bundle without
+      // writing or acquiring a live-profile lock under the data barrier.
+      enablement.disableBatch(stageData, profile, stageDirectory, [name], ops, { preflightOnly: true });
+      assertProfileLayout(stageDirectory, true);
+      publishedRevision = profileRevision(stageDirectory);
+      if (profileRevision(directory) !== beforeRevision) throw Object.assign(new Error('profile 已被并发修改，拒绝覆盖更新'), { code: 'ERR_CONFIG_CONFLICT' });
+      fs.renameSync(directory, previous); originalMoved = true;
+      if (profileRevision(previous) !== beforeRevision) throw Object.assign(new Error('profile 发布前出现并发修改，拒绝更新'), { code: 'ERR_CONFIG_CONFLICT' });
+      if (fs.existsSync(directory)) throw Object.assign(new Error('profile 发布路径被其他写入者占用'), { code: 'ERR_CONFIG_CONFLICT' });
+      fs.renameSync(stageDirectory, directory);
+      if (profileRevision(directory) !== publishedRevision || profileRevision(previous) !== beforeRevision) throw Object.assign(new Error('profile 发布后出现未知并发修改'), { code: 'ERR_CONFIG_CONFLICT' });
+    } catch (failure) {
+      if (configCoordination.isUnconfirmed(failure)) unknown(failure);
+      if (!originalMoved && fs.existsSync(previous)) originalMoved = true;
+      if (originalMoved) {
+        try {
+          if (fs.existsSync(directory)) {
+            if (!publishedRevision || profileRevision(directory) !== publishedRevision || fs.existsSync(stageDirectory)) unknown(failure);
+            fs.renameSync(directory, stageDirectory);
+          }
+          if (fs.existsSync(directory)) unknown(failure);
+          fs.renameSync(previous, directory); // preserves even late edits to the old inode
+        } catch (restoreError) { unknown(restoreError); }
+      }
+      try { cleanup(); } catch (cleanupError) { unknown(cleanupError); }
+      throw failure;
+    }
+    try { cleanup(); } catch (failure) { unknown(failure); }
+    return { ...result, updated: true, enabled: original.dsh.profile.bundles.includes(name) };
+  });
+}
 function coordinatedProfileOperation(operation) {
   return (dataDir, profile, ...args) => configCoordination.withLock(profiles.directory(dataDir, profile), () => operation(dataDir, profile, ...args));
 }
 module.exports = { runCli, cancelCliOperations, cliOperationStatus,
   repairPluginFiles: coordinatedProfileOperation(repairPluginFiles), runtimeStoreDir, parseSpec, normalizePluginSpec, inspect,
   install: coordinatedProfileOperation(install), installLocal: coordinatedProfileOperation(installLocal), list, setEnabled,
+  disableBatch, restoreDisabledBatch, planUpdate, update,
   uninstall: coordinatedProfileOperation(uninstall) };

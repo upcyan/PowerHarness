@@ -24,10 +24,19 @@ function pkgFile(packageName, ...parts) {
 const coreRoot = pkgRoot('dsh');
 if (!coreRoot) throw new Error('dsh core package not found in the runtime');
 const core = JSON.parse(fs.readFileSync(path.join(coreRoot, 'package.json'), 'utf8'));
-const connectionFile = pkgFile('dsh-client-connection', 'lib', 'client.js');
-if (!connectionFile) throw new Error(`dsh ${core.version}: dsh-client-connection missing from the runtime`);
+const connectionFiles = clientEntry('dsh-client-connection');
+if (!connectionFiles) throw new Error(`dsh ${core.version}: dsh-client-connection missing from the runtime`);
 const metadata = JSON.parse(fs.readFileSync(path.join(pkgRoot('dsh-client-connection'), 'package.json'), 'utf8'));
 if (metadata.version !== core.version) throw new Error(`dsh ${core.version} and client connection ${metadata.version} differ`);
+
+// 0.2.1 splits the single client.js into client.browser.js / client.node.js
+// halves selected by package exports. Patch both halves so whichever the
+// runtime loads carries the fnOS adapter; 0.2.0 single file still resolves.
+function clientEntry(packageName) {
+  const halves = ['client.js', 'client.browser.js', 'client.node.js'].map((name) => pkgFile(packageName, 'lib', name)).filter((file) => file && fs.existsSync(file));
+  if (halves.length) return halves;
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Trust anchor: the browser half decides whether a page origin is trusted for
@@ -35,7 +44,7 @@ if (metadata.version !== core.version) throw new Error(`dsh ${core.version} and 
 // (admin ticket + session cookie) before anything reaches the core, so loopback
 // is not the right predicate for us — the gateway origin must always count.
 // ---------------------------------------------------------------------------
-{
+for (const connectionFile of connectionFiles) {
   const file = connectionFile;
   const source = fs.readFileSync(file, 'utf8');
   const anchor = 'isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),';
@@ -45,7 +54,6 @@ if (metadata.version !== core.version) throw new Error(`dsh ${core.version} and 
   if (occurrences === 1) fs.writeFileSync(file, source.replace(anchor, applied));
   console.log(`Patched ${path.relative(runtime, file)} for authenticated fnOS gateway`);
 }
-
 // Probe the existing carrier before replacing it: a healthy foreground must not
 // cancel its active streams. No page reload, user-RPC replay, or second owner.
 function installForegroundRecovery(globals, connection) {
@@ -162,16 +170,21 @@ function installForegroundRecovery(globals, connection) {
 }
 
 {
-  const file = pkgFile('dsh-api-gateway', 'lib', 'client.js');
+  const files = clientEntry('dsh-api-gateway');
   const host = pkgFile('dsh-api-gateway', 'lib', 'index.js');
-  if (!file || !host) throw new Error(`dsh ${core.version}: foreground probe requires both Gateway faces`);
+  if (!files || !host) throw new Error(`dsh ${core.version}: foreground probe requires both Gateway faces`);
+  for (const file of files) {
   const hostSource = fs.readFileSync(host, 'utf8');
   // Nonempty $events args are rejected BEFORE registering any client or calling
   // a business handler. That typed rejection proves a same-carrier round trip.
   const rejectAnchor = 'Reflect.ownKeys(payload.args).length !== 0) throw new TypertGatewayError("gateway/arguments-invalid", REMOTE_EVENT_STREAM_ENDPOINT';
-  const validationPrefix = 'async *openRemoteEvents(payload, signal) { if (!isObject(payload) || !isPlainObject(payload) || Reflect.ownKeys(payload).length !== 1 || !Object.hasOwn(payload, "args") || !isObject(payload.args) || !isPlainObject(payload.args) || Reflect.ownKeys(payload.args).length !== 0) throw new TypertGatewayError("gateway/arguments-invalid", REMOTE_EVENT_STREAM_ENDPOINT, "forwarded Remote event stream requires an empty args object"); const registration = this.remoteEvents;';
+  // 0.2.0 signature: openRemoteEvents(payload, signal). 0.2.1 adds a peer
+  // parameter used for lifetime binding. Accept both; the empty-args reject
+  // anchor below still pins the same side-effect-free contract.
+  const validationPrefix = 'async *openRemoteEvents(payload, signal, peer) { if (!isObject(payload) || !isPlainObject(payload) || Reflect.ownKeys(payload).length !== 1 || !Object.hasOwn(payload, "args") || !isObject(payload.args) || !isPlainObject(payload.args) || Reflect.ownKeys(payload.args).length !== 0) throw new TypertGatewayError("gateway/arguments-invalid", REMOTE_EVENT_STREAM_ENDPOINT, "forwarded Remote event stream requires an empty args object"); const registration = this.remoteEvents;';
+  const validationPrefix020 = 'async *openRemoteEvents(payload, signal) { if (!isObject(payload) || !isPlainObject(payload) || Reflect.ownKeys(payload).length !== 1 || !Object.hasOwn(payload, "args") || !isObject(payload.args) || !isPlainObject(payload.args) || Reflect.ownKeys(payload.args).length !== 0) throw new TypertGatewayError("gateway/arguments-invalid", REMOTE_EVENT_STREAM_ENDPOINT, "forwarded Remote event stream requires an empty args object"); const registration = this.remoteEvents;';
   const normalizedHost = hostSource.replace(/\s+/g, ' ');
-  if (hostSource.split(rejectAnchor).length !== 2 || !normalizedHost.includes(validationPrefix)) {
+  if (hostSource.split(rejectAnchor).length !== 2 || (!normalizedHost.includes(validationPrefix) && !normalizedHost.includes(validationPrefix020))) {
     throw new Error(`dsh ${core.version}: re-check the side-effect-free foreground probe contract`);
   }
   let source = fs.readFileSync(file, 'utf8');
@@ -206,9 +219,8 @@ function installForegroundRecovery(globals, connection) {
     fs.writeFileSync(file, source.replace(anchor, recovery));
     console.log('Patched fnOS foreground carrier check and SDK-owned recovery');
   }
+  }
 }
-
-// ---------------------------------------------------------------------------
 // 0.2.0 made every browser route document-relative (upstream note:
 // web-document-relative-app-routes): routes ship as `"/path".slice(1)` and are
 // resolved against document.baseURI. A subpath deployment therefore inherits
@@ -221,10 +233,17 @@ function installForegroundRecovery(globals, connection) {
 // class of bug that produced those rewrites in the first place).
 // ---------------------------------------------------------------------------
 function assertAnchor(packageName, anchor, label) {
-  const file = pkgFile(packageName, 'lib', 'client.js');
-  if (!file) throw new Error(`dsh ${core.version}: package ${packageName} not found (needed to verify ${label})`);
-  const source = fs.readFileSync(file, 'utf8');
-  if (!source.includes(anchor)) {
+  const files = clientEntry(packageName) || [];
+  const extra = pkgFile(packageName, 'lib', 'types', 'client', 'runtime.js');
+  if (extra && fs.existsSync(extra)) files.push(extra);
+  if (!files.length) throw new Error(`dsh ${core.version}: package ${packageName} not found (needed to verify ${label})`);
+  let seen = false;
+  for (const file of files) {
+    if (!fs.existsSync(file)) continue;
+    const source = fs.readFileSync(file, 'utf8');
+    if (source.includes(anchor)) { seen = true; break; }
+  }
+  if (!seen) {
     throw new Error(`dsh ${core.version}: ${packageName} (${label}) no longer carries its relative-route anchor — re-check fnOS gateway-prefix assumptions before bumping`);
   }
   console.log(`Verified ${packageName} keeps its document-relative route (${label})`);
@@ -268,7 +287,7 @@ assertAnchor('dsh-client-ui-deliverables',
 // global exists. That dependency is why patchLegacyCompat must FAIL the build
 // when the shim cannot be injected, never skip silently.
 {
-  const eager = ['lib/client.js', 'lib/index.js']
+  const eager = ['lib/client.js', 'lib/client.browser.js', 'lib/client.node.js', 'lib/index.js']
     .map((rel) => pkgFile('dsh-client-ui-sidebar-documentpreview', rel))
     .filter((file) => file && fs.existsSync(file));
   for (const file of eager) {

@@ -1,0 +1,49 @@
+name: Candidate checks and build
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 20 * * *"
+permissions:
+  contents: read
+concurrency:
+  group: fnos-candidate
+  cancel-in-progress: false
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Configure verified build tool
+        env:
+          FNPACK_URL: ${{ vars.FNPACK_URL }}
+          FNPACK_SHA256: ${{ vars.FNPACK_SHA256 }}
+        run: |
+          set -euo pipefail
+          test -n "$FNPACK_URL" && test -n "$FNPACK_SHA256"
+          curl --fail --location --proto "=https" "$FNPACK_URL" -o "$RUNNER_TEMP/fnpack"
+          printf "%s  %s\n" "$FNPACK_SHA256" "$RUNNER_TEMP/fnpack" | sha256sum --check --strict
+          chmod 755 "$RUNNER_TEMP/fnpack"
+          echo "FNPACK_BIN=$RUNNER_TEMP/fnpack" >> "$GITHUB_ENV"
+      - name: Record upstream version without changing pinned dependency
+        run: |
+          set -euo pipefail
+          npm view @deepseek-ai/dsh version --json > "$RUNNER_TEMP/upstream-version.json"
+      - name: Build candidate only
+        env:
+          FNOS_CANDIDATE_OUTPUT: ${{ runner.temp }}/fnos-candidate
+        run: bash scripts/build-candidate.sh
+      - name: Upload auditable candidate and logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: fnos-candidate-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/fnos-candidate/artifacts/
+            ${{ runner.temp }}/fnos-candidate/*.json
+            ${{ runner.temp }}/fnos-candidate/*.log
+            ${{ runner.temp }}/fnos-candidate/SHA256SUMS
+            ${{ runner.temp }}/upstream-version.json
+          retention-days: 30

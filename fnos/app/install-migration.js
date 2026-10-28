@@ -30,6 +30,10 @@ function migrate({legacy,target,backupDir,controlDir,env=process.env,appDir=__di
  if(state&&state.phase!=='completed'&&state.phase!=='rolled-back')throw new Error('存在未完成迁移事务，保留现场，不自动重试');
  if(state?.phase==='completed'&&state.source===source&&state.target===dest&&stat(path.join(dest,MARKER)))return {migrated:false,reason:'already-migrated'};
  if(!hasRealData(source))return {migrated:false,reason:'no-legacy-data'};
+ // Existing configured data is authoritative. This is a read-only no-op, not
+ // a migration: do not demand parent rename grants or scan stale legacy locks.
+ // Trust, path independence and unresolved transaction guards above still apply.
+ if(preserveExisting&&stat(dest)&&hasRealData(dest))return {migrated:false,reason:'configured-target-preserved'};
  const record={dataDir:dest,backupDir:backup,selectedPlugins:[]};authorised(record,env);cold([source,dest],appDir);
  if(stat(dest)&&hasRealData(dest)){if(preserveExisting)return {migrated:false,reason:'configured-target-preserved'};throw new Error('目标已使用，拒绝覆盖');}
  const fd=fs.openSync(lock,'wx',0o600);fs.fchmodSync(fd,0o600);let stage=null,previous=null,moved=false,committed=false,confirmed=false,entry=null;

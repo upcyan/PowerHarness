@@ -116,7 +116,7 @@ for ((i=0; i<100; i++)); do
         curl --silent --show-error --unix-socket "$stage/app/guide.sock" \
           -H 'Host: 127.0.0.1:5666' -H 'X-Trim-IsAdmin: true' \
           -D "$stage/guide.headers" -o "$stage/guide.html" http://127.0.0.1/app/dsh-fnos
-        grep -q '应用设置' "$stage/guide.html" || { cat "$stage/guide.headers" "$stage/guide.html"; exit 1; }
+        grep -q '控制台' "$stage/guide.html" || { cat "$stage/guide.headers" "$stage/guide.html"; exit 1; }
         ticket="$(sed -n 's/.*<iframe[^>]*src="\([^"]*\)".*/\1/p' "$stage/guide.html")"
         [[ "$ticket" == https://127.0.0.1:3080/_fnos/start?ticket=* ]] || { cat "$stage/guide.headers" "$stage/guide.html"; exit 1; }
         curl --insecure --silent --show-error --location --max-redirs 5 \

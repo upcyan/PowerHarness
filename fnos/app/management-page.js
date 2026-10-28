@@ -11,6 +11,8 @@ const pluginPaths = require('./plugin-paths.js');
 const grants = require('./grants.js');
 const automaticBackups = require('./automatic-backup-policy.js');
 const managementTheme = require('./management-theme.js');
+const managementPlugins = require('./management-plugins.js');
+const managementDiagnosis = require('./management-diagnosis.js');
 const reliabilityPanel = require('./reliability-panel.js');
 const actions = require('./actions.js');   // 破坏性 action 的唯一定义处（见该文件头注释）
 
@@ -18,7 +20,7 @@ const groups = [
   { id: 'overview', label: '概览', description: '查看运行状态、重启 DSH 和调整服务端口。', items: [['overview', '运行状态'], ['runtime', '运行控制']] },
   { id: 'core', label: '核心与扩展', description: '管理 DSH 核心版本、插件、npm 下载源与 profile 配置文件。', items: [['versions', 'DSH 版本'], ['plugins', '插件管理'], ['registry', 'npm 源'], ['config', '配置文件']] },
   { id: 'data', label: '数据与权限', description: '管理配置档与备份，以及目录、容器和插件 URL 的访问权限。', items: [['profiles', '配置档'], ['backups', '备份与恢复'], ['grants', '目录权限'], ['containers', '容器权限'], ['pluginPaths', '插件 URL 放行']] },
-  { id: 'diagnostics', label: '诊断', description: '查看日志、执行 dsh/npm/pnpm 命令、开启限时网络调试。', items: [['logs', '诊断日志'], ['terminal', '命令行'], ['network', '网络调试']] }
+  { id: 'diagnostics', label: '诊断', description: '使用独立 AI 诊断配置档、查看日志、执行命令与开启限时网络调试。', items: [['ai', 'AI 诊断'], ['logs', '诊断日志'], ['terminal', '命令行'], ['network', '网络调试']] }
 ];
 const views = new Set(groups.flatMap((group) => group.items.map(([id]) => id)));
 
@@ -66,33 +68,11 @@ function startupDiagnosisCard(diag, form, action, state) {
     + '<p class="hint">「同步模块解析层」按当前核心目录重建回退层软链、归档遮蔽回退层的旧版核心包；「重建版本豁免」按期望清单重放被数据回滚清空的 exact-version 豁免。两者在核心重启后生效。</p>'
     + '</div>';
 }
-// AI 诊断模式卡（0.3.61）：核心起不来时，用只含模型 provider 的纯净 patch 启动
-// （supervisor 的 enter-diagnosis），再用网关侧直连模型的对话面板分析日志——
-// 该通道不经过 core，核心挂了也能用；退出时从进入前的备份恢复原配置。
+// 常驻独立诊断配置档由网关承载，不裁剪或切换主配置。
 function diagnosisCard(state, form, action, diag, csrf, aiProviders) {
-  const active = !!diag?.active;
-  if (!active && state.mode !== 'safe') return '';
-  const legacy = active && diag.mode !== 'read-only';
-  const items = aiProviders || [];
-  const options = items.map(p => '<option value="' + escapeHtml(p.id) + '" data-models="' + escapeHtml(JSON.stringify(p.models || [])) + '" data-preferred="' + escapeHtml(p.model || '') + '"' + (p.preferred ? ' selected' : '') + '>' + escapeHtml(p.id) + (p.reason ? '（暂不支持）' : '') + '</option>').join('');
-  const core = ['ready', 'rollback'].includes(state.mode) ? '核心已就绪' : '核心未就绪（' + escapeHtml(state.mode || 'unknown') + '）';
-  return '<div class="card remediation ai-diagnosis"><h3>只读 AI 辅助诊断</h3>'
-    + '<p><strong id="ai-core-state">' + core + '</strong>。此面板不依赖核心启动；发送诊断请求不会停用插件、修改 patch 或重启核心。</p>'
-    + (legacy ? '<p class="error">这是旧诊断流程留下的配置变更，不能据此认定第三方插件全部已停用。请确认并恢复原配置。</p><p class="hint">原配置备份：<code>' + escapeHtml(String(diag.backup || '未记录')) + '</code></p>' : '')
-    + '<p class="hint">仅发送运行状态（模式与版本）和你输入的内容；不会自动上传原始配置或日志。请先遮盖敏感内容。仅支持文本 Chat/API-key；OAuth/Codex 等协议暂不支持。</p>'
-    + (items.some(p => p.temporaryOnly) ? '<p class="error">当前配置不可解析：仅展示官方内置 Chat 目录，不读取原密钥。请输入本次临时诊断密钥；原配置保持不变。</p>' : '')
-    + (!items.length ? '<p class="error">未能读取可用模型配置。请先校验配置或备份，不要为打开此面板而重置 patch。</p>' : '')
-    + '<div id="ai-log" aria-live="polite"></div><div class="ai-fields">'
-    + '<label>模型 provider<select id="ai-provider">' + options + '</select></label>'
-    + '<label>模型<select id="ai-model"></select></label>'
-    + '<label>端点（服务器配置/官方内置目录）<input id="ai-base" type="url" readonly></label>'
-    + '<p id="ai-provider-hint" class="hint"></p>'
-    + '<label>临时诊断密钥（可选，不保存）<input id="ai-key" type="password" autocomplete="off" placeholder="留空则使用明确引用的托管 API key"></label>'
-    + '</div><label>错误信息或问题<textarea id="ai-input" rows="3" placeholder="粘贴已脱敏的错误，并说明发生的操作"></textarea></label>'
-    + '<input id="ai-csrf" type="hidden" value="' + escapeHtml(String(csrf || '')) + '"><p><button type="button" id="ai-send">发送给所选模型</button></p>'
-    + (active ? '<div class="actions">' + action('exit-diagnosis', legacy ? '恢复旧诊断前配置并退出' : '关闭只读诊断') + '</div>' : '')
-    + '</div>';
+  return managementDiagnosis.render({ state, action, diag, csrf, providers: aiProviders });
 }
+
 // 会话存档卡片（0.3.61）：让管理员在设置页看到「是否有会话尚未存档」，并可一键
 // 建快照。回滚只回退到最近一次快照，未存档的会话在回滚时会丢——把它变成可见、
 // 可操作的指标，而不是隐含风险。
@@ -312,15 +292,9 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const action = (name, label, fields = '') => form(name, fields, label);
   const select = (name, values, selected) => `<select name="${name}">${values.map(([value, label]) => `<option value="${escapeHtml(value)}"${value === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select>`;
   const coreOptions = installedCores.map((version) => [version, `DSH ${version}${version === state.activeVersion ? '（运行中）' : ''}`]);
-  const profileOptions = profileNames.map((name) => [name, `${name}${name === activeProfile ? '（运行中）' : ''}`]);
+  const profileOptions = profileNames.filter(name => name !== 'fnos-diagnostic').map((name) => [name, `${name}${name === activeProfile ? '（运行中）' : ''}`]);
   const backupRows = backupReadError ? '<tr><td colspan="4" class="error">' + escapeHtml(backupReadError) + '</td></tr>' : backups.map((item) => `<tr><td>${escapeHtml(item.createdAt)}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.version)}</td><td>${action('restore', '恢复此备份', `<input type="hidden" name="backupId" value="${escapeHtml(item.id)}">`)}</td></tr>`).join('');
-  const pluginCards = installedPlugins.map((item) => {
-    const field = `<input type="hidden" name="packageName" value="${escapeHtml(item.name)}">`;
-    if (item.enablementError) return `<article class="plugin-card"><div><strong>${escapeHtml(item.name)}</strong><span>启用状态记录损坏，操作已锁定</span></div><p class="error">${escapeHtml(item.enablementError)}。请从备份页恢复配置；安装文件未被删除。</p></article>`;
-    const status = item.enabled ? (item.filesOk === false ? '已启用（文件缺失）' : '已启用') : item.compatible ? '已禁用' : '文件缺失或非插件';
-    const toggle = item.enabled ? form('disable-plugin', field, '禁用') : item.compatible ? form('enable-plugin', field, '启用') : '';
-    return `<article class="plugin-card"><div><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.version)} · ${status}</span></div><div class="actions">${toggle}${form('uninstall-plugin', field, '卸载并清理', 'danger')}</div></article>`;
-  }).join('');
+  const pluginCards = managementPlugins.cards(installedPlugins, form);
   const pendingPluginPaths = pluginUrlPaths.candidates.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item.path)}/*</code></strong><span>最近检测：${escapeHtml(item.lastSeen)} · 次数：${item.count}</span></div><div class="actions">${form('allow-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '放行')}${form('dismiss-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '忽略')}</div></article>`).join('');
   const approvedPluginPaths = pluginUrlPaths.approved.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item)}/*</code></strong><span>已允许自动改写到 DSH 网关</span></div><div class="actions">${form('revoke-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item)}">`, '撤销放行', 'danger')}</div></article>`).join('');
   const registryPresets = [
@@ -366,7 +340,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     versions: `<h2>DSH 版本</h2><p>应用版本（FPK）：<strong>${escapeHtml(appVer || '未知')}</strong><br>随包版本：${escapeHtml(state.bundledVersion || '未知')} · 当前版本：${escapeHtml(state.activeVersion || '未知')}</p><p>npm latest（默认渠道）：<strong>${escapeHtml(update.latest || '未检查')}</strong><br>npm next（预览渠道）：<strong>${escapeHtml(update.next || '未检查')}</strong><br>上次检查：${escapeHtml(update.checkedAt || '尚未检查')}</p>${action('check-update', '立即检查更新')}<div class="divider"></div><h3>安装新版本</h3>${form('install-core', `<label>版本号 <input name="version" required pattern="[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?" value="${escapeHtml(update.latest || '')}"></label>`, '安装并切换核心')}<h3>切换已有版本</h3>${coreOptions.length ? form('switch-core', `<label>已安装版本 ${select('version', coreOptions, state.activeVersion)}</label>`, '切换版本') : '<p class="hint">暂无独立安装的版本。</p>'}${action('use-bundled', '切换到随包核心')}`,
     registry: `<h2>npm 源</h2><p>当前源：<code>${escapeHtml(registry)}</code></p><div class="actions">${registryPresets}</div>${form('set-registry', `<label>自定义 HTTPS 源 <input name="registry" type="url" required value="${escapeHtml(registry)}"></label>`, '保存源')}<p class="hint">仅填写可信的 HTTPS 镜像地址。插件使用新源需要重新启动 DSH 核心。</p>`,    config: `<h2>配置文件</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。DSH 的自定义配置写在 <code>cordis.patch.yml</code>（每个配置档一份；保存时校验页面读取版本，外部改动后需刷新，不会覆盖较新配置），保存后 DSH 会自动热加载（patchReload: live），无需重启；若 core 因此异常，请到「运行控制」重试进入安全模式，<strong>按影响从小到大的分级引导</strong>修复（含备份恢复与禁用自定义条目）。</p><h3>cordis.patch.yml（可编辑）</h3>${form('save-patch-config', `<input type="hidden" name="patchRevision" value="${escapeHtml(patchView.patchRevision)}"><input type="hidden" name="profile" value="${escapeHtml(activeProfile)}"><textarea name="content" class="patch-editor" spellcheck="false" wrap="off">${escapeHtml(patchView.patch)}</textarea>`, '保存并应用')}<h3>备份（自动保留最近 10 份）</h3>${patchBackupOptions.length ? form('restore-patch-config', `<label>选择备份 ${select('backupName', patchBackupOptions, patchBackupOptions[0] && patchBackupOptions[0][0])}</label>${legacyPatchBackups.length ? `<label class="hint"><input type="checkbox" name="confirmLegacyProfile" value="true"> 我确认把「来源未知的历史备份」恢复到当前配置档 ${escapeHtml(activeProfile)}（${legacyPatchBackups.length} 份历史备份需要此确认）</label>` : ''}`, '恢复此备份') : '<p class="hint">暂无备份（保存或禁用时会自动创建）。</p>'}<div class="divider"></div><h3>cordis.yml（根配置，只读）</h3><pre class="patch-readonly">${escapeHtml(patchView.rootConfig) || '（空）'}</pre><p class="hint">这是 profile 根配置，DSH 官方要求不要直接修改它；所有自定义都应写在上方 cordis.patch.yml。</p>`,
 
-    plugins: `<h2>插件管理</h2>${pluginWiringCard(wiring, action)}<p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。禁用会保留安装文件；卸载会从配置、依赖清单和安装目录清理插件。操作完成后会验证 DSH 能否启动。</p>${state.mode === 'safe' ? '<p class="error">当前处于安全模式。可先禁用冲突插件，成功后 DSH 会自动恢复运行。</p>' : ''}<h3>安装新插件</h3>${form('install-plugin', '<label>插件来源 <input name="packageName" required placeholder="name@1.2.3、user/repo 或 github:user/repo#tag"></label>', '检查并安装插件')}<p class="hint">安装前会检查 DSH 插件声明、依赖兼容性并（对 npm 来源）查询高危漏洞公告；支持 npm 来源（name@1.2.3）与 GitHub 来源（user/repo 或 github:user/repo#tag，经 pnpm 安装）。安装失败会恢复原配置。GitHub 来源不经过 npm 安全审计；插件运行时代码拥有 DSH 权限，请只安装可信发布者的插件。</p><h3>从本地文件导入</h3><form id="plugin-import-form"><p><input type="file" id="plugin-import-file" accept=".tgz,.tar.gz" required></p><p><button type="submit" id="plugin-import-btn">上传并安装</button><span id="plugin-import-status" class="hint"></span></p></form><p class="hint">支持 npm pack 产物（.tgz，≤64MB）。上传后走与在线安装相同的校验与回滚链；插件运行时代码拥有 DSH 权限，请只导入可信来源的包。</p>${pluginsNeedRepair ? `<div class="card remediation"><h3>检测到插件文件缺失</h3><p>部分插件的 node_modules 文件不完整（通常是 pnpm 操作半途失败所致，表现为插件路由 404、功能消失）。可按 pnpm-lock.yaml 一键重建插件目录，完成后自动重启 DSH。</p><div class="actions">${action('repair-plugin-files', '一键修复插件文件并重启')}</div></div>` : ''}<h3>已安装插件</h3><p><input type="search" id="plugin-search" placeholder="搜索插件名…" autocomplete="off" style="width:100%;max-width:360px"></p><div class="plugin-list">${pluginCards || '<p class="hint">当前配置档没有额外安装的插件。</p>'}</div><div class="divider"></div>`,
+    plugins: `<h2>插件管理</h2>${pluginWiringCard(wiring, action)}<p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。禁用会保留安装文件；卸载会从配置、依赖清单和安装目录清理插件。操作完成后会验证 DSH 能否启动。</p>${state.mode === 'safe' ? '<p class="error">当前处于安全模式。可先禁用冲突插件，成功后 DSH 会自动恢复运行。</p>' : ''}<h3>安装新插件</h3>${form('install-plugin', '<label>插件来源 <input name="packageName" required placeholder="name@1.2.3、user/repo 或 github:user/repo#tag"></label>', '检查并安装插件')}<p class="hint">安装前会检查 DSH 插件声明、依赖兼容性并（对 npm 来源）查询高危漏洞公告；支持 npm 来源（name@1.2.3）与 GitHub 来源（user/repo 或 github:user/repo#tag，经 pnpm 安装）。安装失败会恢复原配置。GitHub 来源不经过 npm 安全审计；插件运行时代码拥有 DSH 权限，请只安装可信发布者的插件。</p><h3>从本地文件导入</h3><form id="plugin-import-form"><p><input type="file" id="plugin-import-file" accept=".tgz,.tar.gz" required></p><p><button type="submit" id="plugin-import-btn">上传并安装</button><span id="plugin-import-status" class="hint"></span></p></form><p class="hint">支持 npm pack 产物（.tgz，≤64MB）。上传后走与在线安装相同的校验与回滚链；插件运行时代码拥有 DSH 权限，请只导入可信来源的包。</p>${pluginsNeedRepair ? `<div class="card remediation"><h3>检测到插件文件缺失</h3><p>部分插件的 node_modules 文件不完整（通常是 pnpm 操作半途失败所致，表现为插件路由 404、功能消失）。可按 pnpm-lock.yaml 一键重建插件目录，完成后自动重启 DSH。</p><div class="actions">${action('repair-plugin-files', '一键修复插件文件并重启')}</div></div>` : ''}<h3>已安装插件</h3>${managementPlugins.toolbar(session.csrf, view)}<div class="plugin-list">${pluginCards || '<p class="hint">当前配置档没有额外安装的插件。</p>'}</div><div class="divider"></div>`,
     pluginPaths: `<h2>插件 URL 放行</h2><p>手机和 fnOS 远程入口使用子路径。应用会自动发现插件请求的根路径 API，但不会自动放行。确认路径属于可信插件后点击“放行”，再返回并强制刷新 DSH。</p><p class="hint">这里只控制浏览器 URL 自动改写，不限制插件在 DSH 内部的权限，也不代替插件与 DSH 核心版本的兼容检查。每条规则覆盖对应路径及其子路径，不含其他前缀。</p><h3>待放行</h3><div class="plugin-list">${pendingPluginPaths || '<p class="hint">尚未检测到第三方根路径请求。先打开插件页面，再刷新这里。</p>'}</div><div class="divider"></div><h3>已放行</h3><div class="plugin-list">${approvedPluginPaths || '<p class="hint">尚未放行第三方路径。</p>'}</div>`,
     profiles: `<h2>DSH 配置档</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。新配置档从 DSH 官方 Web 模板创建，切换前自动备份。</p>${form('switch-profile', `<label>已有配置档 ${select('profile', profileOptions, activeProfile)}</label>`, '切换配置档')}${form('create-profile', '<label>新配置档名称 <input name="profile" required pattern="[a-z][a-z0-9_-]{0,31}" maxlength="32" placeholder="例如 work"></label>', '新建并切换')}`,
     grants: `<h2>目录权限</h2><p>在 fnOS 应用中心找到 DeepSeek Harness，打开访问权限并授予需要使用的 NAS 文件夹。授权后重新启动应用，再刷新此页。</p><p>已授权且可读取的目录会在 DSH 工作区的 <code>${escapeHtml(grants.shortcutFolder)}</code> 中显示为快捷入口。文件操作仍受 fnOS 对应用账号授予的权限限制。</p><div class="table-scroll"><table><thead><tr><th>fnOS 授权目录</th><th>当前访问</th></tr></thead><tbody>${grantRows || '<tr><td colspan="2">当前未收到 fnOS 授权目录。请在 fnOS 应用中心授予访问权限。</td></tr>'}</tbody></table></div><div class="divider"></div><h3>检测工作区写入权限</h3><p>输入在 DSH 中选择的完整目录，例如 <code>/vol1/共享文件夹/项目目录</code>。检测会在该目录短暂创建并删除一个空文件夹，与 DSH 的工作区检查一致。</p>${form('probe-workspace', '<label>工作区绝对路径 <input name="workspacePath" required placeholder="/vol1/共享文件夹/项目目录"></label>', '检测实际写入权限')}<p class="hint">上表只显示授权根目录的基础权限；子目录可能有不同 ACL。若刚授权仍未显示，请在 fnOS 应用中心停止并重新启动本应用。</p>`,
@@ -394,6 +368,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     let capability = null; try { capability = ops.readJson(ops.dataPath(dataDir, 'core-capabilities.json')); } catch {}
     panels[view] += `<section class="reliability-status"><h3>实际启动能力</h3><p>${capability ? escapeHtml(capability.status === 'compatible' ? '实际参数能力匹配；仍需完整启动验收' : '参数能力不兼容或未确认') : '尚未检查当前核心的实际 CLI 参数'}</p>${action('inspect-core-capabilities', '只读检查实际参数（不重启）')}</section>`;
   }
+  panels.ai = diagnosisCard(state, form, action, diagnosisState, csrf, aiProviders);
   if (view === 'runtime') panels[view] += require('./connection-settings').render(dataDir, form);
   if (['overview', 'backups', 'logs'].includes(view)) panels[view] += reliabilityPanel.render({dataDir,state,backups,backupReadError,profile:activeProfile,authorizedCount:authorizedDirectories.length,action,report:integrityReport});
 
@@ -500,7 +475,9 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   // 都可能判定"状态变化了，刷新页面" —— 两者各刷一次会让用户看到两次闪跳，
   // 且都可能在 fetch 在途时打断它。这里只允许第一个申请者生效。
   let reloadGate = false, reloadTimer = null, operationGeneration = 0;
-  let pageActive = true, stateFlight = null, postController = null, authProblem = false;
+  let pageActive = true, stateFlight = null, postController = null, authProblem = false, activePostForm = null, activePostButton = null;
+  const operationFeedback = (${managementPlugins.operationFeedback.toString()});
+  const showOperationFeedback = (${managementPlugins.showOperationFeedback.toString()});
   let observedBootId = ${JSON.stringify(state.bootId || null)};
   const restartRequest = () => {
     if (!/^[a-f0-9]{32}$/.test(observedBootId || '') || !window.crypto?.getRandomValues) return null;
@@ -631,78 +608,8 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     if (event.target.closest('a[data-dsh-open]') && window.parent !== window) window.parent.postMessage({ type: 'dsh-fnos-view', view: 'dsh' }, '*');
   });
   // —— AI 诊断对话（网关直连模型，不经过 core；核心挂了也能用）——
-  (() => {
-    const log = document.getElementById('ai-log');
-    const input = document.getElementById('ai-input');
-    const btn = document.getElementById('ai-send');
-    if (!log || !input || !btn) return;
-    const history = [];
-    const csrf = document.getElementById('ai-csrf')?.value || '';
-    const providerSel = document.getElementById('ai-provider');
-    const baseInput = document.getElementById('ai-base');
-    const modelSel = document.getElementById('ai-model');
-    const keyInput = document.getElementById('ai-key');
-    const hint = document.getElementById('ai-provider-hint');
-    let models = [], selection = 0, controller = null;
-    const updateModel = () => {
-      const selected = models.find(m => m.id === modelSel.value);
-      baseInput.value = selected ? selected.baseURL || '' : '';
-      btn.disabled = !(selected && selected.supported && selected.baseURL);
-      hint.textContent = btn.disabled ? '未解析到受支持的 Chat 模型与端点。Codex/OAuth 不使用此调用链。' : '端点来自服务器配置或官方目录；不能在浏览器覆盖，以免把密钥发送到其他地址。';
-    };
-    const applyProviderBase = () => {
-      selection++; controller?.abort(); history.length = 0; log.textContent = ''; keyInput.value = '';
-      const option = providerSel.selectedOptions[0];
-      try { models = JSON.parse(option?.dataset.models || '[]'); } catch { models = []; }
-      modelSel.replaceChildren();
-      for (const model of models) {
-        const item = document.createElement('option'); item.value = model.id; item.textContent = model.id + (model.supported ? '' : '（暂不支持）'); modelSel.appendChild(item);
-      }
-      if (models.some(m => m.id === option?.dataset.preferred)) modelSel.value = option.dataset.preferred;
-      updateModel();
-    };
-    applyProviderBase();
-    providerSel.addEventListener('change', applyProviderBase);
-    modelSel.addEventListener('change', () => { selection++; controller?.abort(); history.length = 0; log.textContent = ''; updateModel(); });
-    const append = (role, text) => {
-      const div = document.createElement('div');
-      div.style.margin = '6px 0';
-      div.style.whiteSpace = 'pre-wrap';
-      div.textContent = (role === 'user' ? '我：' : 'AI：') + text;
-      log.appendChild(div);
-      log.scrollTop = log.scrollHeight;
-      return div;
-    };
-    const send = async () => {
-      const message = input.value.trim();
-      if (!message || btn.disabled) return;
-      input.value = '';
-      append('user', message);
-      const pending = append('assistant', '分析中…');
-      btn.disabled = true;
-      const token = selection;
-      try {
-        const provider = providerSel ? providerSel.value : '';
-        const baseURL = baseInput ? baseInput.value.trim() : '';
-        controller = new AbortController();
-        const deadline = setTimeout(() => controller.abort(), 125000);
-        let res;
-        try { res = await fetch('/__fnos/ai-chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ csrf, message, history, provider, model: modelSel.value, baseURL, apiKey: keyInput.value }) }); } finally { clearTimeout(deadline); }
-        if (token !== selection) return;
-        const data = await res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status }));
-        if (token !== selection) return;
-        if (data.ok) {
-          pending.textContent = 'AI：' + data.reply;
-          history.push({ role: 'user', content: message }, { role: 'assistant', content: data.reply });
-        } else { pending.textContent = '⚠ ' + (data.error || '调用失败'); }
-      } catch (error) { pending.textContent = '⚠ 网络错误：' + error.message; }
-      updateModel();
-      log.scrollTop = log.scrollHeight;
-      input.focus();
-    };
-    btn.addEventListener('click', send);
-    input.addEventListener('keydown', (event) => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); send(); } });
-  })();
+  ${managementDiagnosis.clientScript()}
+
   // 常驻状态轮询（0.3.66，用户反馈）：原先只有**点了操作按钮**才临时轮询，
   // 若用户从应用中心冷启动应用后停在管理页，页面会一直显示旧状态（"维护中"），
   // 必须手动切视图才发现已就绪。现在页面加载即每 3 秒拉一次 /__fnos/state，
@@ -777,13 +684,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
   })();
 
-  // —— 插件管理：搜索过滤 ——
-  document.getElementById('plugin-search')?.addEventListener('input', (event) => {
-    const q = event.target.value.trim().toLowerCase();
-    document.querySelectorAll('.plugin-card').forEach((card) => {
-      card.style.display = !q || (card.textContent || '').toLowerCase().includes(q) ? '' : 'none';
-    });
-  });
+  ${managementPlugins.clientScript()}
   // —— 插件管理：本地 .tgz 导入（base64 上传 → 服务端落盘安装）——
   document.getElementById('plugin-import-form')?.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -857,11 +758,20 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     delete document.body.dataset.busy;
     document.body.classList.remove('page-busy');
   }
-  window.addEventListener('pagehide', () => { pageActive = false; beginOperation(); postController?.abort(); resetBusy(); });
+  window.addEventListener('pagehide', () => {
+    if (activePostForm && activePostButton && postController) {
+      activePostButton.classList.remove('is-working');
+      activePostButton.removeAttribute('aria-busy');
+      showOperationFeedback(activePostForm, activePostButton, operationFeedback({}, false));
+    }
+    pageActive = false; beginOperation(); postController?.abort(); resetBusy();
+  });
   window.addEventListener('pageshow', () => { pageActive = true; resetBusy(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) { cancelReload(); stateFlight?.controller.abort(); } });
   document.addEventListener('submit', async (event) => {
+    if (event.defaultPrevented) return;
     if (!event.target.matches('form[action="/__fnos/action"]')) return;
+    if (event.target.dataset.operationUnconfirmed === '1') { event.preventDefault(); return; }
     const action = event.target.querySelector('input[name="action"]')?.value;
     // retry / restart-all 的确认已由标题栏弹窗承担（0.3.62）：弹窗里两个选项各自
     // 写明了影响范围与预计耗时，再来一个 window.confirm 是重复打断。其余仍是
@@ -921,12 +831,25 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     // ⚠ 必须转成 URLSearchParams：服务端按 urlencoded 解析请求体，
     // FormData 默认是 multipart，凭据字段会全部解析失败（403）。
     postController = new AbortController();
+    activePostForm = form; activePostButton = button;
     const postAbort = postController;
     const postDeadline = setTimeout(() => postAbort.abort(), 180000);
     fetch(form.getAttribute('action'), { signal: postAbort.signal, method: 'POST', body: formBody, credentials: 'same-origin' })
       .then(async (reply) => {
         if (!currentOperation(generation)) return;
-        if (!reply.ok) throw new Error('HTTP ' + reply.status);
+        const resultUrl = new URL(reply.url || location.href, location.href);
+        const serverNotice = resultUrl.origin === location.origin ? resultUrl.searchParams.get('notice') || '' : '';
+        if (!reply.ok || serverNotice.startsWith('操作失败')) {
+          const failure = new Error(!reply.ok ? 'HTTP ' + reply.status : serverNotice);
+          failure.httpStatus = !reply.ok ? reply.status : 0;
+          failure.serverNotice = serverNotice;
+          failure.confirmedFailure = serverNotice.startsWith('操作失败');
+          failure.confirmedAccepted = Boolean(serverNotice) && !failure.confirmedFailure;
+          if (reply.headers?.get('content-type')?.includes('application/json')) {
+            try { const detail = await reply.json(); failure.serverReason = typeof detail.error === 'string' ? detail.error : detail.error?.message || detail.message || ''; } catch { /* do not expose arbitrary HTML */ }
+          }
+          throw failure;
+        }
         // 重启类操作：服务端返回时核心可能仍在启动，直接刷新只会看到旧状态或 503
         // 页面。这里轮询到真正就绪再跳转，之后徽标自然回到「运行中」。
         if (isRestart) {
@@ -940,7 +863,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
         }
         // 服务端把操作结果放在重定向的 notice 参数里；reload 当前地址会把它丢掉，
         // 失败也会被当成成功。跳到 fetch 跟随后的最终地址（同源，服务端自己签发）。
-        const target = new URL(reply.url, location.href);
+        const target = resultUrl;
         if (target.origin === location.origin && target.href !== location.href) location.href = target.href;
         else location.reload();
       })
@@ -951,11 +874,11 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
         // 会主动断掉当前连接，fetch 因此必然 reject，于是一次**成功**的重启
         // 在界面上被标成"重启失败"。现在按错误类型给出不同结论，并且都恢复按钮。
         const message = String((error && error.message) || '');
-        const status = message.startsWith('HTTP ') ? Number(message.slice(5)) : 0;
+        const status = Number(error.httpStatus) || (message.startsWith('HTTP ') ? Number(message.slice(5)) : 0);
         let authExpired = error.authExpired || status === 401 || status === 403;
         let restartFailed = Boolean(error.restartFailed);
         // 丢失POST响应只查询同一请求的回执，不重发。旧ready/其他请求一律不算成功。
-        if (restart && !authExpired && !status && !restartFailed) {
+        if (restart && !authExpired && (!status || error.confirmedAccepted) && !restartFailed && !error.confirmedFailure) {
           try {
             const confirmed = await waitForCoreReady(Math.max(0, operationDeadline - Date.now()), generation, true, restart);
             if (!currentOperation(generation)) return;
@@ -969,7 +892,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
         if (authExpired) {
           authProblem = true;
           // 未被接受的请求不能拿旧核心ready证明重启成功，也不能自动重发。
-          setAppState('凭据过期，请刷新页面', 'bad');
+          setAppState(status === 403 ? '管理请求被拒绝，请刷新检查权限' : '凭据过期，请刷新页面', 'bad');
         } else if (restartFailed) {
           setAppState('完全重启失败，请检查运行控制', 'bad');
         } else if (isRestart) {
@@ -981,8 +904,9 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
         button.classList.remove('is-working');
         button.removeAttribute('aria-busy');
         if (button.classList.contains('restart-icon')) button.setAttribute('aria-label', authExpired ? '重启 DSH（凭据已过期，请刷新页面）' : '重启 DSH');
-        else button.textContent = authExpired ? '凭据过期，请刷新页面' : '操作失败，请重试';
-      }).finally(() => { clearTimeout(postDeadline); if (postController === postAbort) postController = null; });
+        const feedback = operationFeedback({ ...error, message, httpStatus: status, authExpired, restartFailed }, isRestart);
+        showOperationFeedback(form, button, feedback);
+      }).finally(() => { clearTimeout(postDeadline); if (postController === postAbort) { postController = null; activePostForm = null; activePostButton = null; } });
   });
   </script>` : '';
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DeepSeek Harness 应用设置</title><style>
@@ -1159,7 +1083,9 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
   .plugin-card strong,.debug-info code,.card code{overflow-wrap:anywhere}
   /* 防止横向滚动条：页面级兜底。 */
   html,body{max-width:100%;overflow-x:hidden}
-${managementTheme.css}</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${statusBanner}${pendingBar}${restartDialog}<div class="shell settings-shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><div class="settings-layout"><aside class="settings-sidebar"><nav class="primary" aria-label="设置分类">${primaryNav}</nav></aside><div class="settings-content"><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div></div></div>${busyScript}${nonce ? `<script nonce="${nonce}">(${managementTheme.installNavigation.toString()})();</script>` : ''}</body></html>`;
+${managementTheme.css}
+${managementPlugins.styles}
+${managementDiagnosis.styles}</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${statusBanner}${pendingBar}${restartDialog}<div class="shell settings-shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><div class="settings-layout"><aside class="settings-sidebar"><nav class="primary" aria-label="设置分类">${primaryNav}</nav></aside><div class="settings-content"><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div></div></div>${busyScript}${nonce ? `<script nonce="${nonce}">(${managementTheme.installNavigation.toString()})();</script>` : ''}</body></html>`;
 }
 
 module.exports = { render, selectedView };
