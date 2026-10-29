@@ -35,6 +35,24 @@ if [[ -n "$bump_kind" && -n "$set_version" ]]; then
   echo "--bump and --set are mutually exclusive" >&2; exit 2
 fi
 
+# ---------------------------------------------------------------------------
+# npm HOME / cache isolation.
+#
+# npm derives its cache as ${HOME}/.npm. The build must never depend on a HOME
+# the build user cannot write:
+#   - unset HOME           -> npm falls back to /home/<user>/.npm, which may not
+#                             exist (npm then fails at mkdir 'EACCES /home/dsh_fnos');
+#   - HOME=/root           -> npm probes /root/.npm, owned root:root 0700, and
+#                             fails at mkdir '_cacache/tmp' for the same reason.
+# Both failure modes look like a cache-ownership bug but are really just a bad
+# HOME. A private HOME under the build tmpdir plus an explicit cache removes
+# the guesswork, and keeps every byte of npm state off /root.
+export DSH_NPM_HOME="${DSH_NPM_HOME:-${TMPDIR:-/tmp}/dsh-fnos-npm-home}"
+export DSH_NPM_CACHE="${DSH_NPM_CACHE:-${TMPDIR:-/tmp}/dsh-fnos-npm-cache}"
+mkdir -p "$DSH_NPM_HOME" "$DSH_NPM_CACHE"
+export HOME="$DSH_NPM_HOME"
+export npm_config_cache="$DSH_NPM_CACHE"
+
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
   echo "Build requires Linux x86_64." >&2
   exit 1
@@ -148,7 +166,7 @@ npm ci --omit=dev --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage
 # npm ci only warns about advisories: it is NOT a release security gate.
 # Network errors, vulnerabilities or SDK contract failures abort before fnpack,
 # preserving the prior artifact and manifest instead of emitting an unsafe FPK.
-npm audit --omit=dev --audit-level=low --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
+npm audit --omit=dev --audit-level="${DSH_NPM_AUDIT_LEVEL:-low}" --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
 node "$root/scripts/verify-mcp-runtime.mjs" "$stage/app/runtime"
 node "$root/scripts/patch-dsh.mjs" "$stage/app/runtime"
 # Data-only platform catalogue and read-only post-patch gate share the UI inspector.

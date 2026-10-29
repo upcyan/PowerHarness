@@ -165,6 +165,30 @@ def sanitize_text(data: bytes, name: str) -> bytes:
     return text.encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Copyright-risk denylist — INDEPENDENT of the SPDX check below.
+#
+# The SPDX check only reads package.json `license`. A wrapper that declares MIT
+# can still redistribute upstream model/service access whose terms forbid it:
+# shared "free" model relays, hub plugins that broker third-party provider
+# accounts (jethub etc.), and account-login sites. Those must never ship in the
+# FPK regardless of how the wrapper is licensed. User rule: no copyright-risk
+# packages in the FPK.
+#
+# Adding an entry requires a name + a reason. Removal requires the user's word.
+#
+# Cleared by the user on 2026-10-29 (keep in the FPK, do NOT re-add without a new
+# instruction): dshmarket, dsh-glm-mode.
+# ---------------------------------------------------------------------------
+COPYRIGHT_RISK_PACKAGES: dict[str, str] = {
+    'dsh-our-free-model': 'bundles shared "free" model relay access; upstream model terms do not travel with an MIT wrapper',
+    'dsh-providers-hub': 'brokers third-party provider accounts including jethub; redistribution not covered by wrapper license',
+    'dsh-free-models-hub': 'aggregates third-party free-model endpoints of unverified provenance',
+    'dsh-zcode-plan-bridge': 'exposes a third-party CLI plan as a model provider',
+    'dsh-trae-cyanmod': 'bundles third-party account credentials/login flow',
+}
+
+
 def npm_pack(package_dir: Path, out_dir: Path, require_licenses: bool = False) -> Path | None:
     """Pack a package using npm's own `files` semantics.
 
@@ -193,6 +217,13 @@ def npm_pack(package_dir: Path, out_dir: Path, require_licenses: bool = False) -
         # package without a `files` allowlist would otherwise publish.
         target = out_dir / produced[0].name
         metadata = json.loads((package_dir / 'package.json').read_text(encoding='utf-8'))
+        # Copyright-risk denylist runs first and is unconditional: it ignores
+        # `license`, `files` and any supplemental notice text.
+        risk = COPYRIGHT_RISK_PACKAGES.get(metadata['name'])
+        if risk:
+            print(f"    NOT DISTRIBUTED: {metadata['name']} — copyright risk: {risk}")
+            produced[0].unlink(missing_ok=True)
+            return None
         approved = {'dsh-plugin-proxy': '0.1.0', 'dsh-preset-integrator': '0.1.0', '@vectorize-io/hindsight-coding-agents': '0.8.1'}
         files = []
         if metadata['name'] in approved and approved[metadata['name']] == metadata.get('version'):

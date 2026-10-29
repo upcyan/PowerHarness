@@ -298,8 +298,8 @@
     {
       "packagePath": "node_modules/@earendil-works/pi-ai/package.json",
       "name": "@earendil-works/pi-ai",
-      "version": "1.3.0",
-      "manifestSha256": "4e9ed07b06a91d844485874c251f312b610d015a4a4fd32c78cde58a7862a3f1",
+      "version": "1.4.0",
+      "manifestSha256": "36df91142c18a5912eafab0f2783bb4d88cdd101c5c5e7fd9173d4387cc5cced",
       "documents": [
         {
           "target": "LICENSE",
@@ -308,13 +308,14 @@
           "sourceUrl": "https://github.com/earendil-works/pi/blob/71023aec1546d6d677a65669c5665c0927ce0dd0/LICENSE",
           "identityCheck": "verified-SLSA-subject-and-workflow-plus-fixed-source-package-Git-blob"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     },
     {
       "packagePath": "node_modules/@earendil-works/pi-telemetry/package.json",
       "name": "@earendil-works/pi-telemetry",
-      "version": "1.3.0",
-      "manifestSha256": "386479e7767a2aff572fea6339558405b1b23e9e7951504731515fc71b7db6ae",
+      "version": "1.4.0",
+      "manifestSha256": "d6e047b173341260b811a294e377e2f90ce31755fdc94ac2fe30bfbdf0d32847",
       "documents": [
         {
           "target": "LICENSE",
@@ -323,7 +324,8 @@
           "sourceUrl": "https://github.com/earendil-works/pi/blob/71023aec1546d6d677a65669c5665c0927ce0dd0/LICENSE",
           "identityCheck": "verified-SLSA-subject-and-workflow-plus-fixed-source-package-Git-blob"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     },
     {
       "packagePath": "node_modules/data-uri-to-buffer/package.json",
@@ -373,8 +375,8 @@
     {
       "packagePath": "node_modules/@deepseek-ai/dsh-experimental-inspector/package.json",
       "name": "@deepseek-ai/dsh-experimental-inspector",
-      "version": "0.2.1-rc.2",
-      "manifestSha256": "8fa8b089e35ff0ee884c21e570006004d153489185d26f6c3f2afed8a9864aad",
+      "version": "0.2.1-rc.4",
+      "manifestSha256": "fa4a042ddc6da55c532aefbad2fdd47f7cb09fe1066031e990312d93e71e6325",
       "documents": [
         {
           "target": "LICENSE.DeepSeek-project.txt",
@@ -383,13 +385,14 @@
           "sourceUrl": "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-inspector-profile/-/dsh-experimental-inspector-profile-0.2.1-rc.2.tgz",
           "identityCheck": "same deepseek-harness project at 0.2.1-rc.2; profile tarball SRI; profile manifest byte-identical to frozen payload; profile LICENSE is the project MIT text already shipped with @deepseek-ai/dsh"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     },
     {
       "packagePath": "node_modules/@aws-sdk/credential-provider-http/package.json",
       "name": "@aws-sdk/credential-provider-http",
-      "version": "3.972.76",
-      "manifestSha256": "c79b69a2e9dba1f267d2605065dd0668a1e30bfaeeede5032f1f90767c1b36dc",
+      "version": "3.972.80",
+      "manifestSha256": "fa20644c970ee81411bd9fe2989d6f1e86a661faa1cbb7cb5942a7c3788f982d",
       "documents": [
         {
           "target": "LICENSE.Apache-2.0.txt",
@@ -398,13 +401,14 @@
           "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
           "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     },
     {
       "packagePath": "node_modules/@aws-sdk/credential-provider-login/package.json",
       "name": "@aws-sdk/credential-provider-login",
-      "version": "3.972.81",
-      "manifestSha256": "64f70b3dfc1ae18643b25157322aa4b38c4e02a47fbba95d08d7f421f5152b80",
+      "version": "3.972.85",
+      "manifestSha256": "77ba3cace1f0eba84ba75030bdd4f07d52c6e5192e13605d09470f31bb935c78",
       "documents": [
         {
           "target": "LICENSE.Apache-2.0.txt",
@@ -413,13 +417,14 @@
           "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
           "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     },
     {
       "packagePath": "node_modules/@aws-sdk/nested-clients/package.json",
       "name": "@aws-sdk/nested-clients",
-      "version": "3.997.48",
-      "manifestSha256": "3566438b4ebec512260cc6f52aa35e8bea3a67ba6f807bf8ef67dba647919dea",
+      "version": "3.997.52",
+      "manifestSha256": "87c1cfd8cad0f19d7b885291233928d5afc13f4fbe5d0fbec00e4cc2496c40c4",
       "documents": [
         {
           "target": "LICENSE.Apache-2.0.txt",
@@ -428,7 +433,8 @@
           "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/blob/main/LICENSE",
           "identityCheck": "monorepo-shared license; Git blob 0322cba2 verified; exact-package-tag not present upstream, package@version found in monorepo at this license"
         }
-      ]
+      ],
+      "upstreamNoticeCarried": false
     }
   ]
 }

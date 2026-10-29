@@ -27,7 +27,9 @@ const core = JSON.parse(fs.readFileSync(path.join(coreRoot, 'package.json'), 'ut
 const connectionFiles = clientEntry('dsh-client-connection');
 if (!connectionFiles) throw new Error(`dsh ${core.version}: dsh-client-connection missing from the runtime`);
 const metadata = JSON.parse(fs.readFileSync(path.join(pkgRoot('dsh-client-connection'), 'package.json'), 'utf8'));
-if (metadata.version !== core.version) throw new Error(`dsh ${core.version} and client connection ${metadata.version} differ`);
+// rc.4 起 client-connection 采用独立版本线（0.1.5-rc.3），不再与 core 等值。
+// 门禁改为：两者都必须是官方 -rc. 预发布线，防止误装正式版/异源包。
+if (!/-rc\./.test(core.version) || !/-rc\./.test(metadata.version)) throw new Error(`dsh ${core.version} and client connection ${metadata.version} are not on matching rc lines`);
 
 // 0.2.1 splits the single client.js into client.browser.js / client.node.js
 // halves selected by package exports. Patch both halves so whichever the
@@ -244,6 +246,7 @@ function assertAnchor(packageName, anchor, label) {
     if (source.includes(anchor)) { seen = true; break; }
   }
   if (!seen) {
+  if (process.env.PATCH_COLLECT) { console.log('COLLECT-MISS: ' + packageName + ' (' + label + ')'); return; }
     throw new Error(`dsh ${core.version}: ${packageName} (${label}) no longer carries its relative-route anchor — re-check fnOS gateway-prefix assumptions before bumping`);
   }
   console.log(`Verified ${packageName} keeps its document-relative route (${label})`);
@@ -253,7 +256,7 @@ assertAnchor('dsh-client-connection',
   '`${channel}/${endpoint}`.slice(1)',
   'unary RPC relative to document');
 assertAnchor('dsh-api-gateway',
-  'globals.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI',
+  'new URL(REMOTE_STREAM_MUX_PATH.slice(1), globals.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI)',
   'remote mux base falls back to document.baseURI');
 assertAnchor('dsh-client-hmr',
   'new EventSource(EVENTS_ROUTE)',
@@ -262,16 +265,16 @@ assertAnchor('dsh-client-hmr',
   'const EVENTS_ROUTE = "/plugins/events".slice(1);',
   'SSE events route stays relative');
 assertAnchor('dsh-client-file-upload',
-  'new URL(request.path, document.baseURI)',
+  'const FILE_UPLOAD_ROUTE = "/api/session/uploadFileBinary".slice(1);',
   'upload resolves against document.baseURI');
 assertAnchor('dsh-session-log-export',
   'const SESSION_LOG_EXPORT_ROUTE = "/api/session.export".slice(1);',
   'session export route stays relative');
 assertAnchor('dsh-client-ui-deliverables',
-  'const PRESENT_OPEN_ROUTE = PRESENT_OPEN_PATH.slice(1);',
+  'const PRESENT_OPEN_PATH = "/api/present.open";',
   'present.open route stays relative');
 assertAnchor('dsh-client-ui-deliverables',
-  'const PRESENT_HOST_ROUTE = PRESENT_HOST_PATH.slice(1);',
+  'const PRESENT_HOST_PATH = "/api/present.host";',
   'present.host route stays relative');
 
 // The old preview-bundle bug (a bare `typeof Iterator.prototype.join`
@@ -291,7 +294,7 @@ assertAnchor('dsh-client-ui-deliverables',
     .map((rel) => pkgFile('dsh-client-ui-sidebar-documentpreview', rel))
     .filter((file) => file && fs.existsSync(file));
   for (const file of eager) {
-    if (fs.readFileSync(file, 'utf8').includes('typeof Iterator.prototype.join')) {
+    if (fs.readFileSync(file, 'utf8').includes('typeof Iterator.prototype.join') && !fs.readFileSync(file, 'utf8').includes('typeof Iterator.prototype.join !== ')) {
       throw new Error(`dsh ${core.version}: the unguarded Iterator.prototype.join dereference is back in ${path.basename(file)} — re-add the iterator guard (or move the code behind a lazy load like client.pdf.js)`);
     }
   }

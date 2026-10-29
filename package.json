@@ -9,7 +9,7 @@
     "@modelcontextprotocol/client": "2.3.1"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.2.1-rc.2",
+    "@deepseek-ai/dsh": "0.2.1-rc.4",
     "pnpm": "10.34.5",
     "selfsigned": "5.5.0"
   }
