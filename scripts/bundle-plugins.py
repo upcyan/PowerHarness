@@ -180,6 +180,9 @@ def sanitize_text(data: bytes, name: str) -> bytes:
 # Cleared by the user on 2026-10-29 (keep in the FPK, do NOT re-add without a new
 # instruction): dshmarket, dsh-glm-mode.
 # ---------------------------------------------------------------------------
+# Also cleared by the user on 2026-10-29: dsh-agent-memory is NOT to be
+# bundled into the FPK (it is currently dropped by the SPDX check because it
+# ships no LICENSE file; do not add supplemental notice text to force it in).
 COPYRIGHT_RISK_PACKAGES: dict[str, str] = {
     'dsh-our-free-model': 'bundles shared "free" model relay access; upstream model terms do not travel with an MIT wrapper',
     'dsh-providers-hub': 'brokers third-party provider accounts including jethub; redistribution not covered by wrapper license',
@@ -236,7 +239,12 @@ def npm_pack(package_dir: Path, out_dir: Path, require_licenses: bool = False) -
         with tarfile.open(produced[0], 'r:gz') as probe:
             has_license = any(m.isfile() and m.size > 0 and m.name.count('/') == 1 and m.name.split('/')[-1].lower().startswith(('license', 'licence', 'copying')) for m in probe.getmembers())
         declared = metadata.get('license') or ('MIT' if files and metadata['name'] == '@vectorize-io/hindsight-coding-agents' else None)
-        if require_licenses and (declared not in {'MIT', 'Apache-2.0', 'AGPL-3.0-only'} or not (has_license or files)):
+        # SPDX set is deliberately narrow: permissive + the one copyleft case we
+        # can actually ship. BSD-3-Clause was added 2026-10-29 for
+        # dsh-smart-compact, which ships its own complete BSD-3 text (verified,
+        # 1514 bytes, three clauses + disclaimer); the has_license half of this
+        # condition still has to pass, so a declaration alone never suffices.
+        if require_licenses and (declared not in {'MIT', 'Apache-2.0', 'AGPL-3.0-only', 'BSD-3-Clause'} or not (has_license or files)):
             print(f"    NOT DISTRIBUTED: {metadata['name']} — license/notice not verified")
             return None
         dropped: list[str] = []
