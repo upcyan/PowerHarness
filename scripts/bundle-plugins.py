@@ -337,12 +337,21 @@ def main(argv: list[str]) -> int:
         archive = npm_pack(package_dir, out_dir, require_licenses=args.require_licenses)
         if archive is None:
             continue
-        entries.append({
+        description = ""
+        try:
+            meta = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
+            description = str(meta.get("description") or "").strip()[:80]
+        except (OSError, ValueError):
+            description = ""
+        entry = {
             "name": name,
             "version": version,
             "file": archive.name,
             "integrity": digest(archive),
-        })
+        }
+        if description:
+            entry["description"] = description
+        entries.append(entry)
 
     if want is not None:
         missing = want - {e["name"] for e in entries}

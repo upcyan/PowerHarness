@@ -29,8 +29,26 @@ else
     false
   fi
 fi
+STAGE="检测 agent 对话进行中"
+# 对话/任务进行中（.writing/.lock 最近 120 秒内有写入）则明示等待，不笼统报失败。
+# busy 检测已从门禁降级为日志（0.3.101）：钩子在平台停用应用之后运行，此刻中止
+# 只会让应用停留在停用态、强迫手动重启，救不回已被切断的对话；真正的数据保护
+# 是下一步的升级前冷备。这里仅留痕供事后解释"对话为何中断"，然后继续升级。
+if [ "$(FNOS_DATA_DIR="$DATA_DIR" node "$APP_DIR/upgrade-agent-busy.js" 2>/dev/null || echo unknown)" = busy ]; then
+  message="升级前置提示：检测到 agent 任务互斥痕迹（.writing/.lock 近 120 秒内有写入）。进行中的任务会被本次升级中断；数据由升级前冷备保护。继续升级。"
+  printf "%s\n" "$message" >> "$DATA_DIR/supervisor.log" 2>/dev/null || true
+  [ -z "${TRIM_TEMP_LOGFILE:-}" ] || printf "%s\n" "$message" >> "$TRIM_TEMP_LOGFILE"
+fi
 STAGE="停止旧应用"
 "$(dirname "$0")/main" stop
+# 冷备开始前即向平台日志与临时日志留痕：告知正在备份、大数据量可能超过 App Center 的
+# 钩子等待窗口而先弹"未知错误"（平台写死的判定，包侧无法干涉），最终结果以应用版本号与
+# supervisor.log 中的「升级前置完成」为准。0.3.102 起冷备为硬链接秒级，正常不会触窗；
+# 本提示为跨文件系统回退复制等慢速场景兜底。
+printf "DeepSeek Harness 升级前置：正在创建升级前独立冷备（数据量大时可能需要数分钟）。若飞牛应用中心在此之前提示升级失败（未知错误），那是其等待窗口先到，属误报——本次升级仍在后台继续，最终结果以应用版本号与应用日志（supervisor.log 中「升级前置完成」）为准。\n" >> "${TRIM_TEMP_LOGFILE:-/dev/null}" 2>/dev/null || true
+printf "DeepSeek Harness 升级前置：开始创建升级前独立冷备。\n" >> "$DATA_DIR/supervisor.log" 2>/dev/null || true
 STAGE="创建并校验升级前独立冷备"
 FNOS_APP_DIR="$APP_DIR" FNOS_DATA_DIR="$DATA_DIR" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
   node "$APP_DIR/upgrade-snapshot.js" >> "$DATA_DIR/supervisor.log" 2>&1
+printf "DeepSeek Harness 升级前置完成：冷备已创建并校验通过。\n" >> "$DATA_DIR/supervisor.log"
+[ -z "${TRIM_TEMP_LOGFILE:-}" ] || printf "DeepSeek Harness 升级前置完成：冷备已创建并校验通过。\n" >> "$TRIM_TEMP_LOGFILE"

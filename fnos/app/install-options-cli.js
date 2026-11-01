@@ -12,7 +12,7 @@ try{
   let index={plugins:[]};try{index=JSON.parse(fs.readFileSync(path.join(app,'plugins-bundled/bundled-plugins.json'),'utf8'));}catch(error){if(error.code!=='ENOENT')throw error;}
   const configured=options.initialize(control,{dataDir:env.wizard_data_dir||options.defaults.dataDir,backupDir:env.wizard_backup_dir||options.defaults.backupDir,selectedPlugins:options.selection(index,env)});const user=identity();if(process.getuid()===0)fs.chownSync(options.file(control),user.uid,user.gid);
   const child=spawnSync(process.execPath,[__filename,'probe-as-app',String(user.uid),String(user.gid)],{env,encoding:'utf8',timeout:15000,maxBuffer:262144});
-  if(child.error||child.status!==0){console.log('安装设置已保存，目录尚未满足应用账号授权：'+options.advice);console.log((child.stderr||'').slice(-2000));}else console.log('数据与备份目录应用身份读写检查通过');
+  if(child.error||child.status!==0){console.log('安装设置已保存，目录尚未满足应用账号授权：'+options.advice);console.log((child.stderr||'').slice(-2000));console.log('NOTICE_AUTH_PENDING');process.exitCode=2;}else console.log('数据与备份目录应用身份读写检查通过');
  }
  else if(mode==='get-data')console.log(read()?.dataDir||legacy);
  else if(mode==='get-backup')console.log(read()?.backupDir||env.FNOS_BACKUP_DIR||'');

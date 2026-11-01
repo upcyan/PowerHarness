@@ -184,6 +184,10 @@ cache_target="$(realpath -m -- "${stage:?}/.npm-cache")"
 rm -rf -- "$cache_target"
 cd "$root/dist"
 "$fnpack_bin" build --directory "$stage"
+# fnpack always writes dsh-fnos.fpk; keep a version-stamped artifact for release traceability.
+mv -f -- dsh-fnos.fpk "dsh-fnos-${target_version}.fpk"
+sha256sum "dsh-fnos-${target_version}.fpk" > "dsh-fnos-${target_version}.fpk.sha256"
+echo "artifact: dsh-fnos-${target_version}.fpk"
 
 # Only advance the recorded version once the package exists, so an aborted
 # build leaves fnos/manifest untouched.

@@ -33,3 +33,4 @@ tests/
 fnos/app/AI-CONTEXT.md
 fnos/app/CHANGELOG-AI.md
 .candidate-build.lock
+.local/

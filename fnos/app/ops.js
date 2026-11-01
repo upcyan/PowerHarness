@@ -574,17 +574,58 @@ function createSnapshotLocked(dataDir, configDir, kind, version, { online = fals
   privateDir(pending);
   try {
     const fingerprint = (directory, scope) => snapshotFingerprint(directory, configDir, { scope });
+    const fast = process.env.FNOS_UPGRADE_SNAPSHOT_FAST === '1';
+    // fast 模式：不可变大文件（会话日志轮转 .zstd、附件对象块）硬链接；其余照旧复制。
+    const fastLinkable = (file, scope) => {
+      if (!fast || scope !== 'all') return false;
+      const rel = path.relative(dataDir, file);
+      return rel.startsWith('dsh-home' + path.sep + 'sessions' + path.sep) && file.endsWith('.zstd')
+        || rel.startsWith('dsh-home' + path.sep + 'attachments' + path.sep + 'objects' + path.sep);
+    };
+    const linkTree = (srcRoot, dstRoot) => {
+      const walk = (src, dst, depth) => {
+        let entries; try { entries = fs.readdirSync(src, { withFileTypes: true }); } catch { return; }
+        fs.mkdirSync(dst, { recursive: true });
+        for (const e of entries) {
+          const s = path.join(src, e.name), d = path.join(dst, e.name);
+          if (e.isSymbolicLink()) continue;
+          if (e.isDirectory()) walk(s, d, depth + 1);
+          else if (fastLinkable(s, 'all')) { try { fs.linkSync(s, d); } catch { try { fs.copyFileSync(s, d); } catch {} } }
+          else { try { fs.copyFileSync(s, d); } catch {} }
+        }
+      };
+      walk(srcRoot, dstRoot, 0);
+    };
     const copy = scope => {
       for (const name of ['dsh-home', 'workspace']) {
         const src = dataPath(dataDir, name);
-        if (exists(src)) fs.cpSync(src, path.join(pending, name), {
-          recursive: true, dereference: false, verbatimSymlinks: true,
-          filter: file => {
-            if (!configCoordination.snapshotFilter(file)) return false;
-            const isStatic = path.relative(dataDir, file).split(path.sep).includes('node_modules');
-            return scope === 'all' || (scope === 'mutable' ? !isStatic : isStatic || fs.lstatSync(file).isDirectory());
-          },
-        });
+        if (!exists(src)) continue;
+        if (fast && scope === 'all') {
+          // fast：先硬链接不可变树（sessions/*.zstd、attachments/objects），其余整体复制并跳过已链接文件
+          const linkSets = [['dsh-home', 'sessions'], ['dsh-home', path.join('attachments', 'objects')]];
+          for (const [root, sub] of linkSets) {
+            const s = path.join(src, sub);
+            if (exists(s)) linkTree(s, path.join(pending, root, sub));
+          }
+          fs.cpSync(src, path.join(pending, name), {
+            recursive: true, dereference: false, verbatimSymlinks: true, force: false,
+            filter: file => {
+              if (!configCoordination.snapshotFilter(file)) return false;
+              if (fastLinkable(file)) return false; // 已硬链接，跳过复制
+              const isStatic = path.relative(dataDir, file).split(path.sep).includes('node_modules');
+              return scope === 'all' || (scope === 'mutable' ? !isStatic : isStatic || fs.lstatSync(file).isDirectory());
+            },
+          });
+        } else {
+          fs.cpSync(src, path.join(pending, name), {
+            recursive: true, dereference: false, verbatimSymlinks: true,
+            filter: file => {
+              if (!configCoordination.snapshotFilter(file)) return false;
+              const isStatic = path.relative(dataDir, file).split(path.sep).includes('node_modules');
+              return scope === 'all' || (scope === 'mutable' ? !isStatic : isStatic || fs.lstatSync(file).isDirectory());
+            },
+          });
+        }
       }
     };
     // Large dependency trees are retained, but do not stretch the consistency

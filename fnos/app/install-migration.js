@@ -47,7 +47,7 @@ function migrate({legacy,target,backupDir,controlDir,env=process.env,appDir=__di
   if(fingerprint(source)!==sourceBefore||fingerprint(dest)!==targetBefore)throw new Error('迁移期间目录变化，拒绝提交');cold([source,dest],appDir);
   save(path.join(stage,MARKER),{schema:1,id:entry.id,source,target:dest,backup:receipt});
   entry.phase='committing';save(journal,entry);fs.renameSync(dest,previous);moved=true;fs.renameSync(stage,dest);committed=true;stage=null;
-  entry.phase='completed';save(journal,entry);confirmed=true;return {migrated:true,backup:receipt.archive,previous,receipt:path.join(dest,MARKER)};
+  entry.phase='completed';save(journal,entry);confirmed=true;try{const ownership=require('./ownership.js');const repaired=ownership.claim(dest);if(repaired)console.log('迁移属主接管：'+repaired+' 个条目归还应用账号');}catch{}/* 属主修复失败不推翻已提交的迁移，audit 会在启动时兜底报错 */return {migrated:true,backup:receipt.archive,previous,receipt:path.join(dest,MARKER)};
  }catch(error){
   if(committed){throw new Error('迁移已提交但回执未确认，禁止自动重试：'+error.message);}
   if(moved){try{if(stat(dest))throw new Error('目标身份未知');fs.renameSync(previous,dest);moved=false;}catch{throw new Error('迁移恢复状态未确认，保留事务与锁，禁止重试');}}

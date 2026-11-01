@@ -16,7 +16,7 @@ function preserve(dataDir,configDir,version,env=process.env){
  if(meta.fingerprint!==ops.snapshotFingerprint(location,configDir)||meta.fingerprint!==ops.snapshotFingerprint(dataDir,configDir))throw new Error('卸载保全校验失败，拒绝继续');
  for(const control of meta.controlFiles||[]){const bytes=fs.readFileSync(path.join(location,'control-evidence',control.name));if(require('node:crypto').createHash('sha256').update(bytes).digest('hex')!==control.sha256)throw new Error('卸载控制配置保全失败');}
  const receipt={schema:1,mode:'independent-preservation',keep:true,snapshotId:snapshot.id,storageRoot:root,verified:true,at:new Date().toISOString(),externalBackupsDeleted:false};
- ops.writeJson(path.join(root,'uninstall-preservation.json'),receipt);return receipt;
+ try{require('./ownership.js').claim(location);}catch{}/* 快照属主修复尽力而为；备份树属主异常会让下次启动的备份扫描炸 EACCES */ops.writeJson(path.join(root,'uninstall-preservation.json'),receipt);return receipt;
 }
 if(require.main===module){const {FNOS_DATA_DIR:data,FNOS_CONFIG_DIR:config,FNOS_APP_DIR:app}=process.env;if(!data||!app)throw new Error('Missing fnOS retention paths');console.log(JSON.stringify(preserve(data,config,ops.dshVersion(app))));}
 module.exports={policy,preserve};

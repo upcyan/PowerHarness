@@ -138,7 +138,9 @@ function managedKey(dataDir, yaml, ref, explicit, customSource = false) {
   return value;
 }
 function diagnosticMessages(state, history, message, model = {}, options = {}) {
-  let system = isolated.INSTRUCTIONS;
+  // 2026-10-31 用户反馈 #6：先注入运维诊断预设提示词（角色/背景/排查顺序/边界），
+  // 再追加原 isolated.INSTRUCTIONS；结构化摘要仍按白名单附加。
+  let system = require('./diagnosis-prompt').prompt + '\n\n' + isolated.INSTRUCTIONS;
   // The fifth argument is constructed by the server, never by spreading a client payload.
   if (options.includeContext === true) {
     const context = require('./diagnostic-context').collect(options.dataDir, options.yaml, options.appDir);

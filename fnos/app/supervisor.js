@@ -2145,6 +2145,19 @@ async function boot() {
   if (nodeMajor < 22) throw new Error(`本机的 Node.js 运行时过旧（v${process.versions.node}），无法运行 DSH。请在 fnOS 应用中心安装或升级「Node.js v24」（nodejs_v24）后重启本应用。`);
   if (nodeMajor < 24) throw new Error(`本机的 Node.js 运行时版本过低（v${process.versions.node}，本应用按 v24 打包）。请在 fnOS 应用中心升级「Node.js v24」（nodejs_v24）后重启本应用。`);
   for (const name of [dataDir, ops.dataPath(dataDir, 'dsh-home'), ops.dataPath(dataDir, 'workspace')]) fs.mkdirSync(name, { recursive: true, mode: 0o700 });
+  // 存储属主自检（2026-10-31 事故加固）：root 钩子残留的 0700/0600 条目会让
+  // 核心启动期 pnpm 抛出无路径的 "EACCES: permission denied, opendir"，排查困难。
+  // 这里在 spawn 之前以带路径的中文错误明确指出坏目录与修复命令，进安全模式页。
+  try {
+    const ownershipProblems = require('./ownership.js').audit(dataDir);
+    if (ownershipProblems.length) {
+      eventLog('storage_ownership_broken', { count: ownershipProblems.length });
+      throw new Error(ownershipProblems.join('；'));
+    }
+  } catch (error) {
+    if (error.message.startsWith('存储目录不可读')) throw error;
+    /* 自检自身失败（如模块缺失）不阻断启动 */
+  }
   // DSH_HOME 可能被旁路到 /vol1 之外的符号链接（见 resolveDshHomePath）：
   // 真实目录必须先存在，链接才建得出来。结果存到模块级变量供 spawnDsh 使用。
   dshHome = resolveDshHomePath();

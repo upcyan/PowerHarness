@@ -1,10 +1,21 @@
 #!/bin/bash
-set -eu
+set -u
 export PATH="/var/apps/nodejs_v24/target/bin:$PATH"
-"$(dirname "$0")/main" stop
-DATA_DIR="$(node "${TRIM_APPDEST:?}/install-options-cli.js" get-data)" || exit 1
-FNOS_BACKUP_DIR="$(node "${TRIM_APPDEST:?}/install-options-cli.js" get-backup)" || exit 1
-[ -z "$FNOS_BACKUP_DIR" ] || export FNOS_BACKUP_DIR
+# 卸载前置（0.3.97 加固）：fnOS 以本脚本退出码判定"卸载失败"，但旧实现用 set -eu
+# 导致"停止已成功、保全校验失败"或"get-data 瞬时错误"都弹"未知错误"，而平台
+# 实际继续删除——用户看到失败提示却卸载成功。现在：停止与读取尽力而为；
+# 只有保全（uninstall-retention）失败才返回非零，让"失败"名副其实。
+RETAIN_STAGE="数据保全"
+fail() {
+  local message="DeepSeek Harness 卸载前置失败：${1}。数据未完成保全，请勿强行卸载，先检查数据目录访问权限。"
+  printf "%s\n" "$message" >&2
+  [ -z "${TRIM_TEMP_LOGFILE:-}" ] || printf "%s\n" "$message" >> "$TRIM_TEMP_LOGFILE"
+  exit 1
+}
+"$(dirname "$0")/main" stop || printf "main stop 非零退出（可能本就未运行），继续卸载前置\n" >&2
+DATA_DIR="$(node "${TRIM_APPDEST:?}/install-options-cli.js" get-data)" || DATA_DIR="${TRIM_PKGVAR:-}"
+[ -n "$DATA_DIR" ] || fail "无法确定数据目录"
+FNOS_BACKUP_DIR="$(node "${TRIM_APPDEST}/install-options-cli.js" get-backup)" || FNOS_BACKUP_DIR=""
 wizard_keep_data="${wizard_keep_data:-true}" wizard_delete_confirmation="${wizard_delete_confirmation:-}" \
-FNOS_APP_DIR="${TRIM_APPDEST:?}" FNOS_DATA_DIR="${DATA_DIR:?}" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" \
-  node "${TRIM_APPDEST}/uninstall-retention.js" >> "${TRIM_PKGVAR}/supervisor.log" 2>&1
+FNOS_APP_DIR="${TRIM_APPDEST:?}" FNOS_DATA_DIR="$DATA_DIR" FNOS_CONFIG_DIR="${TRIM_PKGETC:-}" FNOS_BACKUP_DIR="$FNOS_BACKUP_DIR" \
+  node "${TRIM_APPDEST}/uninstall-retention.js" >> "${TRIM_PKGVAR}/supervisor.log" 2>&1 || fail "$RETAIN_STAGE"
