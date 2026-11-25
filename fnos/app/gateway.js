@@ -1,6 +1,10 @@
 const http = require('node:http');
 const sseProxy = require('./sse-proxy');
 const unavailablePage = require('./unavailable-page');
+const recoveryStatus = require('./recovery-status');
+const shellRecovery = require('./shell-recovery');
+const setupPage = require('./setup-page');
+const installOptions = require('./install-options.js');
 const wsUpgrade = require('./ws-upgrade');
 const connectionSettings = require('./connection-settings');
 const https = require('node:https');
@@ -10,6 +14,7 @@ const os = require('node:os');
 const { createHash, randomBytes } = require('node:crypto');
 const selfsigned = require('selfsigned');
 const ops = require('./ops.js');
+const appName = require('./app-name.js').appName();
 const cores = require('./core-manager.js');
 const profiles = require('./profiles.js');
 const diagnostics = require('./diagnostics.js');
@@ -33,6 +38,7 @@ const dataDir = process.env.FNOS_DATA_DIR;
 const guideSocket = process.env.GUIDE_SOCKET;
 const manifestPort = Number(process.env.FNOS_PORT || 3080);
 let upstreamPort = Number(process.env.DSH_PORT || 3081);
+let maintenanceHold = null; // 「切换中」占位文本：非 null 时所有代理请求返回维护页（跨 execve 保活，2026-11-18）
 let publicPort = ops.portSettings(dataDir).publicPort || manifestPort;
 // 早期捕获器（0.3.62）：注入到代理的 DSH 页面 <head> 最前，必须在客户端任何
 // 模块加载之前执行 —— 框架常在 import 时就 console.error.bind(console) 捕获原引用，
@@ -70,7 +76,9 @@ let aliasServer = null;
 let guideServer = null;   // 模块级（0.3.62）：main().catch 的失败清理要引用它
 let tlsOptions = null;
 process.on('message', (message) => {
-  if (message?.type === 'core-port' && Number.isInteger(message.port) && message.port >= 1024 && message.port <= 65535) upstreamPort = message.port;
+  if (message?.type === 'maintenance-hold') { maintenanceHold = message.text || '核心正在切换，请稍候；页面会自动刷新。'; }
+  else if (message?.type === 'maintenance-release') { maintenanceHold = null; }
+  else if (message?.type === 'core-port' && Number.isInteger(message.port) && message.port >= 1024 && message.port <= 65535) upstreamPort = message.port;
   else if (message?.type === 'public-port' && Number.isInteger(message.port) && message.port >= 1024 && message.port <= 65535) {
     applyPublicPort(message.port, (error) => {
       if (process.send) process.send({ type: 'public-port-result', id: message.id, ok: !error, error: error?.message || null });
@@ -360,6 +368,10 @@ const reportKeys = new Map();
 const guideCsrf = new Map();
 const gatewayDshPrefix = '/app/dsh-fnos/dsh';
 const gatewayManagePrefix = '/app/dsh-fnos/manage';
+// fnOS 的桌面图标 url 就是应用级前缀（ui/config 里的 gatewayPrefix / url）。
+// 派生实例在打包期把 '/app/dsh-fnos' 改写成 '/app/dsh-fnos2'，所以这里从
+// gatewayDshPrefix 反推，**不要再写第三份字面量**（派生实例会漏改）。
+const gatewayAppPrefix = gatewayDshPrefix.slice(0, -'/dsh'.length);
 const pluginUrlCompat = fs.readFileSync(require.resolve('./plugin-url-compat.js'));
 const cookieName = '__Host-fnos_dsh';
 const log = diagnostics.logger(dataDir, 'gateway');
@@ -491,6 +503,36 @@ async function managementPage(request, response, session) {
   response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; ${framePolicy(session)}`.trim(), 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
   response.end(body);
 }
+// setup 模式：只起了网关、核心从未 spawn（见 supervisor 的 setupBlockReason）。
+// 用户打开应用看到的必须是配置页，而不是「核心暂不可用」——后者会让人以为
+// 应用坏了，实际它正等着配置。CSP 与 unavailable 页同源，另加 form-action
+// 才能提交表单；脚本只用来在提交时禁用按钮防重复提交。
+function setupResponse(request, response, session, guide = false) {
+  const nonce = randomBytes(16).toString('base64');
+  const controlDir = process.env.FNOS_CONFIG_DIR || dataDir;
+  // 没有配置时给一组可按的默认值，省得用户从零开始敲长路径；
+  // 有配置但检查不过时预填已保存的值，方便就地改。
+  let saved = null;
+  try { saved = installOptions.read(controlDir); } catch { /* 坏文件也要能进页面重配 */ }
+  const notice = new URL(request.url, 'http://localhost').searchParams.get('notice') || '';
+  response.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; base-uri 'none'; ${framePolicy(session)}`.trim(),
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer'
+  });
+  response.end(setupPage.render(currentState(), {
+    nonce,
+    csrf: sessionCsrfToken(session),
+    notice,
+    // guide 侧（桌面图标）走 fnOS 反代前缀，表单与状态轮询要指向 manage 端点；
+    // 直连侧走本进程的 /__fnos/*。
+    actionUrl: guide ? gatewayManagePrefix + '/action' : '/__fnos/action',
+    stateUrl: guide ? gatewayManagePrefix + '/state' : '/__fnos/state',
+    defaults: saved ? { dataDir: saved.dataDir, backupDir: saved.backupDir } : installOptions.defaults
+  }));
+}
 function logsPage(request, response, session) {
   const url = new URL(request.url, 'https://fnos.invalid');
   const source = url.searchParams.get('source') || 'gateway';
@@ -518,7 +560,13 @@ function guideLogsPage(request, response) {
   }
   const nonce = randomBytes(16).toString('base64');
   response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'`, 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
-  response.end(diagnosticsUi.render('/app/dsh-fnos/diagnostics', source, content, nonce));
+  // 0.3.116：必须传第 5 个参数 settingsHref，否则两个返回通道同时失效——
+  //   ① render 里 `back` 取到空串 ⇒ 页面上没有「返回应用设置」；
+  //   ② 渲染脚本的 `if (Boolean(settingsHref) && ...) postMessage({view:'settings'})` 不再执行
+  //      ⇒ 壳页 setView 不会切到 settings，顶栏停在「强制刷新 DSH」而不是「返回 DSH」。
+  // 直连模式（logsPage, gateway.js:548）一直传了 '/__fnos/?view=logs'，所以只有这一侧有缺陷。
+  // 前缀与 guideManagementPage 的 request.url.replace(gatewayManagePrefix, '/__fnos') 对齐。
+  response.end(diagnosticsUi.render('/app/dsh-fnos/diagnostics', source, content, nonce, `${gatewayManagePrefix}/?view=logs`));
 }
 const pendingCommands = new Map();
 process.on('message', (message) => {
@@ -532,7 +580,7 @@ function command(action, params) {
     const id = randomBytes(12).toString('hex');
     const timer = setTimeout(() => { pendingCommands.delete(id); reject(new Error('操作超时')); }, 15 * 60_000);
     pendingCommands.set(id, (message) => { clearTimeout(timer); message.ok ? resolve(message.result) : reject(new Error(message.error)); });
-    process.send({ type: 'command', id, action, backupId: params.get('backupId'), version: params.get('version'), registry: params.get('registry'), profile: params.get('profile'), packageName: params.get('packageName'), packageNames: params.getAll('packageNames'), dockerMode: params.get('dockerMode'), corePort: params.get('corePort'), publicPort: params.get('publicPort'), dailyLimit: params.get('dailyLimit'), manualLimit: params.get('manualLimit'), upgradeLimit: params.get('upgradeLimit'), dailyMode: params.get('dailyMode'), content: params.get('content'), patchRevision: params.get('patchRevision'), backupName: params.get('backupName'), confirmLegacyProfile: params.get('confirmLegacyProfile'), restartRequestId: params.get('restartRequestId'), commandText: params.get('command') });
+    process.send({ type: 'command', id, action, backupId: params.get('backupId'), version: params.get('version'), registry: params.get('registry'), profile: params.get('profile'), packageName: params.get('packageName'), packageNames: params.getAll('packageNames'), dockerMode: params.get('dockerMode'), corePort: params.get('corePort'), publicPort: params.get('publicPort'), dailyLimit: params.get('dailyLimit'), manualLimit: params.get('manualLimit'), upgradeLimit: params.get('upgradeLimit'), dailyMode: params.get('dailyMode'), content: params.get('content'), patchRevision: params.get('patchRevision'), backupName: params.get('backupName'), confirmLegacyProfile: params.get('confirmLegacyProfile'), restartRequestId: params.get('restartRequestId'), commandText: params.get('command'), dataDir: params.get('dataDir'), backupDir: params.get('backupDir'), confirmation: params.get('confirmation') });
   });
 }
 
@@ -604,6 +652,10 @@ function aiChat(request, response, session, guide = false) {
       if (!record || record.expires < Date.now() || record.user !== String(request.headers['x-trim-userid'] || '')) return send(response, 403, JSON.stringify({ ok: false, error: 'Invalid CSRF token' }));
     } else if (!csrfMatches(session, String(payload.csrf || ''))) {
       return send(response, 403, JSON.stringify({ ok: false, error: 'Invalid CSRF token' }));
+    }
+    if (payload.action === 'preview-context') {
+      try { return send(response, 200, JSON.stringify({ ok: true, context: require('./diagnostic-context').collect(dataDir, yamlModule, process.env.FNOS_APP_DIR, currentState()) })); }
+      catch { return send(response, 200, JSON.stringify({ ok: false, error: '摘要采集未完成；未调用模型，也未读取凭据。' })); }
     }
     const message = String(payload.message || '').trim();
     const controller = new AbortController();
@@ -712,8 +764,12 @@ async function managementAction(request, response, session, guide = false) {
       connectionSettings.save(dataDir, values[0] === 'true', params.get('connectionRevision'));
       notice = '连接设置已保存；下一次恢复检查生效，无需重启核心';
     } else if (action === 'probe-workspace') {
-      grants.probeWorkspace(params.get('workspacePath'));
-      notice = '工作区目录可读写，可以在 DSH 中使用';
+      const probed = grants.probeWorkspace(params.get('workspacePath'));
+      // 快照为空时不再直接判死（那会把"授权已生效但进程没看到"报成权限不足），
+      // 但结论必须说清楚，否则用户以为任务已结束，实际上重启应用后才会更省心。
+      notice = probed.snapshotTrusted
+        ? '工作区目录可读写，可以在 DSH 中使用'
+        : '工作区目录实际可读写，可以在 DSH 中使用。注意本次启动没有收到 fnOS 授权列表；改过授权的话，建议停止并重新启动本应用。';
     } else if (action === 'start-network-debug') {
       const selected = await networkDebug.start(session.nasIp, { minutes: params.get('minutes') || undefined, mode: params.get('mode') || undefined });
       notice = `临时网络调试已切换为${selected.mode === 'command' ? '指令模式' : '只读模式'}，${selected.minutes} 分钟后自动关闭；端口和 Token 已更新`;
@@ -909,6 +965,15 @@ function handlePublic(request, response) {
     if (!sameOrigin(request)) return send(response, 403, 'Origin denied');
     return connectionPolicyResponse(request, response);
   }
+  // 维护占位（2026-11-18）：supervisor 换镜像（execve/重启）期间 gateway 保活，
+  // 核心必然无响应；与其让 fnOS 反代报裸 Bad Gateway 让用户误以为应用挂了，
+  // 不如由 gateway 自己回答一页会自动刷新的维护说明。被杀/替换后自然退出此状态。
+  if (maintenanceHold && request.url.split('?')[0] !== '/__fnos/connection-policy') {
+    const body = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"5\"><style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:80vh;margin:0;background:#faf9f7;color:#3d3a36}main{text-align:center;max-width:28em;padding:2em}h1{font-size:1.15rem;font-weight:600;margin:0 0 .6em}p{font-size:.9rem;line-height:1.7;margin:.4em 0}</style><title>DSH 维护中</title></head><body><main><h1>DSH 正在切换或启动核心</h1><p>"+String(maintenanceHold).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]))+"</p><p>本页每 5 秒自动刷新；就绪后会自动进入应用。</p></main></body></html>";
+    response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Retry-After': '5', 'Cache-Control': 'no-store' });
+    response.end(body);
+    return;
+  }
   // A credential-free pixel lets the fnOS mobile shell check whether its own
   // WebView can reach the separate HTTPS port before navigating an iframe.
   if (request.method === 'GET' && request.url.startsWith('/_fnos/reachability.svg?')) {
@@ -919,7 +984,7 @@ function handlePublic(request, response) {
   if (request.url === '/_fnos/diagnostic') return browserDiagnostic(request, response);
   if (request.url === '/__fnos/plugin-import') {
     const session = cookieSession(request);
-    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: '请从 fnOS 桌面图标打开 DeepSeek Harness。' }));
+    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: `请从 fnOS 桌面图标打开 ${appName}。` }));
     return pluginImport(request, response, session);
   }
   // 轻量状态端点（0.3.61）：管理页在「重启 DSH」后轮询这里，直到核心真正就绪
@@ -927,7 +992,7 @@ function handlePublic(request, response) {
   // 返回 JSON（体积远小于整页），未就绪时用 503 让前端一眼判定。
   if (request.url.startsWith('/__fnos/state')) {
     const session = cookieSession(request);
-    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: '请从 fnOS 桌面图标打开 DeepSeek Harness。' }));
+    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: `请从 fnOS 桌面图标打开 ${appName}。` }));
     const current = currentState();
     const ready = available();
     const body = JSON.stringify({ ok: ready, mode: current?.mode || 'unknown', error: current?.error || null, activeVersion: current?.activeVersion || null, operation: current?.operation || null, automaticBackupDeferred: automaticBackups.publicDeferrals(current?.automaticBackupDeferred), bootId: current?.bootId || null, restartReceipt: current?.restartReceipt || null, updatedAt: current?.updatedAt || null });
@@ -936,18 +1001,18 @@ function handlePublic(request, response) {
   }
   if (request.url === '/__fnos/ai-chat') {
     const session = cookieSession(request);
-    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: '请从 fnOS 桌面图标打开 DeepSeek Harness。' }));
+    if (!session) return send(response, 401, JSON.stringify({ ok: false, error: `请从 fnOS 桌面图标打开 ${appName}。` }));
     return aiChat(request, response, session);
   }
   if (request.url.startsWith('/__fnos/action')) {
     const session = cookieSession(request);
-    if (!session) { log('session_missing'); return send(response, 401, '请从 fnOS 桌面图标打开 DeepSeek Harness。'); }
+    if (!session) { log('session_missing'); return send(response, 401, `请从 fnOS 桌面图标打开 ${appName}。`); }
     return managementAction(request, response, session);
   }
   // 诊断包（0.3.62）：直连模式同样需要会话，避免未授权下载日志。
   if (request.method === 'GET' && request.url === '/__fnos/diagnostics-pack') {
     const session = cookieSession(request);
-    if (!session) { log('session_missing'); return send(response, 401, '请从 fnOS 桌面图标打开 DeepSeek Harness。'); }
+    if (!session) { log('session_missing'); return send(response, 401, `请从 fnOS 桌面图标打开 ${appName}。`); }
     return diagnosticsPack(request, response);
   }
   if (!sameOrigin(request) && !entryNavigation(request) && !(cookieSession(request) && managementNavigation(request))) {
@@ -985,7 +1050,18 @@ function handlePublic(request, response) {
   }
   if (request.url.startsWith('/_fnos/start?')) return startTicket(request, response);
   const session = cookieSession(request);
-  if (!session) { log('session_missing'); return send(response, 401, '请从 fnOS 桌面图标打开 DeepSeek Harness。'); }
+  if (!session) { log('session_missing'); return send(response, 401, `请从 fnOS 桌面图标打开 ${appName}。`); }
+  // setup 模式（目录还没配好 / 配了但授权不过）：核心从未 spawn，所有页面入口
+  // 都归到配置页。位置必须在 /__fnos/ 路由之前 —— 否则管理页会先接住请求，
+  // 而管理页在 setup 态下的按钮全都指向要核心的操作，点了只会被静默忽略。
+  // action（POST）刻意放行：保存目录正是通过它提交。
+  if (currentState().mode === 'setup') {
+    const setupPath = request.url.split('?')[0];
+    const isSetupPage = request.method === 'GET'
+      && (['/', '/index.html', '/__fnos/', '/__fnos/index.html', '/__fnos'].includes(setupPath));
+    if (isSetupPage) return setupResponse(request, response, session);
+    if (request.method !== 'POST' && !setupPath.startsWith('/__fnos/logs') && !setupPath.startsWith('/__fnos/preflight')) return send(response, 503, 'DSH 正在等待数据目录配置');
+  }
   if (request.url.startsWith('/__fnos/')) {
     if (request.method === 'GET' && request.url.split('?')[0] === '/__fnos/preflight') return recoveryChecksResponse(response);
     if (request.url.startsWith('/__fnos/action')) return managementAction(request, response, session);
@@ -993,11 +1069,12 @@ function handlePublic(request, response) {
     if (request.method === 'GET') return managementPage(request, response, session).catch((error) => managementFallbackPage(response, error, session));
     return send(response, 405, 'Method not allowed');
   }
+
   if (!available()) {
     if (request.method !== 'GET' || !['/', '/index.html'].includes(request.url)) return send(response, 503, 'DSH 核心暂不可用');
     const nonce = randomBytes(16).toString('base64');
     const unavailableState = currentState();
-    response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'; ${framePolicy(session)}`.trim(), 'X-Content-Type-Options': 'nosniff' });
+    response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; ${framePolicy(session)}`.trim(), 'X-Content-Type-Options': 'nosniff' });
     return response.end(unavailablePage.render(unavailableState, { nonce, settingsUrl: '/__fnos/?view=runtime' }));
   }
   const lifetime = sseProxy.createProxyLifetime(request, response);
@@ -1119,7 +1196,9 @@ async function proxyGuideDsh(request, response) {
       let value;
       try { value = JSON.parse(body); } catch { return send(response, 400, 'Invalid report'); }
       if (!pluginPaths.firstSegment(value?.path) || pluginPaths.firstSegment(value.path) !== value.path) return send(response, 400, 'Invalid plugin path');
-      pluginPaths.observe(dataDir, value.path);
+      // plugin 字段来自浏览器调用栈，是不可信输入：plugin-paths 内部按字面量校验，
+      // 不合规就丢弃（仍然记录路径），不会拼进 HTML 或路径。
+      pluginPaths.observe(dataDir, value.path, value?.plugin);
       response.writeHead(204, { 'Cache-Control': 'no-store' });
       response.end();
     })().catch(() => send(response, 500, 'Report failed'));
@@ -1137,7 +1216,7 @@ async function proxyGuideDsh(request, response) {
     if (request.method !== 'GET' || !['/', '/index.html'].includes(localPath)) return send(response, 503, 'DSH 核心暂不可用');
     const nonce = randomBytes(16).toString('base64');
     const unavailableState = currentState();
-    response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; base-uri 'none'`, 'X-Content-Type-Options': 'nosniff' });
+    response.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'`, 'X-Content-Type-Options': 'nosniff' });
     return response.end(unavailablePage.render(unavailableState, { nonce, settingsUrl: `${gatewayManagePrefix}/?view=runtime` }));
   }
   const headers = await guideCoreAuth.headersForGuide(request, upstreamHeaders(request));
@@ -1381,6 +1460,40 @@ function handleGuide(request, response) {
   if (request.headers['x-trim-isadmin'] !== 'true') { log('guide_denied'); return send(response, 403, '仅 fnOS 管理员可打开。'); }
   if (request.url.split('?')[0] === `${gatewayDshPrefix}/__fnos/connection-policy`) return connectionPolicyResponse(request, response);
   if (request.method === 'GET' && request.url.split('?')[0] === `${gatewayManagePrefix}/preflight`) return recoveryChecksResponse(response);
+  // setup 模式（2026-11-10）：目录没配 / 配了但授权不过 → 核心从未 spawn。
+  // guide 侧必须在 proxyGuideDsh 之前拦，否则会去连一个不存在的 core，
+  // 用户看到的是「DSH 暂不可用」而不是配置页。
+  //
+  // 桌面图标进来时 url 带 /app/<app>/dsh 前缀，所以先剥前缀再比对页面路径；
+  // 否则 '/' 永远匹配不上，整个分支形同虚设。
+  //
+  // ⚠ guide 侧**不能**用 cookieSession：桌面图标走 fnOS 的 guide socket，
+  // 请求没有本应用的 HTTPS cookie ⇒ cookieSession 恒为 null ⇒ 一律 401
+  // 「请从 fnOS 桌面图标打开」。实测 2026-11-15：主实例全新装后（尚无
+  // install-options.json ⇒ setup 态），桌面图标只显示「DSH 正在等待数据目录配置」。
+  // guide 侧改用 guideCsrf：按 x-trim-userid 签发用户绑定的 CSRF 会话，
+  // 与 managementAction(..., guide=true) 的校验口径一致（见下）。
+  if (currentState().mode === 'setup') {
+    const setupPath = request.url.split('?')[0];
+    const relPath = setupPath.startsWith(gatewayDshPrefix) ? (setupPath.slice(gatewayDshPrefix.length) || '/') : setupPath;
+    const isSetupPage = request.method === 'GET'
+      && ['/', '/index.html', '/__fnos/', '/__fnos/index.html', '/__fnos', gatewayAppPrefix, `${gatewayAppPrefix}/`, gatewayManagePrefix, `${gatewayManagePrefix}/`].includes(relPath);
+    if (isSetupPage) {
+      const csrf = randomBytes(32).toString('base64url');
+      const guideSession = { csrf, user: String(request.headers['x-trim-userid'] || ''), expires: Date.now() + GUIDE_TTL_MS, mobileShell: true };
+      guideCsrf.set(csrf, guideSession); schedulePersist();
+      return setupResponse(request, response, guideSession, true);
+    }
+    // ⚠ manage/state 必须放行：setup 页用它轮询「配置是否已生效」。
+    // 它在下面才被路由到（1469 行），若这里一并 503 掉，页面永远等不到
+    // mode 变化，配置保存成功后也不会自动刷新。
+    if (request.method !== 'POST'
+      && !relPath.startsWith('/__fnos/logs')
+      && !relPath.startsWith('/__fnos/preflight')
+      && setupPath !== `${gatewayManagePrefix}/state`) {
+      return send(response, 503, 'DSH 正在等待数据目录配置');
+    }
+  }
   if (request.url.startsWith(`${gatewayDshPrefix}/`)) return proxyGuideDsh(request, response).catch(() => {
     if (!response.destroyed && !response.writableEnded) send(response, 503, 'DSH 核心鉴权尚未就绪，请稍后刷新');
   });
@@ -1462,7 +1575,7 @@ function handleGuide(request, response) {
   // 面板会静默消失且没有任何报错。这里同时也把"强制刷新"确认框一并收进来，
   // 它们原本就都挂在 </iframe> 之后。
 
-const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-live="polite"><div class="bs-card"><div class="bs-spin" aria-hidden="true"></div><h2 id="bs-title">正在准备</h2><p id="bs-text">正在获取应用状态…</p><p id="bs-hint" class="bs-hint">维护耗时受数据量和磁盘速度影响，暂无法准确预计完成时间。DSH 服务可能暂时不可用；完成后会自动尝试恢复，请等待，无需重复操作。</p></div></section><section id="console-panel" hidden aria-label="页面控制台"><div id="console-head"><span>控制台</span><label class="cbx" title="只显示未识别的错误"><input type="checkbox" id="console-only-unknown">仅未知</label><button type="button" id="console-snapshot">记录卡顿现场</button><button type="button" id="console-copy">复制</button><button type="button" id="console-clear">清空</button><button type="button" id="console-close">关闭</button><span class="count" id="console-count">0</span></div><div id="console-toast" role="status" aria-live="polite" hidden></div><textarea id="console-snapshot-text" aria-label="独立连接诊断，可长按复制" style="min-height:120px;width:100%;box-sizing:border-box" hidden readonly></textarea><div id="console-log" role="log" aria-live="polite"><div id="console-empty">暂未捕获到日志。页面加载时与 iframe 内的错误会自动出现在这里。</div></div></section><dialog id="refresh-confirm" class="refresh-confirm" aria-labelledby="refresh-title"><h2 id="refresh-title">强制刷新 DSH？</h2><p>将重新加载 DSH 页面。当前未保存的输入可能丢失；DSH 核心不会重启。</p><form method="dialog"><button id="refresh-cancel" value="cancel">取消</button><button id="refresh-accept" class="confirm" value="refresh">强制刷新</button></form></dialog>`;
+const consolePanelHtml = `<section id="console-panel" class="recovery-console" hidden aria-label="页面控制台"><div id="console-head"><span>控制台</span><label class="cbx" title="只显示未识别的错误"><input type="checkbox" id="console-only-unknown">仅未知</label><button type="button" id="console-snapshot">记录卡顿现场</button><button type="button" id="console-copy">复制</button><button type="button" id="console-clear">清空</button><button type="button" id="console-close">关闭</button><span class="count" id="console-count">0</span></div><div id="console-toast" role="status" aria-live="polite" hidden></div><textarea id="console-snapshot-text" aria-label="独立连接诊断，可长按复制" style="min-height:120px;width:100%;box-sizing:border-box" hidden readonly></textarea><div id="console-log" role="log" aria-live="polite"><div id="console-empty">暂未捕获到日志。页面加载时与 iframe 内的错误会自动出现在这里。</div></div></section><dialog id="refresh-confirm" class="refresh-confirm" aria-labelledby="refresh-title"><h2 id="refresh-title">强制刷新 DSH？</h2><p>将重新加载 DSH 页面。当前未保存的输入可能丢失；DSH 核心不会重启。</p><form method="dialog"><button id="refresh-cancel" value="cancel">取消</button><button id="refresh-accept" class="confirm" value="refresh">强制刷新</button></form></dialog>`;
 
   // 手机版控制台悬浮窗（0.3.62）。
   // 起因：fnOS 手机版没有开发者工具，页面出错时用户完全无从取证（我们只能靠猜）。
@@ -1818,59 +1931,8 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     frame.addEventListener('load', () => { attachedOnce = false; try { attach(); } catch { /* 忽略 */ } });
     attach();
     render('info', ['控制台已就绪。']);
-    // 维护态提示（0.3.62，用户反馈）：gateway 模式原先没有任何状态显示 ——
-    // 核心重启/维护期间用户只看到 iframe 白屏或报错，不知道程序在做什么。
-    // 这里轮询 /__fnos/state（网关侧接口，不经过 core，核心停了也能答），
-    // 非 ready 时盖一层说明「正在做什么 + 已用时 + 预计」，就绪自动撤除。
-    (() => {
-      const overlay = document.getElementById('boot-status');
-      const title = document.getElementById('bs-title');
-      const text = document.getElementById('bs-text');
-      if (!overlay) return;
-      let shown = false, startedAt = null;
-      const apply = (info) => {
-        if (!info || typeof info.mode !== 'string') return;
-        const op = info.operation && typeof info.operation === 'object' ? info.operation : null;
-        if (info.mode === 'ready' || info.mode === 'rollback') {
-          if (shown) { overlay.hidden = true; shown = false; }
-          return;
-        }
-        const label = { starting: '正在启动核心', maintenance: '自动维护模式，请等待', safe: '安全模式' }[info.mode] || info.mode;
-        title.textContent = label;
-        overlay.classList.toggle('safe', info.mode === 'safe');
-        let dismiss = overlay.querySelector('.bs-dismiss');
-        if (info.mode === 'safe' && !dismiss) {
-          dismiss = document.createElement('button');
-          dismiss.type = 'button';
-          dismiss.className = 'bs-dismiss';
-          dismiss.textContent = '仍要进入控制台（隐藏此提示）';
-          dismiss.onclick = () => { overlay.hidden = true; shown = false; };
-          overlay.querySelector('.bs-card').appendChild(dismiss);
-        } else if (info.mode !== 'safe' && dismiss) {
-          dismiss.remove();
-        }
-        let line = op && op.text ? op.text : (info.error ? String(info.error) : '正在准备服务…');
-        if (info.mode !== 'maintenance' && op && op.etaSeconds) line += '（预计约 ' + op.etaSeconds + ' 秒）';
-        const opStart = op && op.startedAt ? Date.parse(op.startedAt) : NaN;
-        if (Number.isFinite(opStart)) line += ' · 已用 ' + Math.max(0, Math.round((Date.now() - opStart) / 1000)) + ' 秒';
-        else if (startedAt) line += ' · 本页已等待 ' + Math.max(0, Math.round((Date.now() - startedAt) / 1000)) + ' 秒';
-        text.textContent = line;
-        if (!shown) { overlay.hidden = false; shown = true; }
-      };
-      const tick = async () => {
-        try {
-          const statePath = location.pathname.startsWith('/app/dsh-fnos') ? '${gatewayManagePrefix}/state' : '/__fnos/state';
-          const r = await fetch(statePath + '?t=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' });
-          if (!r.ok && r.status !== 503) { startedAt = startedAt || Date.now(); return; }
-          const info = await r.json().catch(() => null);
-          if (info && info.mode && info.mode !== 'ready') startedAt = startedAt || Date.now();
-          if (info && info.mode === 'ready') startedAt = null;
-          apply(info);
-        } catch { startedAt = startedAt || Date.now(); }
-      };
-      tick();
-      setInterval(tick, 3000);
-    })();
+    // Status is a normal-flow notice. Polling never blocks navigation.
+    ${recoveryStatus.script({ statePath: gatewayManagePrefix + '/state', instanceKey: gatewayMode ? gatewayManagePrefix : 'direct', poll: true })}
     // 导航「更多」下拉（0.3.62）：开合、点外关闭、选中后收起；
     // 「诊断」= 记录 frame report（#diagnose 既有绑定）+ 跳转日志页。
     const navMore = document.getElementById('nav-more');
@@ -1917,7 +1979,7 @@ const consolePanelHtml = `<section id="boot-status" hidden role="status" aria-li
     if (diagBtn) diagBtn.addEventListener('click', () => { try { frame.contentWindow.location.href = '/app/dsh-fnos/diagnostics'; } catch {} });
   })();
   </script>`;
-  let body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-visual,viewport-fit=cover"><title>DeepSeek Harness</title><style id="shell-boot-banner">header:has(nav[aria-label="应用导航"]){display:none!important}</style><style>*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;flex-direction:column;background:var(--dsh-shell-bg,#fff);color:var(--dsh-shell-text,#0f1115);font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif}header{min-height:48px;padding:6px 12px;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(15,17,21,.08);background:var(--dsh-shell-bg,#fff)}strong{white-space:nowrap;font-weight:700;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;max-width:38vw}nav{margin-left:auto;display:flex;gap:2px;align-items:center;min-width:0;flex:1 1 auto;justify-content:flex-end;position:relative}
+  let body = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-visual,viewport-fit=cover"><title>${appName}</title><style id="shell-boot-banner">header:has(nav[aria-label="应用导航"]){display:none!important}</style><style>*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{display:flex;flex-direction:column;background:var(--dsh-shell-bg,#fff);color:var(--dsh-shell-text,#0f1115);font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif}header{min-height:48px;padding:6px 12px;display:flex;align-items:center;gap:10px;border-bottom:1px solid rgba(15,17,21,.08);background:var(--dsh-shell-bg,#fff)}strong{white-space:nowrap;font-weight:700;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;max-width:38vw}nav{margin-left:auto;display:flex;gap:2px;align-items:center;min-width:0;flex:1 1 auto;justify-content:flex-end;position:relative}
 nav .nav-scroller{display:flex;gap:2px;align-items:center;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;scroll-behavior:smooth}
 nav .nav-scroller.can-scroll.scroll-start{mask-image:linear-gradient(to right,transparent 0,#000 16px,#000 100%);-webkit-mask-image:linear-gradient(to right,transparent 0,#000 16px,#000 100%)}
 nav .nav-scroller.can-scroll.scroll-end{mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 16px),transparent 100%);-webkit-mask-image:linear-gradient(to right,#000 0,#000 calc(100% - 16px),transparent 100%)}
@@ -1930,14 +1992,16 @@ nav .nav-arrow.visible{display:inline-flex}
 @media(max-width:360px){header strong{display:none}nav a,nav .nav-more>button{padding:6px 8px;font-size:12.5px}}
 nav .nav-arrow:hover{background:rgba(15,17,21,.06);color:#0f1115}
 nav .nav-arrow[data-dir="prev"]{margin-right:-2px}
-nav .nav-arrow[data-dir="next"]{margin-left:-2px}nav a,nav .nav-more>button{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px 11px;font-size:13.5px;line-height:1;border:0;border-radius:999px;color:#61666b;background:transparent;text-decoration:none;white-space:nowrap;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation;flex:0 0 auto}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible{background:rgba(15,17,21,.06);color:#0f1115}nav a[aria-current='page']{background:rgba(15,17,21,.06);color:#0f1115;font-weight:600}nav .nav-more{position:relative;display:inline-flex}#nav-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:60;display:flex;flex-direction:column;gap:2px;min-width:180px;padding:6px;border:.5px solid rgba(15,17,21,.16);border-radius:14px;background:#fff;box-shadow:0 10px 34px rgba(15,17,21,.14)}#nav-menu button{display:flex;align-items:center;gap:8px;width:100%;min-height:36px;padding:7px 10px;border:0;border-radius:9px;background:transparent;color:#0f1115;font:inherit;text-align:left;cursor:pointer}#nav-menu button:hover{background:#f7f8fa}@media(prefers-color-scheme:dark){body{--dsh-shell-bg:#151517;--dsh-shell-text:#f9fafb}header{border-bottom-color:rgba(255,255,255,.09)}nav a,nav .nav-more>button{color:#cfd3d6}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible,nav a[aria-current='page']{background:rgba(255,255,255,.08);color:#f9fafb}#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}#nav-menu button:hover{background:#2c2c2e}iframe{background:#151517}}[hidden]{display:none!important}iframe{flex:1;width:100%;min-height:0;border:0;background:#fff}.connection-state{flex:1;display:grid;align-content:center;justify-items:center;padding:24px;text-align:center;background:#f9fafb;color:#0f1115}.connection-state h1{font-size:20px;margin:0 0 12px}.connection-state p{max-width:420px;line-height:1.6;margin:0 0 12px}.connection-state a,.connection-state button{margin:5px;padding:9px 14px;color:#fff;background:#4176e6;border:0;border-radius:8px;text-decoration:none;font:inherit}</style></head><body><header><strong>DeepSeek Harness</strong><nav aria-label="应用导航"><button type="button" id="console-open" aria-haspopup="dialog" aria-expanded="false">调试信息</button><a id="dsh-nav"  href="${contentBase}/" target="dsh-frame">刷新 DSH</a><a id="settings-nav"  class="settings" href="${gatewayMode ? gatewayManagePrefix : `${appOrigin}/__fnos`}/" target="dsh-frame">控制台</a></nav></header>${connectionState}<iframe name="dsh-frame" title="DeepSeek Harness 内容" ${frameAttributes} allow="clipboard-read; clipboard-write"></iframe>${consoleScript}</body></html>`;
+nav .nav-arrow[data-dir="next"]{margin-left:-2px}nav a,nav .nav-more>button{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px 11px;font-size:13.5px;line-height:1;border:0;border-radius:999px;color:#61666b;background:transparent;text-decoration:none;white-space:nowrap;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation;flex:0 0 auto}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible{background:rgba(15,17,21,.06);color:#0f1115}nav a[aria-current='page']{background:rgba(15,17,21,.06);color:#0f1115;font-weight:600}nav .nav-more{position:relative;display:inline-flex}#nav-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:60;display:flex;flex-direction:column;gap:2px;min-width:180px;padding:6px;border:.5px solid rgba(15,17,21,.16);border-radius:14px;background:#fff;box-shadow:0 10px 34px rgba(15,17,21,.14)}#nav-menu button{display:flex;align-items:center;gap:8px;width:100%;min-height:36px;padding:7px 10px;border:0;border-radius:9px;background:transparent;color:#0f1115;font:inherit;text-align:left;cursor:pointer}#nav-menu button:hover{background:#f7f8fa}@media(prefers-color-scheme:dark){body{--dsh-shell-bg:#151517;--dsh-shell-text:#f9fafb}header{border-bottom-color:rgba(255,255,255,.09)}nav a,nav .nav-more>button{color:#cfd3d6}nav a:hover,nav .nav-more>button:hover,nav a:focus-visible,nav .nav-more>button:focus-visible,nav a[aria-current='page']{background:rgba(255,255,255,.08);color:#f9fafb}#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}#nav-menu button:hover{background:#2c2c2e}iframe{background:#151517}}[hidden]{display:none!important}iframe{flex:1;width:100%;min-height:0;border:0;background:#fff}.connection-state{flex:1;display:grid;align-content:center;justify-items:center;padding:24px;text-align:center;background:#f9fafb;color:#0f1115}.connection-state h1{font-size:20px;margin:0 0 12px}.connection-state p{max-width:420px;line-height:1.6;margin:0 0 12px}.connection-state a,.connection-state button{margin:5px;padding:9px 14px;color:#fff;background:#4176e6;border:0;border-radius:8px;text-decoration:none;font:inherit}</style></head><body><header><strong>${appName}</strong><nav aria-label="应用导航"><button type="button" id="console-open" aria-haspopup="dialog" aria-expanded="false">调试信息</button><a id="dsh-nav"  href="${contentBase}/" target="dsh-frame">刷新 DSH</a><a id="settings-nav"  class="settings" href="${gatewayMode ? gatewayManagePrefix : `${appOrigin}/__fnos`}/" target="dsh-frame">控制台</a></nav></header>${connectionState}<iframe name="dsh-frame" title="${appName} 内容" ${frameAttributes} allow="clipboard-read; clipboard-write"></iframe>${consoleScript}</body></html>`;
   body = body.replace('>刷新 DSH</a>', '>强制刷新 DSH</a>')
     .replace('</head>', '<style>dialog.refresh-confirm{max-width:min(92vw,420px);padding:24px;border:.5px solid rgba(15,17,21,.16);border-radius:20px;background:#fff;color:#0f1115;box-shadow:0 18px 50px rgba(15,17,21,.22)}dialog.refresh-confirm::backdrop{background:rgba(15,17,21,.4)}dialog.refresh-confirm h2{margin:0 0 10px;font-size:20px}dialog.refresh-confirm p{line-height:1.6}dialog.refresh-confirm form{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}dialog.refresh-confirm button{padding:9px 16px;border:1px solid rgba(15,17,21,.16);border-radius:10px;background:#fff;color:#0f1115;font:inherit;cursor:pointer}dialog.refresh-confirm button.confirm{background:#4176e6;border-color:#4176e6;color:#fff}</style></head>')
-    .replace('</head>', '<style>#console-panel{position:fixed;left:0;right:0;bottom:0;max-height:60vh;display:flex;flex-direction:column;background:#0b1220f7;color:#e4e7ec;border-top:1px solid #344054;z-index:60}#console-panel[hidden]{display:none}#boot-status{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#101828f2;color:#e4e7ec;z-index:90;padding:24px}#boot-status.safe{align-items:flex-start;padding-top:9vh}#boot-status.safe .bs-card{background:#101828;border:1px solid #344054;border-radius:14px;padding:18px 22px;max-width:420px}#boot-status .bs-dismiss{margin-top:14px;padding:8px 14px;border:1px solid #475467;border-radius:8px;background:transparent;color:#e4e7ec;font:inherit;font-size:13px;cursor:pointer}#boot-status .bs-dismiss:hover{background:#344054}#boot-status[hidden]{display:none}#boot-status .bs-card{max-width:340px;text-align:center}#boot-status h2{font-size:17px;margin:14px 0 8px}#boot-status p{margin:0;font-size:13px;line-height:1.6;color:#98a2b3}#boot-status .bs-hint{margin-top:12px;font-size:12px;color:#667085}#boot-status .bs-spin{width:30px;height:30px;margin:0 auto;border:3px solid #344054;border-top-color:#4ebdff;border-radius:50%;animation:bs-spin .9s linear infinite}@keyframes bs-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){#boot-status .bs-spin{animation:none}}#console-log .row.known{opacity:.55}#console-log .row .tag{display:inline-block;margin-left:6px;padding:1px 6px;border:1px solid #475467;border-radius:5px;font-size:11px;color:#98a2b3;white-space:nowrap}#console-head .cbx{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#98a2b3;cursor:pointer;user-select:none}#console-head .cbx input{accent-color:#4ebdff;margin:0}#console-toast{position:absolute;left:12px;right:12px;bottom:12px;padding:10px 12px;background:#1d2939;border:1px solid #475467;border-radius:10px;box-shadow:0 12px 30px #000a;font-size:12px;line-height:1.6;color:#e4e7ec;z-index:5}#console-toast[hidden]{display:none}#console-toast strong{color:#4ebdff}#console-panel{position:relative}#console-log .row.hint{color:#98a2b3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px dashed #344054;padding-top:6px;margin-top:6px}#console-log .row.hint button{padding:2px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}header{position:relative}.nav-more{position:relative;display:flex}#nav-more{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px clamp(7px,1.6vw,13px);border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation}#nav-more:hover,#nav-more:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-more:hover,#nav-more:focus-visible{background:rgba(255,255,255,.08)}}#nav-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:180px;background:var(--dsh-shell-menu,#fff);border:.5px solid rgba(15,17,21,.16);border-radius:14px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 34px rgba(15,17,21,.14);z-index:70}@media(prefers-color-scheme:dark){#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}}#nav-menu[hidden]{display:none}#nav-menu a,#nav-menu button{display:block;width:100%;text-align:left;min-height:38px;padding:9px 12px;border:0;border-radius:9px;background:transparent;color:var(--dsh-shell-text,#0f1115);font:inherit;font-size:14px;text-decoration:none;white-space:nowrap;cursor:pointer}#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(255,255,255,.08)}}#console-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #344054;font-weight:600}#console-head .count{margin-left:auto;font-weight:400;color:#98a2b3;font-size:12px}#console-head button{padding:5px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}#console-head button:hover{background:#344054}#console-log{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:8px 12px 16px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}#console-log .row{padding:4px 0;border-bottom:1px solid #1d2939}#console-log .row.error{color:#fda29b}#console-log .row.warn{color:#fec84b}#console-log .row.info{color:#84caff}#console-log .row.log{color:#d0d5dd}#console-log .t{color:#667085;margin-right:6px}#console-empty{color:#667085;padding:12px 0}</style></head>')
+    .replace('</head>', '<style>#console-panel{position:fixed;left:0;right:0;bottom:0;max-height:60vh;display:flex;flex-direction:column;background:#0b1220f7;color:#e4e7ec;border-top:1px solid #344054;z-index:60}#console-panel[hidden]{display:none}#dsh-loading-bar{position:fixed;top:0;left:0;right:0;z-index:85;padding:8px 14px;background:#1d2939;color:#e4e7ec;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-align:center;border-bottom:1px solid #475467;box-shadow:0 2px 12px #0006}#dsh-loading-bar[hidden]{display:none}#dsh-loading-bar::before{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:linear-gradient(90deg,transparent,#4ebdff,transparent);background-size:40% 100%;background-repeat:no-repeat;animation:bar-slide 1.1s ease-in-out infinite}@keyframes bar-slide{0%{background-position:-40% 0}100%{background-position:140% 0}}@media(prefers-reduced-motion:reduce){#dsh-loading-bar::before{animation:none;background:#4ebdff;opacity:.6}}#boot-status .bs-bar{position:relative;height:4px;margin:16px auto 0;max-width:240px;border-radius:2px;background:#1d2939;overflow:hidden}#boot-status .bs-bar::after{content:"";position:absolute;top:0;bottom:0;width:40%;border-radius:2px;background:linear-gradient(90deg,transparent,#4ebdff,transparent);animation:bs-bar 1.1s ease-in-out infinite}@keyframes bs-bar{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}@media(prefers-reduced-motion:reduce){#boot-status .bs-spin{animation:none}#boot-status .bs-bar::after{animation:none;width:100%;background:#4ebdff;opacity:.65}}#console-log .row.known{opacity:.55}#console-log .row .tag{display:inline-block;margin-left:6px;padding:1px 6px;border:1px solid #475467;border-radius:5px;font-size:11px;color:#98a2b3;white-space:nowrap}#console-head .cbx{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#98a2b3;cursor:pointer;user-select:none}#console-head .cbx input{accent-color:#4ebdff;margin:0}#console-toast{position:absolute;left:12px;right:12px;bottom:12px;padding:10px 12px;background:#1d2939;border:1px solid #475467;border-radius:10px;box-shadow:0 12px 30px #000a;font-size:12px;line-height:1.6;color:#e4e7ec;z-index:5}#console-toast[hidden]{display:none}#console-toast strong{color:#4ebdff}#console-panel{position:relative}#console-log .row.hint{color:#98a2b3;display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px dashed #344054;padding-top:6px;margin-top:6px}#console-log .row.hint button{padding:2px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}header{position:relative}.nav-more{position:relative;display:flex}#nav-more{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px clamp(7px,1.6vw,13px);border:0;border-radius:999px;background:transparent;color:inherit;font:inherit;font-weight:500;cursor:pointer;transition:background .15s,color .15s;touch-action:manipulation}#nav-more:hover,#nav-more:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-more:hover,#nav-more:focus-visible{background:rgba(255,255,255,.08)}}#nav-menu{position:absolute;top:calc(100% + 6px);right:0;min-width:180px;background:var(--dsh-shell-menu,#fff);border:.5px solid rgba(15,17,21,.16);border-radius:14px;padding:6px;display:flex;flex-direction:column;gap:2px;box-shadow:0 10px 34px rgba(15,17,21,.14);z-index:70}@media(prefers-color-scheme:dark){#nav-menu{background:#232324;border-color:rgba(255,255,255,.14)}}#nav-menu[hidden]{display:none}#nav-menu a,#nav-menu button{display:block;width:100%;text-align:left;min-height:38px;padding:9px 12px;border:0;border-radius:9px;background:transparent;color:var(--dsh-shell-text,#0f1115);font:inherit;font-size:14px;text-decoration:none;white-space:nowrap;cursor:pointer}#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(15,17,21,.06)}@media(prefers-color-scheme:dark){#nav-menu a:hover,#nav-menu button:hover,#nav-menu a:focus-visible,#nav-menu button:focus-visible{background:rgba(255,255,255,.08)}}#console-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #344054;font-weight:600}#console-head .count{margin-left:auto;font-weight:400;color:#98a2b3;font-size:12px}#console-head button{padding:5px 10px;border:1px solid #475467;border-radius:6px;background:transparent;color:#e4e7ec;font:inherit;cursor:pointer}#console-head button:hover{background:#344054}#console-log{flex:1;overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:8px 12px 16px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word}#console-log .row{padding:4px 0;border-bottom:1px solid #1d2939}#console-log .row.error{color:#fda29b}#console-log .row.warn{color:#fec84b}#console-log .row.info{color:#84caff}#console-log .row.log{color:#d0d5dd}#console-log .t{color:#667085;margin-right:6px}#console-empty{color:#667085;padding:12px 0}</style></head>')
       // ⚠ 面板**必须**注入在 consoleScript 之前（0.3.62 修复）。
       // 脚本第一件事就是 getElementById('console-panel'/'console-log')，
       // 拿不到就 `if (!panel || ...) return` 静默退出 —— 表现为「按钮点了没反应」。
       // 早先注入到 </body> 前（页面末尾），脚本先执行时面板还不存在，正是此故。
+      .replace('</head>', '<style>' + recoveryStatus.styles + '</style></head>')
+      .replace('<iframe ', recoveryStatus.render(currentState(), { settingsUrl: gatewayMode ? gatewayManagePrefix + '/' : appOrigin + '/__fnos/', target: 'dsh-frame' }) + '<iframe ')
       .replace('allow="clipboard-read; clipboard-write"></iframe>', 'allow="clipboard-read; clipboard-write"></iframe>' + consolePanelHtml);
   const clientScript = `<script nonce="${scriptNonce}">
   const button = document.getElementById('diagnose');
@@ -1981,7 +2045,8 @@ nav .nav-arrow[data-dir="next"]{margin-left:-2px}nav a,nav .nav-more>button{disp
     setView('dsh');
   }
   dshNav.addEventListener('click', (event) => {
-    if (activeView !== 'dsh') { setView('dsh'); return; }
+    // 「返回 DSH」同样走 iframe 导航，给同一份加载反馈；强制刷新走确认弹窗。
+    if (activeView !== 'dsh') { setView('dsh'); showConsoleLoading('正在加载 DSH'); return; }
     event.preventDefault();
     if (typeof refreshConfirm.showModal === 'function') refreshConfirm.showModal();
     else if (window.confirm('强制刷新 DSH？未保存的输入可能丢失。')) hardRefreshDsh();
@@ -1991,31 +2056,32 @@ nav .nav-arrow[data-dir="next"]{margin-left:-2px}nav a,nav .nav-more>button{disp
 
 
   document.getElementById('refresh-accept').addEventListener('click', hardRefreshDsh);
-  // 控制台冷启动体验（0.3.98 反馈）：管理页服务端毫秒级返回，但 iframe 内 DSH 主页面
-  // 在核心冷启动/预热期间是白屏。点击「控制台」时先探测一次 state，非 ready 就把
-  // 既有 boot-status 遮罩显示出来——它本身每 3 秒轮询，ready 后自动撤除，无需额外状态机。
-  settingsNav.addEventListener('click', () => {
-    setView('settings');
-    const overlay = document.getElementById('boot-status');
-    if (!overlay || !overlay.hidden) return;
-    const statePath = location.pathname.startsWith('/app/dsh-fnos') ? '${gatewayManagePrefix}/state' : '/__fnos/state';
-    fetch(statePath + '?t=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' })
-      .then(r => r.ok || r.status === 503 ? r.json() : null)
-      .then(info => {
-        if (!info || info.mode === 'ready' || !overlay.hidden) return;
-        overlay.hidden = false;
-        const title = document.getElementById('bs-title'), text = document.getElementById('bs-text');
-        if (title) title.textContent = { starting: '正在启动核心', maintenance: '自动维护模式，请等待', safe: '安全模式' }[info.mode] || info.mode;
-        if (text) text.textContent = info.error ? String(info.error) : '正在准备服务…';
-      })
-      .catch(() => {});
-  });
+  // The loading notice never escalates into an overlay, including after a timeout.
+  let consoleOverlayToken=0, activeLoading=null;
+  function showConsoleLoading(label) {
+    if(activeLoading)activeLoading.dispose(true);
+    const token=++consoleOverlayToken,started=Date.now(),frame=document.querySelector('iframe[name="dsh-frame"]');
+    let bar=document.getElementById('dsh-loading-bar');
+    if(!bar&&frame){bar=document.createElement('div');bar.id='dsh-loading-bar';bar.setAttribute('role','status');frame.parentNode.insertBefore(bar,frame);}
+    let timer=null,deadline=null,disposed=false;
+    const dispose=(hide)=>{if(disposed)return;disposed=true;clearInterval(timer);clearTimeout(deadline);frame?.removeEventListener('load',done);if(activeLoading?.token===token){activeLoading=null;if(hide&&bar)bar.hidden=true;}};
+    const done=()=>dispose(true);
+    const tick=()=>{if(bar)bar.textContent=(label||'正在加载页面')+' · 已用 '+Math.max(0,Math.round((Date.now()-started)/1000))+' 秒；日志与诊断仍可使用。';};
+    activeLoading={token,dispose};if(bar){bar.hidden=false;bar.setAttribute('role','status');bar.removeAttribute('tabindex');bar.onclick=null;bar.onkeydown=null;}tick();timer=setInterval(tick,1000);
+    frame?.addEventListener('load',done);
+    deadline=setTimeout(()=>{dispose(false);if(bar){bar.textContent='页面加载较慢；可继续使用导航、日志和独立 AI 诊断。点击此提示可收起。';bar.setAttribute('role','button');bar.tabIndex=0;bar.onclick=()=>{bar.hidden=true;};bar.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();bar.hidden=true;}};}},25000);
+    return token;
+  }
+  settingsNav.addEventListener('click',()=>{setView('settings');window.__fnosRecovery?.enterConsole();showConsoleLoading('正在打开控制台');});
+  window.addEventListener('fnos:recovery-navigate',()=>{setView('settings');showConsoleLoading('正在打开诊断页面');});
+  window.addEventListener('pagehide',()=>{if(activeLoading)activeLoading.dispose(true);});
   if (logsNav) logsNav.addEventListener('click', () => setView('settings'));   // 元素已并入「更多」菜单（0.3.62）
   window.addEventListener('message', (event) => {
     if (event.source !== document.querySelector('iframe[name="dsh-frame"]').contentWindow || event.origin !== ${gatewayMode ? 'location.origin' : `'${appOrigin}'`}) return;
     if (event.data?.type === 'dsh-fnos-view' && ['dsh', 'settings'].includes(event.data.view)) setView(event.data.view);
   });
   </script>`;
+  body = body.replace('</body>', '<script nonce="' + scriptNonce + '">' + shellRecovery.script({settingsUrl:gatewayMode ? gatewayManagePrefix + '/?view=runtime' : appOrigin + '/__fnos/?view=runtime',frameOrigin:gatewayMode ? null : appOrigin,dshUrl:contentBase + '/'}) + '</script></body>');
   const connectionScript = !gatewayMode ? `<script nonce="${scriptNonce}">
   const connectionState = document.getElementById('connection-state');
   const frame = document.querySelector('iframe[name="dsh-frame"]');

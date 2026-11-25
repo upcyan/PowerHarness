@@ -29,6 +29,25 @@ else
     false
   fi
 fi
+# Only probe; never take ownership of user-selected data or historical backups.
+STAGE="检查应用账号能否读取缓存和回收站；失败时仅修报错条目，不要递归 chown"
+(
+  set -eu
+  probe=(find -P)
+  if [[ $EUID == 0 ]]; then
+    account="${TRIM_USERNAME:-dsh_fnos}"; group="${TRIM_GROUPNAME:-$account}"
+    [[ $account =~ ^[a-z_][a-z0-9_-]*$ && $group =~ ^[a-z_][a-z0-9_-]*$ ]]
+    [[ $(id -u "$account") != 0 ]]
+    probe=(runuser -u "$account" -g "$group" -- find -P)
+  fi
+  for rel in pnpm-store/v10/tmp dsh-home/.local/share/Trash/files; do
+    scope="$DATA_DIR/$rel"
+    [[ -d $scope ]] || continue
+    [[ $(realpath -e -- "$scope") == "$scope" ]] || exit 1
+    bad="$("${probe[@]}" "$scope" -xdev \( -type d ! -executable -o ! -type l ! -readable \) -print -quit)"
+    if [[ -n $bad ]]; then printf '应用账号不能访问：%q\n' "$bad" >&2; exit 1; fi
+  done
+)
 STAGE="检测 agent 对话进行中"
 # 对话/任务进行中（.writing/.lock 最近 120 秒内有写入）则明示等待，不笼统报失败。
 # busy 检测已从门禁降级为日志（0.3.101）：钩子在平台停用应用之后运行，此刻中止

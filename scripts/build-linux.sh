@@ -89,6 +89,21 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 cp -a "$root/fnos/." "$stage/"
+
+# ---- install_callback ERR-trap gate -------------------------------------
+# fnOS treats a non-zero exit from install_callback as "install failed" and
+# shows the popup "无法安装". Two defects in that script made every install
+# fail regardless of the package:
+#   1) `trap migrate_error ERR` calls a handler that uses ${1}; under `set -u`
+#      the trap itself explodes with "unbound variable" and swallows the real
+#      error (real-machine proof: /var/log/apps/dsh-fnos.log, last line).
+#   2) `set +e` does NOT disarm an ERR trap (measured: the trap still fires on
+#      a failing command), so the `rc == 2` branch ("directory not authorised
+#      yet" — a normal path) was never reached and the script exited 1.
+# The gate runs after the wizard generator has rewritten install_callback, so it
+# validates the file that actually ships. It lives in its own script so it can
+# also be run against any candidate package on its own.
+
 # Local source backups must never ship: they carry stale copies of app code
 # (including pre-fix versions of supervisor.js/gateway.js) in the installed
 # tree, where they are dead weight at best and a supply of outdated copies at
@@ -162,6 +177,11 @@ fi
 
 python3 "$root/scripts/generate-install-wizard.py" "$stage"
 
+# Re-check install_callback AFTER the wizard generator rewrote it: the gate must
+# validate the file that actually ships, not the pre-generation source.
+python3 "$root/scripts/check-install-callback-trap.py" "$stage/cmd/install_callback" \
+  || { echo "install_callback failed the ERR-trap gate after wizard generation; refusing to pack" >&2; exit 1; }
+
 npm ci --omit=dev --prefix "$stage/app/runtime" --cache "${DSH_NPM_CACHE:-$stage/.npm-cache}"
 # npm ci only warns about advisories: it is NOT a release security gate.
 # Network errors, vulnerabilities or SDK contract failures abort before fnpack,
@@ -188,6 +208,19 @@ cd "$root/dist"
 mv -f -- dsh-fnos.fpk "dsh-fnos-${target_version}.fpk"
 sha256sum "dsh-fnos-${target_version}.fpk" > "dsh-fnos-${target_version}.fpk.sha256"
 echo "artifact: dsh-fnos-${target_version}.fpk"
+
+# ── 实例身份断言门（2026-11-20 双实例身份混装事故防线）────────────────
+# A 包必须纯 A 身份（无 /opt/dsh2、无 __Host-fnos_dsh2、无 /app/dsh-fnos2）。
+identity_gate="$root/../pwtest/fnos-agents/verify-instance-identity.cjs"
+[[ -s "$identity_gate" ]] || identity_gate="/vol1/1000/deepseek_harness/fnos/pwtest/fnos-agents/verify-instance-identity.cjs"
+if [[ -s "$identity_gate" ]]; then
+  if ! node "$identity_gate" "$root/dist/dsh-fnos-${target_version}.fpk" dsh-fnos; then
+    echo "IDENTITY GATE FAILED: A 包不纯——拒绝交付" >&2
+    exit 1
+  fi
+else
+  echo "WARNING: identity gate script missing: $identity_gate" >&2
+fi
 
 # Only advance the recorded version once the package exists, so an aborted
 # build leaves fnos/manifest untouched.

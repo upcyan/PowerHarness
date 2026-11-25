@@ -68,6 +68,9 @@ body{background:var(--mg-bg);color:var(--mg-text);font-family:var(--mg-font)}
 .settings-content .card.remediation h3{color:var(--mg-warn-title)}
 .settings-content .notice,.settings-content .startup-diagnosis{background:var(--mg-softer);color:var(--mg-text);border-color:var(--mg-border)}
 .settings-content .error{color:var(--mg-danger)}
+.settings-content .guide-text span{color:var(--mg-muted)}
+.settings-content details{background:var(--mg-softer);border-color:var(--mg-border-strong);color:var(--mg-text)}
+.settings-content details[open]>summary{border-bottom-color:var(--mg-border-strong)}
 a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--mg-accent);outline-offset:2px}
 @media(prefers-color-scheme:dark){:root{
 --mg-bg:#151517;--mg-panel:#232324;--mg-soft:#2c2c2e;--mg-softer:#202021;
@@ -76,7 +79,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 --mg-accent:#5686fe;--mg-accent-soft:rgba(86,134,254,.16);
 --mg-active:#353638;
 --mg-shadow:none;
---mg-warn-bg:#2b2416;--mg-warn-border:rgba(255,205,90,.28);--mg-warn-title:#ffd79a
+--mg-warn-bg:#2b2416;--mg-warn-border:rgba(255,205,90,.28);--mg-warn-title:#ffd79a;
 --mg-ok-bg:#12271b;--mg-ok-border:#1f5c3a;--mg-ok-text:#7fe0a8;
 --mg-err-bg:#2e1a18;--mg-err-border:#7a3b34;--mg-err-text:#ffb4a6;
 --mg-busy-bg:#2b2416;--mg-busy-border:#6c591e;--mg-busy-text:#ffd79a;
@@ -92,7 +95,8 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,te
 button.restart-icon{background:var(--mg-panel);border-color:var(--mg-border-strong)}
 button.restart-icon:hover,button.restart-icon:focus-visible{background:var(--mg-restart-hover,#e8f0ff);border-color:var(--mg-restart-border,#82a9ed)}
 button.restart-option:hover,button.restart-option:focus-visible{background:var(--mg-soft)}
-.guide .guide-row.tone-ok{background:var(--mg-guide-ok-bg,#f3faf5)}
+.guide .guide-row{background:var(--mg-softer)}
+.guide .guide-row.tone-safe,.guide .guide-row.tone-ok{background:var(--mg-guide-ok-bg,#f3faf5)}
 .guide .guide-row.tone-warn{background:var(--mg-guide-warn-bg,#fdf9ef)}
 .guide .guide-row.tone-danger{background:var(--mg-guide-danger-bg,#fdf4f2)}}
 @media(max-width:700px){.shell.settings-shell{padding:16px 14px 44px}.settings-layout{grid-template-columns:minmax(0,1fr);gap:18px}.settings-sidebar{position:static}.settings-sidebar .primary{display:flex;flex-wrap:nowrap;gap:2px;width:100%;--primary-fit:1;scrollbar-width:none}.settings-sidebar .primary a{flex:1 0 auto;min-width:0;justify-content:center;white-space:nowrap;gap:calc(7px * var(--primary-fit));min-height:44px;padding:8px calc(8px * var(--primary-fit));margin:0;font-size:calc(14px * var(--primary-fit))}.settings-sidebar .primary .nav-icon{width:calc(18px * var(--primary-fit));height:calc(18px * var(--primary-fit));flex-basis:calc(18px * var(--primary-fit))}.settings-nav-group{margin:0}.settings-nav-group h2{display:none}.settings-content .secondary{flex-wrap:nowrap}.settings-content .secondary a{flex:0 0 auto;min-width:0}.settings-content>.card{padding:18px;border-radius:16px}.settings-content .summary{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-shell>header{margin-bottom:14px}.settings-content .reliability-status dl{grid-template-columns:minmax(0,1fr)}.settings-content .reliability-status dd{margin-bottom:6px}}
@@ -174,3 +178,6 @@ function installNavigation() {
   };
 }
 module.exports={css,installNavigation};
+
+// Non-blocking fault status shares the settings content column.
+module.exports.css += ".settings-content .console-status-banner{margin:0 0 20px;padding:16px 18px;border-radius:12px;min-width:0;overflow-wrap:anywhere}.console-status-main{display:flex;align-items:center;justify-content:space-between;gap:16px}.console-status-main p{margin:4px 0 0;line-height:1.65}.console-status-main>a{flex:none;min-height:40px;display:inline-flex;align-items:center;justify-content:center;padding:8px 14px}.console-status-banner details{margin-top:10px}.console-status-banner summary{cursor:pointer;line-height:1.6;min-height:32px}.console-status-banner pre{max-height:180px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.7}.console-status-banner #console-state-refresh{font-size:13px}.console-status-banner #console-state-refresh button{margin-left:8px;min-height:40px;padding:7px 11px}.console-status-banner [hidden]{display:none!important}@media(max-width:600px){.settings-content .console-status-banner{padding:14px;margin-bottom:16px}.console-status-main{align-items:flex-start;gap:10px}.console-status-main>a{min-height:44px;padding:9px 12px}.console-status-banner #console-state-refresh button{margin:8px 0 0;display:block;min-height:44px}}";

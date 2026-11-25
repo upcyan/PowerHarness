@@ -5,6 +5,50 @@ const crypto = require('node:crypto');
 const ops = require('./ops.js');
 const store = require('./backup-store.js');
 
+/** 升级备份保留份数（2026-11-25）：此前无上限，实测累积 15 份 / 34GB。 */
+const UPGRADE_BACKUP_KEEP = 5;
+
+/**
+ * 回收过期的平台升级备份，只保留最近 keep 份。
+ *
+ * 只删「名字像 operation（UUID）且带 receipt.json」的目录 —— receipt 是本次
+ * 备份确实写完并通过指纹校验的证据。任何不符合的条目原样保留：宁可留一份
+ * 垃圾，也不删掉一次仍在进行或形态不明的备份。
+ * @param {string} parent - .platform-upgrade-backups 目录。
+ * @param {number} keep - 保留份数。
+ */
+function pruneUpgradeBackups(parent, keep) {
+  let entries;
+  try { entries = fs.readdirSync(parent, { withFileTypes: true }); } catch { return; }
+  const candidates = entries
+    .filter(e => e.isDirectory() && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(e.name))
+    .map(e => e.name)
+    .filter(name => fs.existsSync(path.join(parent, name, 'receipt.json')))
+    // 排序键必须取 receipt 里的快照 id（形如 2026-11-17T06-49-34-456Z-b85b51e8，
+    // 前缀是 ISO 时间戳）。目录名本身是随机 UUID，字典序与时间毫无关系 ——
+    // 2026-11-25 实测：按目录名排序会保留到 10 月的旧备份、删掉最新的，
+    // 方向完全相反。
+    // 读不出 id 的目录排最后（视为最旧），只在还不够 keep 时保留，
+    // 不会因信息缺失被误删成「最新」。
+    .map(name => {
+      let key = '';
+      try { key = String(JSON.parse(fs.readFileSync(path.join(parent, name, 'receipt.json'), 'utf8')).id || ''); }
+      catch { key = ''; }
+      return { name, key };
+    })
+    .sort((a, b) => (a.key === b.key ? a.name.localeCompare(b.name) : a.key.localeCompare(b.key)))
+    .reverse()
+    .map(entry => entry.name);
+  for (const name of candidates.slice(keep)) {
+    const target = path.join(parent, name);
+    // 再确认一次仍是普通目录且不是软链，避免删到被替换过的路径。
+    const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) continue;
+    fs.rmSync(target, { recursive: true, force: true });
+    console.log('Pruned expired upgrade backup: ' + name);
+  }
+}
+
 function ordinaryDirectory(directory) {
   const stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(directory) !== directory) throw new Error('Upgrade backup directory must be canonical and not linked');
@@ -72,6 +116,19 @@ function run(env = process.env) {
     const fd = fs.openSync(path.join(root, 'receipt.json'), 'wx', 0o600);
     try { fs.fchmodSync(fd, 0o600); fs.writeFileSync(fd, JSON.stringify(receipt)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     console.log('Pre-upgrade backup: ' + snapshot.id + ' (independent operation ' + operation + ')');
+    // ── 升级备份回收（2026-11-25）────────────────────────────────────────────
+    // 这里曾经完全没有清理：每次升级新建一个 operation 目录，永不回收。实测
+    // 2026-11-25 累积 15 份 / 34GB。保留最近 UPGRADE_BACKUP_KEEP 份，更早的删掉。
+    //
+    // 只动 .platform-upgrade-backups 之下的 operation 目录，且只认带 receipt.json
+    // 的完整操作 —— 列表本身来自 mkdir 成功的目录，但 receipt 是「本工具确实
+    // 写完并校验过」的唯一证据。缺 receipt 的目录保留不删（可能是正在进行的
+    // 另一次升级，或早于本版本、形态不明的遗留）。
+    //
+    // 顺序按目录名（含 ISO 时间戳前缀）倒序即最新在前；不用 mtime，因为复制
+    // 过程会刷新子项时间。
+    try { pruneUpgradeBackups(parent, UPGRADE_BACKUP_KEEP); }
+    catch (error) { console.error('升级备份回收失败（不影响本次备份）：' + error.message); }
     return receipt;
   } finally {
     if (previous === undefined) delete process.env.FNOS_BACKUP_DIR; else process.env.FNOS_BACKUP_DIR = previous;

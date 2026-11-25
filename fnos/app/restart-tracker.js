@@ -51,6 +51,14 @@ function createRestartTracker(dataDir, { bootId = randomBytes(16).toString('hex'
       if (receipt?.status === 'accepted') save({ ...receipt, status: 'failed', toBootId: bootId });
     },
     observe(mode) {
+      // 自愈（0.3.104）：fail() 会把本次尝试记成 failed（toBootId=当前代际）。但同一代际内
+      // 核心随后又起来了（例如清掉残留锁后重启成功），这条 failed 记录就变成陈旧噪声：
+      // 前端会一直显示"上次重启失败"，而实际系统已经 ready。这里在 ready 时把它修正为
+      // completed，避免 UI 长期误报。fromBootId === bootId 仍视为无事可做（重启没有跨代际）。
+      if (receipt?.status === 'failed' && receipt.toBootId === bootId && mode === 'ready') {
+        save({ ...receipt, status: 'completed' });
+        return;
+      }
       if (receipt?.status !== 'accepted' || receipt.fromBootId === bootId) return;
       if (mode === 'ready') save({ ...receipt, status: 'completed', toBootId: bootId });
       else if (mode === 'safe' || mode === 'rollback') save({ ...receipt, status: 'failed', toBootId: bootId });

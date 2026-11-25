@@ -227,7 +227,7 @@ def npm_pack(package_dir: Path, out_dir: Path, require_licenses: bool = False) -
             print(f"    NOT DISTRIBUTED: {metadata['name']} — copyright risk: {risk}")
             produced[0].unlink(missing_ok=True)
             return None
-        approved = {'dsh-plugin-proxy': '0.1.0', 'dsh-preset-integrator': '0.1.0', '@vectorize-io/hindsight-coding-agents': '0.8.1'}
+        approved = {'dsh-plugin-proxy': '0.1.0', 'dsh-preset-integrator': '0.1.0', '@vectorize-io/hindsight-coding-agents': '0.8.1', 'dsh-patch-manager': '0.3.3'}
         files = []
         if metadata['name'] in approved and approved[metadata['name']] == metadata.get('version'):
             supplement = Path(__file__).resolve().parent.parent / 'fnos/app/third-party-licenses' / Path(*metadata['name'].split('/'))

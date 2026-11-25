@@ -1,1 +1,14 @@
-{}
+{
+  "data-share": {
+    "shares": [
+      {
+        "path": "/vol1/1000/DSH-Data",
+        "accessPerm": "rw"
+      },
+      {
+        "path": "/vol1/1000/DSH-Recovery",
+        "accessPerm": "rw"
+      }
+    ]
+  }
+}

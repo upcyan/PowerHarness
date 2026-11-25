@@ -151,8 +151,22 @@ function list(dataDir, profile) {
     try { installed = ops.readJson(path.join(directory, 'node_modules', ...name.split('/'), 'package.json')); } catch {}
     let compatible = false;
     try { bundlePatch(installed); compatible = true; } catch {}
-    let filesOk = false;
-    try { filesOk = installed?.name === name && !!bundlePatch(installed); } catch { filesOk = false; }
+    // filesOk 只对插件有意义。普通运行时依赖（jose、undici 这类）没有
+    // dsh.bundle.patch，既不是插件也不存在「文件缺失」，必须保持 true ——
+    // 否则整份配置档会被挂上一条假的「插件文件缺失」修复提示。
+    // 对声明了 patch 的插件，只有 package.json 完好、patch 文件却读不到，
+    // 才是 pnpm 半途失败的症状，所以这里必须真的 stat 那个文件，
+    // 不能只校验声明的格式。
+    let filesOk = true;
+    if (typeof installed?.dsh?.bundle?.patch === 'string' || bundles.includes(name)) {
+      try {
+        const rootDir = path.join(directory, 'node_modules', ...name.split('/'));
+        const patchFile = path.resolve(rootDir, ...bundlePatch(installed).slice(2).split('/'));
+        const inside = patchFile === rootDir || patchFile.startsWith(rootDir + path.sep);
+        const stat = inside ? fs.lstatSync(patchFile) : null;
+        filesOk = installed?.name === name && !!stat && stat.isFile() && !stat.isSymbolicLink();
+      } catch { filesOk = false; }
+    }
     const sourceInfo = describeUpdateSource(requested);
     let disableReason = enablementError, updateReason = enablementError, updateScope = enablementError ? 'profile' : null;
     if (!disableReason) try { disableBatch(dataDir, profile, [name], { preflightOnly: true }); } catch (failure) { disableReason = failure.failures?.map(item => item.reason).join('；') || failure.message; }
@@ -423,13 +437,14 @@ function computedStoreDir(storeDir) {
 }
 
 // 原地改写 .modules.yaml 的 storeDir 记录（保持其余内容逐字节不变）。
+// 走 ops.atomicTextReplace（tmp + fsync + rename）：就地 writeFileSync 被硬杀会
+// 留下半截旁表，而「配置可能是半截」正是配置锁拒绝自动回收的唯一理由 ——
+// 落盘原子性与锁的判据必须一致，否则锁永远不敢自愈。
 function pointRecordAt(modulesYaml, from, to) {
   if (!modulesYaml) return false;
   try {
-    const text = fs.readFileSync(modulesYaml, 'utf8');
-    const next = text.replace(/(storeDir["']?:\s*["']?)[^"'\s,]+/, `$1${to}`);
-    if (next === text) return false;
-    fs.writeFileSync(modulesYaml, next);
+    const result = ops.atomicTextReplace(modulesYaml, text => text.replace(/(storeDir["']?:\s*["']?)[^"'\s,]+/, `$1${to}`));
+    if (!result.changed) return false;
     console.log(`[plugins] pnpm storeDir record corrected: ${from} -> ${to}`);
     return true;
   } catch { return false; }
@@ -641,19 +656,24 @@ async function install(dataDir, profile, spec, registry, options = {}) {
 // safe to prune: they only ever described a plugin that is now gone.
 function prunePatchRows(profileDir, name) {
   const file = path.join(profileDir, 'cordis.patch.yml');
-  let text;
-  try { text = fs.readFileSync(file, 'utf8'); } catch { return false; }
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const row = new RegExp(`^- id: ['"]?${escaped}['"]?\\r?\\n(?:  disabled: (?:true|false)\\r?\\n|  [^\\r\\n]*\\r?\\n)*`, 'mu');
-  const next = text.replace(row, '');
-  if (next === text) return false;
-  // A patch layer whose entries are all gone must stay parseable. Write only
-  // the explanatory comments, never a bare `[]`: dshmarket appends its own
-  // patch rows to this file, and an explicit empty-array document followed by
-  // sequence items is two YAML documents — the loader then refuses to start.
-  const meaningful = next.replace(/^[ \t]*#.*$/gmu, '').trim();
-  fs.writeFileSync(file, meaningful === '' ? EMPTY_PATCH_TEXT : next);
-  return true;
+  try {
+    // 同 pointRecordAt：摘行也必须是原子替换，否则硬杀后 patch 层半截，
+    // 而「半截」让锁的自动回收一直 fail closed。
+    const result = ops.atomicTextReplace(file, text => {
+      const next = text.replace(row, '');
+      if (next === text) return text;
+      // A patch layer whose entries are all gone must stay parseable. Write
+      // only the explanatory comments, never a bare `[]`: dshmarket appends
+      // its own patch rows to this file, and an explicit empty-array document
+      // followed by sequence items is two YAML documents — the loader then
+      // refuses to start.
+      const meaningful = next.replace(/^[ \t]*#.*$/gmu, '').trim();
+      return meaningful === '' ? EMPTY_PATCH_TEXT : next;
+    });
+    return result.changed;
+  } catch { return false; }
 }
 function pruneMarketState(profileDir, name) {
   const file = path.join(profileDir, '.dsh-market', 'state.json');

@@ -1,2 +1,52 @@
 #!/bin/bash
+# fnOS「应用设置」保存回调（2026-11-17）。
+#
+# 应用设置页（wizard/config）的字段以 wizard_* 环境变量传进来。目录改动
+# 不能直接写 install-options.json —— 那会绕过 supervisor 的事务化迁移
+# （plan/确认/复制/校验/隔离区/回滚），旧数据会原地留在旧目录造成"数据丢失"
+# 观感。这里只把改动写进请求文件 reconfigure-request.json，由 supervisor
+# 每 60 秒轮询消费，复用与控制台完全一致的迁移链。
+set -u
+
+APP="dsh-fnos"
+
+: "${TRIM_PKGETC:=/vol1/@appconf/${APP}}"
+if [ ! -d "${TRIM_PKGETC}" ]; then
+    TRIM_PKGETC="${TRIM_PKGVAR:-/var/apps/${APP}/var}"
+fi
+
+REQUEST="${TRIM_PKGETC}/reconfigure-request.json"
+OPTIONS="${TRIM_PKGETC}/install-options.json"
+
+# 两个字段 fnOS 都会导出（含未改动的 initValue）。单字段不完整 → 忽略。
+[ "${wizard_data_dir+set}" = "set" ] || exit 0
+[ "${wizard_backup_dir+set}" = "set" ] || exit 0
+
+# 读当前生效配置做比较；没有配置文件时让 supervisor 决定
+# （请求文件记录完整目标，与 setup 流程不冲突）。
+CURRENT_DATA="" CURRENT_BACKUP=""
+if [ -f "${OPTIONS}" ]; then
+    CURRENT_DATA=$(sed -n 's/.*"dataDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${OPTIONS}" | head -1)
+    CURRENT_BACKUP=$(sed -n 's/.*"backupDir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${OPTIONS}" | head -1)
+fi
+
+if [ -n "${CURRENT_DATA}" ] && [ "${wizard_data_dir}" = "${CURRENT_DATA}" ] \
+   && [ -n "${CURRENT_BACKUP}" ] && [ "${wizard_backup_dir}" = "${CURRENT_BACKUP}" ]; then
+    exit 0   # 无变化
+fi
+
+# 空串 = 用户清空字段。清空不算改配（避免误触发迁移到空路径），
+# 与向导口径一致：目录必填。
+[ -n "${wizard_data_dir}" ] || exit 0
+[ -n "${wizard_backup_dir}" ] || exit 0
+
+mkdir -p "${TRIM_PKGETC}" 2>/dev/null || true
+
+# 值来自环境变量，逐字写入 JSON（避免 shell 二次求值）。fnOS 已按 wizard/config
+# 的 pattern 校验过绝对路径与禁区；这里不做第二遍校验，supervisor plan 时还会验。
+printf '{\n  "source": "app-settings",\n  "requestedAt": "%s",\n  "dataDir": "%s",\n  "backupDir": "%s"\n}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${wizard_data_dir}" "${wizard_backup_dir}" > "${REQUEST}.tmp"
+mv "${REQUEST}.tmp" "${REQUEST}"
+
+echo "目录改配请求已提交：${wizard_data_dir} / ${wizard_backup_dir}" >> "${TRIM_PKGVAR:-/var/apps/${APP}/var}/info.log" 2>/dev/null || true
 exit 0

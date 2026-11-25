@@ -26,9 +26,11 @@ function identity(env = process.env) {
   if (process.getuid() !== 0) return null;
   const name = env.TRIM_USERNAME || 'dsh_fnos';
   if (!/^[a-z_][a-z0-9_-]*$/.test(name)) throw new Error('Invalid application identity');
-  const record = require('node:child_process').execFileSync('getent', ['passwd', name], { encoding: 'utf8' }).trim().split(':');
-  const uid = Number(record[2]), gid = Number(record[3]);
-  if (!(uid > 0 && gid > 0)) throw new Error('Application identity unavailable');
+  const lookup = (db, key) => require('node:child_process').execFileSync('getent', [db, key], { encoding: 'utf8' }).trim().split(':');
+  const group = env.TRIM_GROUPNAME || name;
+  if (!/^[a-z_][a-z0-9_-]*$/.test(group)) throw new Error('Invalid application group');
+  const uid = Number(lookup('passwd', name)[2]), gid = Number(lookup('group', group)[2]);
+  if (!(Number.isSafeInteger(uid) && uid > 0 && Number.isSafeInteger(gid) && gid > 0)) throw new Error('Application identity unavailable');
   return { uid, gid };
 }
 function claim(root, env = process.env) {
@@ -59,11 +61,12 @@ function audit(dataDir, env = process.env) {
     if (!s.isDirectory() || s.isSymbolicLink()) continue;
     for (const { root: dir, error } of walk(root, 3)) {
       if (error && (error.code === 'EACCES' || error.code === 'EPERM')) {
-        problems.push(`存储目录不可读：${dir}（属主 ${(() => { try { return fs.statSync(dir).uid; } catch { return '?'; } })()}，当前 ${process.getuid()}）。请在 NAS 终端执行：sudo chown -R $(id -un):$(id -gn) ${dataDir}`);
+        const uid = process.geteuid(), gid = process.getegid();
+        problems.push(`存储目录不可读：${dir}。当前检查进程 ${uid}:${gid}；请管理员核对该路径及应用进程身份，只处理确认有误的条目，不要递归修改数据目录或备份。`);
         break; // 每棵树报一条即可
       }
     }
   }
   return problems;
 }
-module.exports = { claim, audit };
+module.exports = { claim, audit, identity };

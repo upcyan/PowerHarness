@@ -193,7 +193,11 @@ function commit(dataDir, profile, manifestFile, manifest, beforePatch, afterPatc
 }
 function set(dataDir, profile, state, enabled, ops, options = {}) {
   if (options.preflightOnly === true) {
-    coordination.assertCanStart(dataDir); // Read-only admission check; no lock files created.
+    // Admission check before a preflight write. It never creates a lock, but it
+    // DOES archive a lock already proven orphaned (dead owner + finished txn):
+    // that is the self-healing path out of permanent safe mode, so the name
+    // must not promise more than it does.
+    coordination.assertCanStart(dataDir);
     return setLocked(dataDir, profile, state, enabled, ops, options);
   }
   return coordination.withLock(state.directory, () => setLocked(dataDir, profile, state, enabled, ops, options));
@@ -320,7 +324,12 @@ function disableBatch(dataDir, profile, directory, names, ops, options = {}) {
     manifest[KEY] = { version: 1, disabled };
     return { changed, skipped, preflightOnly: false, ...commit(dataDir, profile, manifestFile, manifest, before, next, ops, beforeManifest, patchSnapshot, { rollbackNames: changed }) };
   };
-  if (options.preflightOnly === true) { if (options.admissionChecked !== true) coordination.assertCanStart(dataDir); return applyBatch(); }
+  if (options.preflightOnly === true) {
+    // Same admission semantics as set(): no new lock, but a proven-orphan lock
+    // is archived here instead of blocking every preflight forever.
+    if (options.admissionChecked !== true) coordination.assertCanStart(dataDir);
+    return applyBatch();
+  }
   return coordination.withLock(directory, applyBatch);
 }
 function restoreDisabledBatch(dataDir, profile, directory, result, ops) {

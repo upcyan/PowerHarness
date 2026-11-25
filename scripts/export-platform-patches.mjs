@@ -9,7 +9,19 @@ const sha = text => createHash('sha256').update(text).digest('hex');
 const must = (yes, message) => { if (!yes) throw Error(message); };
 const LF = String.fromCharCode(10);
 export function createPlatformCatalog(patcher, polyfill) {
-  must(patcher.split('fs.writeFileSync(').length-1===4,'实际平台写入种类变化，必须复核清单覆盖');
+  // 写盘点：数的是「补丁脚本会改写几处文件」，任何一处变化都要求人工复核下面
+  // 的分类映射是否仍然完整 —— 总数对上不代表分类没漂移。
+  //
+  // 实测 5 处（2026-11-25）：
+  //   1. client-connection 网关信任（replace）
+  //   2. api-gateway 前台恢复（foreground）
+  //   3. 输入区背景 color-mix→rgba（replace）
+  //   4. 前端 index.html 注入 legacy shim（probe/shim）
+  //   5. dsh-base 的 cordis.patch.yml 配置写入（0.3.116 新增，钉 tool-bash 的
+  //      promoteOnTimeout）。这一处改的是**配置层**，不是平台代码分类，
+  //      故不进入下面的 rules 清单；但它仍必须计入总数，否则门禁会把
+  //      「多了一处写入」误判成「种类漂移」。
+  must(patcher.split('fs.writeFileSync(').length-1===5,'实际平台写入种类变化，必须复核清单覆盖');
   must(!polyfill.includes('</'+'script'),'shim含script终止符，不能生成安全检查清单');
   // Evaluate only a closed string literal, not the patcher or its filesystem code.
   function stringAt(text, start) {
@@ -43,7 +55,7 @@ export function createPlatformCatalog(patcher, polyfill) {
   }
   const anchor=constant('anchor',gatewayAt),marker=constant('marker',gatewayAt);
   const recovery=template('recovery').split(String.fromCharCode(92)+'n').join(LF)
-    .replaceAll('$'+'{anchor}',anchor).replaceAll('$'+'{marker}',marker)
+    .replaceAll('$'+'{anchorUsed}',anchor).replaceAll('$'+'{anchor}',anchor).replaceAll('$'+'{marker}',marker)
     .replaceAll('$'+'{installForegroundRecovery.toString()}',recoveryFunction)
     .replaceAll('$'+'{probe}',template('probe')).replaceAll('$'+'{reconnect}',template('reconnect'));
   const blockAt=patcher.indexOf('const block = ',shimAt);must(blockAt>=0,'shim拼接表达式漂移');
@@ -62,7 +74,7 @@ export function createPlatformCatalog(patcher, polyfill) {
     {id:'platform-core-version',kind:'version',plugin:'@deepseek-ai/dsh-client-connection',description:'核心与客户端连接模块版本一致'},
     {id:'platform-gateway-trust',kind:'replace',plugin:'@deepseek-ai/dsh-client-connection',description:'fnOS认证网关信任适配',anchor:constant('anchor',trustAt),applied:constant('applied',trustAt)},
     {id:'platform-foreground-probe',kind:'probe',plugin:'@deepseek-ai/dsh-api-gateway',description:'无副作用的前台连接探针契约',targetFile:'lib/index.js',reject:constant('rejectAnchor',gatewayAt),prefixes:[constant('validationPrefix',gatewayAt),constant('validationPrefix020',gatewayAt)]},
-    {id:'platform-foreground-recovery',kind:'foreground',plugin:'@deepseek-ai/dsh-api-gateway',description:'前台恢复与受控自动重连',anchor,marker,previous:constant('previousMarker',gatewayAt),end:constant('endMarker',gatewayAt),applied:recovery},
+    {id:'platform-foreground-recovery',kind:'foreground',plugin:'@deepseek-ai/dsh-api-gateway',description:'前台恢复与受控自动重连',anchor:marker,marker,previous:constant('previousMarker',gatewayAt),end:constant('endMarker',gatewayAt),applied:recovery},
     ...routes,
     {id:'platform-eager-iterator',kind:'iterator',plugin:'@deepseek-ai/dsh-client-ui-sidebar-documentpreview',description:'预览模块首屏禁止裸Iterator解引用',forbidden:'typeof Iterator.prototype.join'},
     {id:'platform-composer-background',kind:'composer',plugin:'@deepseek-ai/dsh-client-ui-conversation',description:'老引擎输入区背景兼容',targetFile:'lib/client.js',anchor:constant('anchor',composerAt),applied:stringAt(patcher,patcher.indexOf('.join(',composerAt)+'.join('.length).value},

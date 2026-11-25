@@ -9,7 +9,22 @@ import { pathToFileURL } from 'node:url';
 const runtime = path.resolve(process.argv[2] || '');
 if (!process.argv[2]) throw new Error('Pass the exact installed candidate runtime');
 const req = createRequire(path.join(runtime, 'package.json'));
-const bridgeEntry = req.resolve('@deepseek-ai/dsh-mcp-client');
+// rc.5 npm 布局可能把 dsh-mcp-client 嵌套进 dsh/node_modules（conflict resolution）。
+// req.resolve 只走祖先链不钻嵌套，所以显式补两级 fallback：顶层 → dsh 嵌套 → dsh-sdk-app 嵌套。
+let bridgeEntry;
+try {
+  bridgeEntry = req.resolve('@deepseek-ai/dsh-mcp-client');
+} catch (error) {
+  const nestedRoots = [
+    path.join(runtime, 'node_modules/@deepseek-ai/dsh/node_modules'),
+    path.join(runtime, 'node_modules/@deepseek-ai/dsh-sdk-app/node_modules'),
+  ];
+  bridgeEntry = nestedRoots.map((root) => path.join(root, '@deepseek-ai/dsh-mcp-client/package.json'))
+    .find((candidate) => fs.existsSync(candidate));
+  if (!bridgeEntry) throw error;
+  bridgeEntry = path.dirname(bridgeEntry);
+  console.log('dsh-mcp-client resolved from a nested layout:', bridgeEntry);
+}
 const bridgeRequire = createRequire(bridgeEntry);
 const sdkEntry = bridgeRequire.resolve('@modelcontextprotocol/client');
 const sdkRoot = path.dirname(path.dirname(sdkEntry));

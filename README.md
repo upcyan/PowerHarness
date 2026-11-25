@@ -1,6 +1,6 @@
 # DeepSeek Harness for fnOS
 
-将 DeepSeek 官方 **dsh Web UI** 打包为飞牛 fnOS 的 FPK 应用，目标平台 fnOS x86_64。FPK 随包携带 `@deepseek-ai/dsh@0.2.1-rc.2` 作为首次安装及离线兜底核心；后续核心可独立安装到应用私有数据目录，管理入口不变。
+将 DeepSeek 官方 **dsh Web UI** 打包为飞牛 fnOS 的 FPK 应用，目标平台 fnOS x86_64。FPK 随包携带 `@deepseek-ai/dsh@0.2.2-rc.5` 作为首次安装及离线兜底核心；后续核心可独立安装到应用私有数据目录，管理入口不变。
 
 ## 界面预览
 

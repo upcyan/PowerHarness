@@ -14,14 +14,26 @@
     return pathname === '/' || paths.some((path) => pathname === path || pathname.startsWith(path + '/'));
   }
 
+  // 归属（2026-11-25）：插件调用 fetch 时，JS 调用栈里会带它自己的脚本 URL
+  // （`https://host/.../plugins/<插件名>/client.xxx.js`）。这是唯一能可靠回答
+  // 「这条根路径是哪个插件在要」的运行时证据——插件 package.json 不声明路由，
+  // 路径名与包名也常对不上（/bili → billion-context、/permgate → @mrweicodes/dsh-permgate）。
+  // 取栈里第一个 /plugins/<name>/ 作为来源；取不到就留空，不猜。
+  function originFromStack() {
+    const stack = String(new Error().stack || '');
+    const match = /\/plugins\/((?:@[A-Za-z0-9._-]+\/)?[A-Za-z0-9._-]+)\//.exec(stack);
+    return match ? match[1] : '';
+  }
+
   function report(pathname) {
     const parts = pathname.split(/[?#]/, 1)[0].split('/');
     const path = parts[1] === '_dsh' ? '/_dsh/' + (parts[2] || '') : '/' + (parts[1] || '');
     const valid = /^\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(path) || /^\/_dsh\/[a-z0-9][a-z0-9-]{0,31}$/.test(path);
     if (!valid || reported.has(path) || typeof originalFetch !== 'function') return;
     reported.add(path);
+    const plugin = originFromStack();
     void originalFetch.call(globalThis, prefix + '/__fnos-plugin-url-candidate', {
-      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path })
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(plugin ? { path, plugin } : { path })
     }).catch(() => {});
   }
 

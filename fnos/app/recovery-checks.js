@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const ops = require('./ops');
 const profiles = require('./profiles');
+const coordination = require('./config-coordination');
 // 只读元信息与配置形状；不启动进程、不创建目录、不修权限、不改链接。
 function inspect(dataDir, yaml, { bridge = '/opt/dsh/home', appDir = process.env.FNOS_APP_DIR || null } = {}) {
   const checks = [];
@@ -26,6 +27,17 @@ function inspect(dataDir, yaml, { bridge = '/opt/dsh/home', appDir = process.env
     const result = ops.validatePatchText(text, yaml);
     add('patch', result.ok ? 'ok' : 'warning', result.ok ? '用户 patch 结构校验通过（不等于插件运行成功）' : '用户 patch 未通过结构校验；先查看配置和备份，不自动重置');
   } catch { add('profile', 'error', '配置档选择或 manifest 不可读取/解析'); }
+  // 配置锁：只清点、不归档。被锁挡住的启动在旧版会被归为「未知故障」，用户只能
+  // SSH 手工处理；这里把「哪把锁、卡在什么原因、能不能自动恢复」直接说出来。
+  try {
+    const info = coordination.inspectLocks(dataDir);
+    if (info.locks.length === 0) add('config-locks', 'ok', '没有遗留配置锁');
+    else for (const lock of info.locks) {
+      const where = lock.scope === 'data' ? '数据根目录' : `配置档 ${lock.profile || '?'}`;
+      const verdict = lock.recoverable ? '可自动恢复（下次启动/写入时归档，保留证据）' : `需人工核对：${lock.message}`;
+      add('config-locks', lock.recoverable ? 'ok' : 'warning', `${where}存在配置锁 ${lock.path}：${verdict}`);
+    }
+  } catch (error) { add('config-locks', 'warning', '配置锁清点失败：' + String(error.message || error)); }
   if (appDir) {
     try {
       const cores = require('./core-manager');

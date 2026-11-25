@@ -1,8 +1,26 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { Script } from 'node:vm';
 
 const runtime = process.argv[2];
 if (!runtime) throw new Error('Pass the installed runtime directory');
+
+// Browser halves are plain scripts: a syntax error never surfaces in the host
+// log. It silently stops __ModuleLoader__.load from running, which reads as
+// "loaded without registering" and, for a required entry such as
+// dsh-client-ui-chat, takes every dependent plugin down with it
+// (2026-11-20 incident: an insert-before patch spliced a const into the middle
+// of an object literal). Parse every browser bundle before it is written.
+function assertBrowserSyntax(file, text) {
+  if (!/[.]m?js$/.test(file)) return;
+  // Only the plain-script halves are silent: the loader never runs them, so a
+  // syntax error just leaves the factory unregistered. The *.node.js halves are
+  // ESM and are parsed at module load, where any error fails loudly instead.
+  if (/[.]node[.]m?js$/.test(file)) return;
+  if (/^[ \t]*(?:import|export)\b/m.test(text)) return;
+  try { new Script(text, { filename: file }); }
+  catch (error) { throw new Error(`refusing to write syntactically invalid browser bundle: ${path.relative(runtime, file)}: ${error.message}`); }
+}
 
 // Resolve a @deepseek-ai package directory. npm may hoist the package to the
 // top level or nest it under the dsh package (0.2.0 does both depending on
@@ -49,11 +67,15 @@ function clientEntry(packageName) {
 for (const connectionFile of connectionFiles) {
   const file = connectionFile;
   const source = fs.readFileSync(file, 'utf8');
-  const anchor = 'isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),';
-  const occurrences = source.split(anchor).length - 1;
+  // rc.5: browser half minified (no spaces); node half keeps spaces. Try both anchors;
+  // exactly one form must hit once (or idempotent marker present).
+  const anchor = 'isLoopback:transport?.ownsHost===true||pageLocation===void 0||isLoopbackHostname(pageLocation.hostname),';
+  const anchorSpaced = 'isLoopback: transport?.ownsHost === true || pageLocation === void 0 || isLoopbackHostname(pageLocation.hostname),';
   const applied = 'isLoopback: true, /* fnOS HTTPS gateway authenticates via NAS admin ticket before forwarding */';
-  if (occurrences !== 1 && !(occurrences === 0 && source.split(applied).length === 2)) throw new Error(`dsh ${core.version} needs a new fnOS adapter: expected one verified trust anchor`);
-  if (occurrences === 1) fs.writeFileSync(file, source.replace(anchor, applied));
+  const hits = [anchor, anchorSpaced].map((a) => source.split(a).length - 1);
+  const occurrences = hits.reduce((sum, n) => sum + n, 0);
+  if (occurrences !== 1 && !(occurrences === 0 && source.split(applied).length === 2)) throw new Error(`dsh ${core.version} needs a new fnOS adapter: expected one verified trust anchor (spaced=${hits[1]}, minified=${hits[0]})`);
+  if (occurrences === 1) { const trustUsed = hits.indexOf(1) === 0 ? anchor : anchorSpaced; const trustNext = source.replace(trustUsed, applied); assertBrowserSyntax(file, trustNext); fs.writeFileSync(file, trustNext); }
   console.log(`Patched ${path.relative(runtime, file)} for authenticated fnOS gateway`);
 }
 // Probe the existing carrier before replacing it: a healthy foreground must not
@@ -192,7 +214,9 @@ function installForegroundRecovery(globals, connection) {
   let source = fs.readFileSync(file, 'utf8');
   const marker = '/* fnOS connection foreground recovery v2 */';
   const previousMarker = '/* fnOS connection foreground recovery */';
-  const anchor = '}, "api-gateway.client.transport");';
+  // rc.5 browser half minified: no spaces/semicolon and template-quote transport tag.
+  const anchor = '},`api-gateway.client.transport`)';
+  const anchorSpaced = '}, "api-gateway.client.transport");';
   if (source.includes(previousMarker)) {
     const endMarker = '}, "fnos.connection.foreground");';
     const at = source.indexOf(previousMarker), until = source.indexOf(endMarker, at);
@@ -200,7 +224,9 @@ function installForegroundRecovery(globals, connection) {
     source = source.slice(0, at) + source.slice(until + endMarker.length);
   }
   if (!source.includes(marker)) {
-    if (source.split(anchor).length !== 2) throw new Error(`dsh ${core.version}: foreground recovery requires one transport owner`);
+    const fgHits = [anchor, anchorSpaced].map((a) => source.split(a).length - 1);
+    if (fgHits.reduce((sum, n) => sum + n, 0) !== 1) throw new Error(`dsh ${core.version}: foreground recovery requires one transport owner (spaced=${fgHits[0]}, minified=${fgHits[1]})`);
+    const anchorUsed = fgHits.indexOf(1) === 0 ? anchor : anchorSpaced;
     const probe = `async (signal) => {
       foregroundCarrier = this.streams.socket;
       if (connection.rpc.open !== void 0) return true;
@@ -217,8 +243,8 @@ function installForegroundRecovery(globals, connection) {
       connection.reconnect();
       return true;
     }`;
-    const recovery = `${anchor}\n${marker}\nctx.effect(() => { let foregroundCarrier; return (${installForegroundRecovery.toString()})(globalThis, { probe: ${probe}, reconnect: ${reconnect}, state: () => connection.state.getSnapshot(), subscribe: listener => connection.state.subscribe(listener), policy: async signal => { const response = await fetch(new URL("__fnos/connection-policy", document.baseURI), { credentials: "same-origin", cache: "no-store", signal }); if (!response.ok) throw new Error("connection policy unavailable"); const policy = await response.json(); if (typeof policy.autoReconnect !== "boolean") throw new Error("connection policy invalid"); return policy.autoReconnect; } }); }, "fnos.connection.foreground");`;
-    fs.writeFileSync(file, source.replace(anchor, recovery));
+    const recovery = `${marker}\nctx.effect(() => { let foregroundCarrier; return (${installForegroundRecovery.toString()})(globalThis, { probe: ${probe}, reconnect: ${reconnect}, state: () => connection.state.getSnapshot(), subscribe: listener => connection.state.subscribe(listener), policy: async signal => { const response = await fetch(new URL("__fnos/connection-policy", document.baseURI), { credentials: "same-origin", cache: "no-store", signal }); if (!response.ok) throw new Error("connection policy unavailable"); const policy = await response.json(); if (typeof policy.autoReconnect !== "boolean") throw new Error("connection policy invalid"); return policy.autoReconnect; } }); }, "fnos.connection.foreground");`;
+    const recoveryNext = source.replace(anchorUsed, anchorUsed + '\n' + recovery); assertBrowserSyntax(file, recoveryNext); fs.writeFileSync(file, recoveryNext);
     console.log('Patched fnOS foreground carrier check and SDK-owned recovery');
   }
   }
@@ -234,7 +260,8 @@ function installForegroundRecovery(globals, connection) {
 // a core whose browser half silently bypasses the gateway prefix (the exact
 // class of bug that produced those rewrites in the first place).
 // ---------------------------------------------------------------------------
-function assertAnchor(packageName, anchor, label) {
+function assertAnchor(packageName, anchor, label, extras = []) {
+  const anchors = [anchor, ...extras];
   const files = clientEntry(packageName) || [];
   const extra = pkgFile(packageName, 'lib', 'types', 'client', 'runtime.js');
   if (extra && fs.existsSync(extra)) files.push(extra);
@@ -243,7 +270,7 @@ function assertAnchor(packageName, anchor, label) {
   for (const file of files) {
     if (!fs.existsSync(file)) continue;
     const source = fs.readFileSync(file, 'utf8');
-    if (source.includes(anchor)) { seen = true; break; }
+    if (anchors.some((a) => source.includes(a))) { seen = true; break; }
   }
   if (!seen) {
   if (process.env.PATCH_COLLECT) { console.log('COLLECT-MISS: ' + packageName + ' (' + label + ')'); return; }
@@ -261,21 +288,28 @@ assertAnchor('dsh-api-gateway',
 assertAnchor('dsh-client-hmr',
   'new EventSource(EVENTS_ROUTE)',
   'SSE events route');
+// rc.5 改名 EVENTS_ROUTE→拆为 EVENTS_ENDPOINT+slice(1)，浏览器半压缩成模板引号。锚双形态任一命中。
 assertAnchor('dsh-client-hmr',
-  'const EVENTS_ROUTE = "/plugins/events".slice(1);',
-  'SSE events route stays relative');
+  'const EVENTS_ROUTE=EVENTS_ENDPOINT.slice(1);',
+  'SSE events route stays relative (rc.5 minified)',
+  ['const EVENTS_ROUTE = "/plugins/events".slice(1);']);
 assertAnchor('dsh-client-file-upload',
-  'const FILE_UPLOAD_ROUTE = "/api/session/uploadFileBinary".slice(1);',
-  'upload resolves against document.baseURI');
+  'const FILE_UPLOAD_ROUTE=FILE_UPLOAD_PATH.slice(1)',
+  'upload resolves against document.baseURI (rc.5 minified)',
+  ['const FILE_UPLOAD_ROUTE = "/api/session/uploadFileBinary".slice(1);']);
 assertAnchor('dsh-session-log-export',
-  'const SESSION_LOG_EXPORT_ROUTE = "/api/session.export".slice(1);',
-  'session export route stays relative');
+  'const SESSION_LOG_EXPORT_ROUTE=SESSION_LOG_EXPORT_PATH.slice(1)',
+  'session export route stays relative (rc.5 minified)',
+  ['const SESSION_LOG_EXPORT_ROUTE = "/api/session.export".slice(1);']);
+// rc.5 拆名：PRESENT_*_PATH 常量 + PRESENT_*_ROUTE=PRESENT_*_PATH.slice(1)。双形态任一命中。
 assertAnchor('dsh-client-ui-deliverables',
-  'const PRESENT_OPEN_PATH = "/api/present.open";',
-  'present.open route stays relative');
+  'const PRESENT_OPEN_PATH=`/api/present.open`',
+  'present.open route stays relative (rc.5 minified)',
+  ['const PRESENT_OPEN_PATH = "/api/present.open";']);
 assertAnchor('dsh-client-ui-deliverables',
-  'const PRESENT_HOST_PATH = "/api/present.host";',
-  'present.host route stays relative');
+  'const PRESENT_HOST_PATH=`/api/present.host`',
+  'present.host route stays relative (rc.5 minified)',
+  ['const PRESENT_HOST_PATH = "/api/present.host";']);
 
 // The old preview-bundle bug (a bare `typeof Iterator.prototype.join`
 // dereferencing a missing global) was fixed upstream in 0.2.0 — the eager
@@ -321,8 +355,55 @@ assertAnchor('dsh-client-ui-deliverables',
     console.log('composer seat background is already engine-portable; skipped');
     return;
   }
-  fs.writeFileSync(target, source.split(anchor).join('rgba(0, 0, 0, 0)'));
+  const seatNext = source.split(anchor).join('rgba(0, 0, 0, 0)'); assertBrowserSyntax(target, seatNext); fs.writeFileSync(target, seatNext);
   console.log('Patched composer seat background (color-mix -> rgba) for legacy engines');
+})();
+
+// ---------------------------------------------------------------------------
+// tool-bash: kill a foreground command when its deadline passes instead of
+// promoting it to a background job.
+//
+// Upstream ships `promoteOnTimeout: true`, so a command that hits the executor
+// deadline keeps running unattended under the job registry. On 2026-11-24 two
+// such leftovers (`trash shot.sh _nav.js`, spawned by a tool call six hours
+// earlier) were spinning at ~85% CPU each on a 4-core N150 — together more CPU
+// than the entire harness — and had been invisible: the tool call that started
+// them had already returned, so no job id pointed at them anymore.
+//
+// `false` makes the deadline kill the process tree. Long-running work stays
+// available through explicit `run_in_background`, which is a deliberate call
+// with a job id the caller holds.
+//
+// The key must appear exactly once; a second occurrence means upstream changed
+// the row and this anchor no longer describes it — fail the build instead of
+// silently shipping the old default.
+// ---------------------------------------------------------------------------
+(function patchBashTimeoutPolicy() {
+  const target = pkgFile('dsh-base', 'cordis.patch.yml');
+  if (!target || !fs.existsSync(target)) {
+    throw new Error('dsh-base cordis.patch.yml not found — cannot pin tool-bash promoteOnTimeout');
+  }
+  const source = fs.readFileSync(target, 'utf8');
+  if (source.includes('promoteOnTimeout: false')) {
+    console.log('tool-bash promoteOnTimeout already pinned; skipped');
+    return;
+  }
+  const anchor = [
+    "    - id: tool-bash",
+    "      name: '@deepseek-ai/dsh-tool-bash'",
+    "      disabled: !!js process.platform === 'win32'",
+  ].join('\n');
+  const occurrences = source.split(anchor).length - 1;
+  if (occurrences !== 1) {
+    throw new Error(`dsh-base tool-bash anchor matched ${occurrences} times, expected 1 — upstream row changed`);
+  }
+  const replacement = anchor + '\n' + [
+    "      config:",
+    "        # 前台命令超时即杀；长跑用显式 run_in_background（2026-11-24 自旋事故）。",
+    "        promoteOnTimeout: false",
+  ].join('\n');
+  fs.writeFileSync(target, source.replace(anchor, replacement));
+  console.log('Pinned tool-bash promoteOnTimeout: false (deadline kills instead of promoting)');
 })();
 
 // ---------------------------------------------------------------------------

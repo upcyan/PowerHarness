@@ -17,7 +17,11 @@ migrate_error() {
   if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then printf "%s\n" "$message" >> "$TRIM_TEMP_LOGFILE"; fi
   exit "$rc"
 }
-trap migrate_error ERR
+# ERR trap 必须带参调用：migrate_error 用到 ${1}，set -u 下无参调用会让 trap 自己
+# 先炸（unbound variable），把**首个真实错误吞掉**，日志里只剩这句自爆信息。
+# 实机证据：/var/log/apps/dsh-fnos.log 末行 106 的 install_callback 报
+# "line 15: 1: unbound variable"，fnOS 据此判安装失败并弹「无法安装」。
+trap 'migrate_error "安装后处理"' ERR
 # fnOS exports wizard fields; keep values out of shell evaluation.
 # init 退出码语义（0.3.97 加固）：
 #   0 = 设置已保存且目录授权检查通过；
@@ -25,14 +29,25 @@ trap migrate_error ERR
 #       supervisor boot 会明确提示并阻止启动）——不再让整个安装报"未知错误"；
 #   其它非零 = 真失败（配置写不进去等），维持 trap 报错。
 set +e
-node "${TRIM_APPDEST:?}/install-options-cli.js" init > "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1
-init_rc=$?
+# TRIM_TEMP_LOGFILE 会被 fnOS 原样当作失败弹窗的正文。成功时往里面写任何东西
+# （哪怕是「读写检查通过」）都会让安装中心把这次安装当成失败弹出来。
+# 所以 init 的输出先落到自己的日志；只有真失败才转交给安装中心。
+INIT_LOG="${TRIM_APPDEST:?}/install-options-init.log"
+: > "$INIT_LOG" 2>/dev/null || INIT_LOG=/dev/null
+# 必须用 `|| init_rc=$?` 捕获，不能写裸 `init_rc=$?`：ERR trap 只认「命令失败」，
+# set +e 挡不住它（实测 trap 照样在 node 返回非 0 时触发），失败信号在上一条命令
+# 上就已经触发 trap 并中止，裸 init_rc=$? 根本没机会执行 ⇒ rc==2（授权待定）
+# 这条正常分支永远走不到，脚本 exit 1 被判成安装失败。
+# 也不能保留 `init_rc=$?` 紧随其后 —— 那会把捕获到的码覆盖成 0。
+init_rc=0
+node "${TRIM_APPDEST:?}/install-options-cli.js" init > "$INIT_LOG" 2>&1 || init_rc=$?
 set -e
 if [ "$init_rc" -eq 0 ]; then
   :
 elif [ "$init_rc" -eq 2 ]; then
-  printf "安装设置已保存；数据/备份目录尚未授权给应用账号，首次启动将被阻止。请在应用中心 → DeepSeek Harness → 访问权限中授权后重启应用。\n" | tee -a "${TRIM_TEMP_LOGFILE:-/dev/null}" >&2
+  printf "安装设置已保存。数据/备份目录尚未授权给应用账号：安装会继续完成，但应用保持停用状态；请在应用中心 → ${TRIM_APPNAME:-本应用} → 访问权限中授权后，再点「启用」。\n" | tee -a "${TRIM_TEMP_LOGFILE:-/dev/null}" >&2
 else
+  cat "$INIT_LOG" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>/dev/null || true
   migrate_error "$INIT_STAGE"
 fi
 # A pre-existing install keeps its data in TRIM_PKGVAR. When the wizard chose a
@@ -41,5 +56,7 @@ fi
 MIGRATION_ARGS=("${MIGRATION_ARGS[@]}")
 if [ -n "${TRIM_PKGVAR:-}" ]; then
   FNOS_APP_DIR="${TRIM_APPDEST}" FNOS_DATA_DIR="${TRIM_PKGVAR}" TRIM_PKGETC="${TRIM_PKGETC:-}" \
-    node "${TRIM_APPDEST}/install-migration-cli.js" "${MIGRATION_ARGS[@]}" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1
+    # 迁移成功时的输出也不是错误，同样不能进失败弹窗。
+    node "${TRIM_APPDEST}/install-migration-cli.js" "${MIGRATION_ARGS[@]}" >> "$INIT_LOG" 2>&1 \
+      || cat "$INIT_LOG" >> "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>/dev/null || true
 fi

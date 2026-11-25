@@ -2,7 +2,7 @@ const fs = require('node:fs');
 const configCoordination = require('./config-coordination.js');
 const backupStore = require('./backup-store.js');
 // 会话库完整性校验用（P6 防护）：zstd -t 只校验不落盘。
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const path = require('node:path');
 const { randomBytes, createHash } = require('node:crypto');
 
@@ -72,11 +72,11 @@ function listBackups(dataDir) {
 //   'timer'  按 sessionInterval 分钟周期定时检查并快照；
 //   'manual' 只在设置页手动点「检查并立即快照」。
 // sessionInterval 为定时的检查周期（分钟），范围 5 分钟 ~ 7 天。
-const defaultBackupSettings = { daily: 7, manual: 3, session: 48, 'pre-upgrade': 2, dailyMode: 'always', sessionMode: 'auto', sessionInterval: 60 };
+const defaultBackupSettings = { daily: 7, manual: 3, session: 48, 'pre-upgrade': 2, uninstall: 5, dailyMode: 'always', sessionMode: 'auto', sessionInterval: 60 };
 function backupSettings(dataDir) {
   const saved = readJson(dataPath(dataDir, 'backup-settings.json'), {});
   const result = { ...defaultBackupSettings, ...saved };
-  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10]]) {
+  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10], ['uninstall', 30]]) {
     if (!Number.isInteger(result[kind]) || result[kind] < 1 || result[kind] > max) throw new Error(`Invalid ${kind} backup limit`);
   }
   if (!['always', 'changed', 'updates'].includes(result.dailyMode)) throw new Error('Invalid daily backup mode');
@@ -88,7 +88,7 @@ function backupSettings(dataDir) {
 function saveBackupSettings(dataDir, value) {
   const settings = { ...backupSettings(dataDir), ...value };
   for (const kind of ['daily', 'manual', 'pre-upgrade']) if (typeof settings[kind] === 'string') settings[kind] = Number(settings[kind]);
-  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10]]) {
+  for (const [kind, max] of [['daily', 30], ['manual', 30], ['session', 168], ['pre-upgrade', 10], ['uninstall', 30]]) {
     if (!Number.isInteger(settings[kind]) || settings[kind] < 1 || settings[kind] > max) throw new Error(`Invalid ${kind} backup limit`);
   }
   if (!['always', 'changed', 'updates'].includes(settings.dailyMode)) throw new Error('Invalid daily backup mode');
@@ -516,13 +516,23 @@ function scanCorruptSessions(dataDir, { quarantine = false } = {}) {
   };
   walk(root);
   const corrupt = [];
+  const unverified = [];
   for (const file of files) {
-    try {
-      // -t 只校验不输出；-q 抑制正常输出。限时防止异常文件挂住启动。
-      execFileSync('zstd', ['-t', '-q', file], { stdio: 'ignore', timeout: 5000 });
-    } catch { corrupt.push(path.relative(root, file)); }
+    // -t 只校验不输出；-q 抑制正常输出。限时防止异常文件挂住启动。
+    // 只有 zstd 自己报「文件损坏」（非零退出码）才判 corrupt。
+    // 超时（signal）、fork 失败（ENOENT/EAGAIN/EMFILE）、被信号杀死等是**检查本身没跑成**，
+    // 与文件内容无关；把它们也当 corrupt 会在冷启动抖动时把完好日志整份搬走，
+    // 会话随即从 GUI 消失。这类情况只记录、不移动，留给下一轮再查。
+    const result = spawnSync('zstd', ['-t', '-q', file], { stdio: 'ignore', timeout: 30000 });
+    if (result.status === 0) continue;
+    const rel = path.relative(root, file);
+    if (result.status === null) {
+      unverified.push({ file: rel, reason: result.error ? String(result.error.code || result.error.message) : 'terminated by signal ' + String(result.signal) });
+      continue;
+    }
+    corrupt.push(rel);
   }
-  if (!corrupt.length || !quarantine) return { scanned: files.length, corrupt, quarantined: 0, dir: null };
+  if (!corrupt.length || !quarantine) return { scanned: files.length, corrupt, unverified, quarantined: 0, dir: null };
   const dir = path.join(root, '..', 'sessions-corrupt-' + Date.now());
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   let quarantined = 0;
@@ -538,7 +548,7 @@ function scanCorruptSessions(dataDir, { quarantine = false } = {}) {
       note: '上游 dsh-session-persistence-jsonl 读取损坏的 Zstandard 会话日志会导致核心启动失败（corrupt Zstandard session log）。这些文件已隔离；如需上报上游请保留本目录。',
     }, null, 2) + '\n', { mode: 0o600 });
   } catch { /* ignore */ }
-  return { scanned: files.length, corrupt, quarantined, dir };
+  return { scanned: files.length, corrupt, unverified, quarantined, dir };
 }
 
 function pruneBackups(dataDir) {
@@ -547,7 +557,11 @@ function pruneBackups(dataDir) {
   for (const item of listBackups(dataDir)) {
     // Legacy evidence must neither be deleted nor consume the new store quota.
     if (path.dirname(backupStore.locate(dataDir, item.id)) !== backupStore.root(dataDir)) continue;
-    if (item.kind === 'uninstall') continue; // Explicit user-data preservation is never automatic-pruned.
+    // 卸载保全曾经无上限：每次卸载/升级都留一份全量快照且永不回收。
+    // 2026-11-25 实测累积 20 份 / 45.4GB，横跨 6 个版本（0.2.0-rc.2 → 0.2.2-rc.5）——
+    // 回滚到 5 个版本以前没有实际操作价值，只是单调吃盘。现在与其它类别一样受
+    // backup-settings 的 uninstall 上限约束（默认 5）；显式删除请求仍由
+    // uninstall-retention.policy() 把关，不受这里影响。
     const group = groups.get(item.kind) || [];
     group.push(item);
     groups.set(item.kind, group);
@@ -762,7 +776,8 @@ function restoreSnapshotLocked(dataDir, configDir, backupId) {
   for (const name of ['dsh-home', 'workspace']) {
     if (!fs.lstatSync(path.join(source, name), { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Backup is incomplete: ${name}`);
   }
-  configCoordination.assertNoProfileLocks(path.join(source, 'dsh-home'));
+  // 只判定、不归档：source 是只读备份快照，归档会把写操作藏在「恢复前校验」后面。
+  configCoordination.assertNoProfileLocks(path.join(source, 'dsh-home'), { mutate: false });
   const targets = [
     ['dsh-home', dataPath(dataDir, 'dsh-home')],
     ['workspace', dataPath(dataDir, 'workspace')]
@@ -1445,6 +1460,39 @@ function atomicPatchWriteUnlocked(file, content, options) {
   }
 }
 
+// 无锁原子文本替换：读 → transform(text) → 写同目录 tmp → fsync → rename。
+// 给 plugins.js 里就地 writeFileSync 的旁表（.modules.yaml 的 storeDir、
+// cordis.patch.yml 的摘行）用：硬杀不会再留下半截文件 —— 而「可能半截」正是
+// 配置锁拒绝自动回收的理由，二者必须一起消除。
+// 调用方若已持有该 profile 的配置锁（plugins.js 多数路径如此），本函数不加锁，
+// 只保证替换的原子性；不加锁就读写的调用点由调用方自己保证互斥。
+function atomicTextReplace(file, transform, options = {}) {
+  const text = fs.readFileSync(file, 'utf8');
+  const next = transform(text);
+  if (typeof next !== 'string') throw new Error('原子替换的回调必须返回字符串');
+  if (next === text) return { changed: false, text };
+  const mode = options.mode ?? (fs.statSync(file).mode & 0o777);
+  const tmp = inside(path.dirname(file), `${file}.tmp-${randomBytes(16).toString('hex')}`);
+  let fd, owned = false;
+  try {
+    fd = fs.openSync(tmp, 'wx', mode);
+    owned = true;
+    fs.writeFileSync(fd, next, { encoding: 'utf8' });
+    fs.fsyncSync(fd);
+    fs.closeSync(fd); fd = undefined;
+    fs.renameSync(tmp, file);
+    const parentFd = fs.openSync(path.dirname(file), 'r');
+    try { fs.fsyncSync(parentFd); } catch { /* 目录 fsync 失败不改变已完成的重命名 */ } finally { fs.closeSync(parentFd); }
+    return { changed: true, text: next };
+  } catch (error) {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* 已关闭 */ } }
+    if (owned) {
+      try { fs.unlinkSync(tmp); } catch (cleanupError) { if (cleanupError.code !== 'ENOENT') error.cleanupError = cleanupError; }
+    }
+    throw error;
+  }
+}
+
 function writePatchConfig(dataDir, text, yamlModule, profile = 'web', options = {}) {
   const directory = patchProfileDir(dataDir, profile);
   if (!fs.existsSync(directory)) throw new Error(`配置档目录不存在，无法写入 patch：${directory}（profile=${profile}）`);
@@ -1501,4 +1549,4 @@ function disablePatchConfig(dataDir, yamlModule, profile = 'web') {
   return writePatchConfig(dataDir, PATCH_EMPTY, yamlModule, profile);
 }
 
-module.exports = { dataPath, readJson, writeJson, appVersion, dshVersion, listBackups, backupSettings, saveBackupSettings, snapshotFingerprint, createSnapshot, restoreSnapshot, diagnosePluginWiring, diagnosePluginSettings, scanBrokenSymlinks, scanCorruptSessions, repairPluginWiring, sessionArchiveStatus, markSessionsArchived, initEmptySessionArchive, scanSessions, archiveBeforeRestore, mergeSessionsFrom, prunePreRestoreArchives, promoteRuntime, portSettings, savePorts, readPatchConfig, listPatchBackups, newestValidPatchBackup, syncFallbackLayer, quarantineShadowedCorePackages, syncExemptions, rememberExemption, validatePatchText, atomicPatchWrite, writePatchConfig, restorePatchConfig, disablePatchConfig, backupPatchConfig, normalizeEmptyPatchArray, disablePatchEntries, diagnosePatchLayer, repairPatchLayerText, findDuplicatePatchIds, dedupePatchEntriesText, PATCH_EMPTY };
+module.exports = { dataPath, readJson, writeJson, appVersion, dshVersion, listBackups, backupSettings, saveBackupSettings, snapshotFingerprint, createSnapshot, restoreSnapshot, diagnosePluginWiring, diagnosePluginSettings, scanBrokenSymlinks, scanCorruptSessions, repairPluginWiring, sessionArchiveStatus, markSessionsArchived, initEmptySessionArchive, scanSessions, archiveBeforeRestore, mergeSessionsFrom, prunePreRestoreArchives, promoteRuntime, portSettings, savePorts, readPatchConfig, listPatchBackups, newestValidPatchBackup, syncFallbackLayer, quarantineShadowedCorePackages, syncExemptions, rememberExemption, validatePatchText, atomicPatchWrite, atomicTextReplace, writePatchConfig, restorePatchConfig, disablePatchConfig, backupPatchConfig, normalizeEmptyPatchArray, disablePatchEntries, diagnosePatchLayer, repairPatchLayerText, findDuplicatePatchIds, dedupePatchEntriesText, PATCH_EMPTY };

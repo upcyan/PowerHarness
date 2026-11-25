@@ -28,7 +28,8 @@ const SUPERVISOR_ACTIONS = [
   'save-patch-config', 'disable-patch-config', 'restore-patch-config',
   'heal-patch-layer', 'dedupe-patch-layer', 'disable-third-party-plugins',
   'repair-plugin-files', 'repair-plugin-wiring', 'sync-module-resolution', 'restore-exemptions',
-  'snapshot-sessions', 'restart-all',
+  'snapshot-sessions', 'restart-all', 'save-setup',
+  'reconfigure-directories', 'confirm-reconfigure-directories', 'cancel-reconfigure-directories',
   'run-terminal-command', 'enter-diagnosis', 'exit-diagnosis'
 ];
 
@@ -53,6 +54,7 @@ const DESTRUCTIVE = {
   'restore': '恢复备份：DSH 的设置、会话与私有工作区会被快照内容**替换**，此后的改动将丢失。',
   'confirm-restore': '恢复备份：DSH 的设置、会话与私有工作区会被快照内容**替换**，此后的改动将丢失。',
   'restart': '重启 DSH 核心：当前会话会暂时断开，正在进行的对话与任务会被中断。',
+  'confirm-reconfigure-directories': '确认改配数据目录：新数据/备份目录里的所有内容会先移入可恢复隔离区，再复制旧数据；复制校验与配置保存完成后，旧数据也移入可恢复隔离区。仅暂停本实例核心，切换目录时网关会短暂重启。',
   'run-terminal-command': '在服务器上执行命令：以应用身份运行，可读写应用数据目录。'
 };
 

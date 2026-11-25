@@ -5,41 +5,10 @@
       {
         "type": "tips",
         "helpText": "需要Node.js v24。核心基础功能随包提供，可选插件在后续步骤自行选择，默认不安装。"
-      }
-    ]
-  },
-  {
-    "stepTitle": "数据与备份目录",
-    "items": [
+      },
       {
         "type": "tips",
-        "helpText": "推荐使用两个独立NAS用户目录。重装/升级时保留原目录与全部数据，直接下一步即可。首次安装后请在应用中心 → DeepSeek Harness → 访问权限中授予两目录父目录读写权限（重装后需重新授权）；未授权将在启动时明确提示与修复指引，不会自动修改ACL或换用临时目录。"
-      },
-      {
-        "type": "text",
-        "field": "wizard_data_dir",
-        "label": "数据目录",
-        "initValue": "/vol1/1000/DSH-Data/dsh-fnos",
-        "helpText": "包含设置、会话、私有工作区及插件数据；支持自定义NAS绝对路径。",
-        "rules": [
-          {
-            "required": true,
-            "message": "请输入数据目录"
-          }
-        ]
-      },
-      {
-        "type": "text",
-        "field": "wizard_backup_dir",
-        "label": "备份目录",
-        "initValue": "/vol1/1000/DSH-Recovery/dsh-fnos",
-        "helpText": "必须与数据目录独立，不得相同或互相包含。支持自定义NAS绝对路径。",
-        "rules": [
-          {
-            "required": true,
-            "message": "请输入备份目录"
-          }
-        ]
+        "helpText": "数据目录与备份目录不再在安装时指定：安装阶段既拿不到目录授权，也无法验证目录真的可写，填了也只是一串字。安装完成后第一次启动应用时，会直接显示目录配置页，在那里选目录、当场验证授权，验证不通过就不会启动核心。"
       }
     ]
   }

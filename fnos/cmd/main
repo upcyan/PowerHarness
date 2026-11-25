@@ -238,7 +238,13 @@ cleanup_failed_start() {
   local token="$1"
   if [ -n "$token" ]; then
     echo "DeepSeek Harness: start failed; stopping launch generation $token" >> "$LOG_FILE"
-    stop_tokens "$token" 20 || return 1
+    # Grace must EXCEED the supervisor's own shutdown budget (20s) plus its
+    # 2s hard-exit backstop = 22s. At 20s we SIGKILLed the supervisor right
+    # before it could release the config lock, and every subsequent start then
+    # hit ERR_CONFIG_LOCKED (permanent safe mode). 30s leaves margin for the
+    # CLI-cancel and lock-release path to finish. Keep in sync with
+    # SHUTDOWN_BUDGET_MS in supervisor.js.
+    stop_tokens "$token" 30 || return 1
   fi
   # Do not return early just because the supervisor has already crashed.
   reclaim_own_stragglers || return 1
@@ -251,10 +257,15 @@ case "${1:-}" in
     # flock locks a persistent inode (never delete this file). Close fd 9 in
     # spawned supervisor so a daemon cannot keep the instance lock forever.
     if [ "${1}" = stop ] && [ ! -d "$DATA_DIR" ]; then exit 0; fi
-    # Authorization must precede mkdir, chmod, lifecycle lock and log creation.
-    if [ "$1" = start ] && [ -f "$APP_DIR/install-options-cli.js" ]; then
-      node "$APP_DIR/install-options-cli.js" check > "${TRIM_TEMP_LOGFILE:-/dev/stderr}" 2>&1 || exit 1
-    fi
+    # 目录授权不再由这里拦（2026-11-10）。早先这里跑一次 check 并直接退出，导致
+    # 应用「已启用却没有任何进程」，用户只看到 bad gateway。问题在于「没配置目录」
+    # 和「配置了但没授权」被混成一件事，而启动脚本只能表达「别启动」，没法让用户
+    # 就地选目录 —— 用户永远只看到一句「去应用中心授权」，改不了配置。
+    #
+    # 现在统一由 supervisor 的 setup 模式承接（app/supervisor.js 的 setupBlockReason）：
+    # 没配置目录、或配置了但授权/可写性不过，supervisor 只起网关并渲染目录配置页，
+    # 用户当场选目录、当场验证，验不过就不 spawn 核心。启动脚本照常放行，这样
+    # 应用中心里点「启用」总能进到页面，而不是卡成一具没有进程的「运行中」。
     mkdir -p -- "$DATA_DIR" && chmod 700 "$DATA_DIR" || exit 1
     [ ! -L "$DATA_DIR/lifecycle.lock" ] || exit 1
     exec 9>"$DATA_DIR/lifecycle.lock" || exit 1

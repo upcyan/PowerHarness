@@ -1,0 +1,33 @@
+[
+  {
+    "stepTitle": "数据与备份目录",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "修改后保存，应用会在运行检查时自动把数据与备份迁移到新目录：迁移期间核心暂停（约 1-5 分钟，视数据量而定），完成后应用自动重启。若新目录已有内容，会先在管理控制台展示「将要覆盖什么」，需要你确认后才执行。<br><br>目录请使用 NAS 上的独立目录，<b>不要</b>用 /vol1/@appdata、/vol1/@appshare、/vol1/@appcenter、/var/apps —— 那些是飞牛应用目录，卸载会被清空。<br><br>路径请直接手工输入，不要让输入框弹出「选择文件夹」（第三方应用无该权限）。<br><br>改完如遇启动失败，请到「应用中心 → DeepSeek Harness → 访问权限」确认目录已授权读写。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "数据目录",
+        "initValue": "/vol1/1000/DSH-Data/dsh-fnos",
+        "helpText": "会话、设置、插件与备份索引都放在这里。改成本机其他路径后保存即触发迁移。",
+        "rules": [
+          { "pattern": "^$|^/.*", "message": "必须是绝对路径（以 / 开头）或留空" },
+          { "pattern": "^(?!/vol[0-9]+/@app)(?!/var/apps).*$", "message": "不能放在 @appdata、@appshare、@appcenter 或 /var/apps 下——卸载应用会删除这些目录" }
+        ]
+      },
+      {
+        "type": "text",
+        "field": "wizard_backup_dir",
+        "label": "备份目录",
+        "initValue": "/vol1/1000/DSH-Recovery/dsh-fnos",
+        "helpText": "升级/回滚快照与手动备份的存放位置。建议与数据目录分开（不同物理盘更佳）。",
+        "rules": [
+          { "pattern": "^$|^/.*", "message": "必须是绝对路径（以 / 开头）或留空" },
+          { "pattern": "^(?!/vol[0-9]+/@app)(?!/var/apps).*$", "message": "不能放在 @appdata、@appshare、@appcenter 或 /var/apps 下" }
+        ]
+      }
+    ]
+  }
+]

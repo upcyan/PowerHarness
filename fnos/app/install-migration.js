@@ -14,7 +14,12 @@ function ordinary(p){const s=stat(p);if(!s||!s.isDirectory()||s.isSymbolicLink()
 function trustedSource(legacy,env){if(!env.TRIM_PKGVAR||!path.isAbsolute(env.TRIM_PKGVAR))throw new Error('缺少平台旧数据路径');const source=ordinary(legacy),expected=ordinary(env.TRIM_PKGVAR);if(source!==expected)throw new Error('迁移源不等于平台TRIM_PKGVAR');return source;}
 function hasRealData(root){return ITEMS.some(n=>{const s=stat(path.join(root,n));return s&&(s.isFile()||(s.isDirectory()&&fs.readdirSync(path.join(root,n)).length));});}
 function cold(roots,app){for(const root of roots){if(owner.ownedProcesses(root,app).length)throw new Error('应用仍在运行，拒绝迁移');const home=path.join(root,'dsh-home');if(stat(home)){const scan=p=>{for(const ent of fs.readdirSync(p,{withFileTypes:true})){const child=path.join(p,ent.name);if(ent.isDirectory())scan(child);else if(ent.name.endsWith('.lock')||ent.name.endsWith('.writing'))throw new Error('旧数据存在写锁，拒绝迁移');}};scan(home);}}}
-function authorised(record,env){const status=options.check(record,env,{create:false});if(!status.ok)throw new Error(status.issues.map(x=>x.message).join('; '));const parent=path.dirname(record.dataDir);if(!options.grants(env).some(r=>within(r,parent)))throw new Error('原子迁移需授权数据目录父目录读写');fs.accessSync(parent,fs.constants.R_OK|fs.constants.W_OK|fs.constants.X_OK);}
+// 目标目录能不能用，只认真实 syscall 的结果。
+// 原先这里还查 TRIM_DATA_ACCESSIBLE_PATHS（父目录必须在授权表里），但那份列表是
+// supervisor 启动那一刻的快照：用户在应用中心刚勾完授权时，运行中的进程还拿着旧
+// 表，迁移会被「请先在应用中心授权」挡回去，而实际上早就授权了（2026-11-17）。
+// 真没授权的话，check 里的读写探针和下面 parent 的 access 会直接给出 EACCES/EPERM。
+function authorised(record,env){const status=options.check(record,env,{create:false});if(!status.ok)return {ok:false,code:'not-authorized',issues:status.issues};const parent=path.dirname(record.dataDir);try{fs.accessSync(parent,fs.constants.R_OK|fs.constants.W_OK|fs.constants.X_OK);}catch(error){return {ok:false,code:'parent-not-writable',message:error.code||String(error)};}return {ok:true};}
 function inventory(root){const out={};const walk=(p,rel)=>{const s=stat(p);if(!s)return;if(s.isSymbolicLink()){out[rel]={type:'link',link:fs.readlinkSync(p)};}else if(s.isDirectory()){out[rel]={type:'dir'};for(const n of fs.readdirSync(p).sort())walk(path.join(p,n),rel?rel+'/'+n:n);}else if(s.isFile()){out[rel]={type:'file',hash:hash(p),mode:s.mode&0o111};}else throw new Error('拒绝迁移特殊文件');};walk(root,'');return out;}
 function fingerprint(root){return JSON.stringify(inventory(root));}
 function linkTarget(src,legacy,target){const link=fs.readlinkSync(src),absolute=path.resolve(path.dirname(src),link);return within(legacy,absolute)?path.join(target,path.relative(legacy,absolute)):fs.realpathSync(absolute);}
@@ -34,7 +39,7 @@ function migrate({legacy,target,backupDir,controlDir,env=process.env,appDir=__di
  // a migration: do not demand parent rename grants or scan stale legacy locks.
  // Trust, path independence and unresolved transaction guards above still apply.
  if(preserveExisting&&stat(dest)&&hasRealData(dest))return {migrated:false,reason:'configured-target-preserved'};
- const record={dataDir:dest,backupDir:backup,selectedPlugins:[]};authorised(record,env);cold([source,dest],appDir);
+ const record={dataDir:dest,backupDir:backup,selectedPlugins:[]};const auth=authorised(record,env);if(!auth.ok)return {migrated:false,reason:'destination-not-authorized',detail:auth};cold([source,dest],appDir);
  if(stat(dest)&&hasRealData(dest)){if(preserveExisting)return {migrated:false,reason:'configured-target-preserved'};throw new Error('目标已使用，拒绝覆盖');}
  const fd=fs.openSync(lock,'wx',0o600);fs.fchmodSync(fd,0o600);let stage=null,previous=null,moved=false,committed=false,confirmed=false,entry=null;
  try{
@@ -56,4 +61,4 @@ function migrate({legacy,target,backupDir,controlDir,env=process.env,appDir=__di
   throw error;
  }finally{fs.closeSync(fd);if((!moved&&!committed)||confirmed)fs.unlinkSync(lock);}
 }
-module.exports={migrate,backupNew,hasRealData,trustedSource,inventory,MARKER};
+module.exports={migrate,backupNew,hasRealData,trustedSource,inventory,MARKER,ITEMS,copy,verify};

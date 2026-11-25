@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 const { spawn, fork } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
@@ -15,6 +16,9 @@ const diagnostics = require('./diagnostics.js');
 const grants = require('./grants.js');
 const dockerAccess = require('./docker-access.js');
 const portOwner = require('./port-owner.js');
+const installOptions = require('./install-options.js');
+const installMigration = require('./install-migration.js');
+const directoryReconfigure = require('./directory-reconfigure.js');
 
 const appDir = process.env.FNOS_APP_DIR;
 const dataDir = process.env.FNOS_DATA_DIR;
@@ -25,6 +29,10 @@ const portReplies = new Map();
 function effectivePublicPort() { return ops.portSettings(dataDir).publicPort || manifestPortEnv; }
 let corePort = ops.portSettings(dataDir).corePort;
 if (!appDir || !dataDir || !guideSocket) throw new Error('Missing fnOS application paths');
+// 本进程启动时刻（2026-11-18）：fnOS 的授权环境变量只在启动进程时注入一次，进程内
+// 不会刷新。要判断「授权是在本次启动之后才落地的」，就必须有一个启动时刻做基准，
+// 否则只能说"可能过期"，没人会为"可能"去重启一个正在用的应用。
+const bootStartedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
 
 // ── PATH 兜底：把 runtime 的 .bin 放到本进程 PATH 最前（0.3.61）─────────────
 // 根因：fnOS 应用启动 supervisor 时的 PATH 是
@@ -126,7 +134,17 @@ let gateway = null;
 let activeDir = appDir;
 let stopping = false;
 let shuttingDown = false;
+let directorySwitchPending = false;
 let gatewayRestartTimer = null;
+// 网关重启退避（2026-11-08，P0）：旧实现固定 1 秒重启、无次数上限 —— gateway 若因
+// 配置损坏等原因持续崩溃，就是每秒 fork 一次的死循环，日志与 CPU 一起爆掉，而且管理
+// 页永远不给出「它坏了」的信号。改为指数退避 + 上限；稳定运行 60 秒才清零计数。
+let gatewayRestartAttempt = 0;
+let gatewayStableTimer = null;
+const gatewayRestartBaseDelay = 1_000;
+const gatewayRestartMaxDelay = 30_000;
+const gatewayRestartLimit = 10;
+const gatewayStableAfterMs = 60_000;
 const startupCancels = new WeakMap();
 let expectedDshStop = false;
 let cleanExitRestarts = 0;
@@ -136,8 +154,83 @@ const cleanExitRestartLimit = 3;
 const cleanExitRestartDelay = 5_000;
 const cleanExitResetAfter = 10 * 60_000;
 let operation = Promise.resolve();
+
+// execve 之前必须把 operation 链断开。
+//
+// 为什么：operation 是一条 promise 串行链（`operation = operation.catch(…).then(…)`），
+// 它挂在当前这条命令自己的 promise 上。而 execve 是**原地替换进程镜像** ——
+// 实测（2026-11-16）：替换后新镜像里的 operation 链**仍然是堵的**，排在后面的
+// 管理命令永远不执行（表现：管理页任何按钮点下去都没反应，命令既不报错也不返回；
+// supervisor 侧能看到消息到达、守卫全过，但 runCommand 从没被调用）。
+//
+// 原因不是「新模块的 operation 变量没重置」，而是那条**永不 settle 的 promise**
+// （execve 那一刻正在执行的那条命令自己）随 V8 微任务队列一起被继承了。
+//
+// 修法：execve 之前把链置空，让新镜像从干净的 Promise.resolve() 起步。
+function detachOperationChain() {
+  operation = Promise.resolve();
+}
+
+// execve 之前必须把**实例标记**重新绑到新镜像实际使用的数据目录。
+//
+// 为什么（2026-11-16 事故，实例 A 起不来）：process.execve 是**原地替换进程
+// 镜像**，新镜像原样继承 process.execArgv。而 execArgv 里带着
+// `--require <dataDir>/.fnos-instance.cjs` —— 那是 port-owner.js 用来判断
+// 「这个进程是不是我家的」的实例标记。
+//
+// 数据目录一变（保存设置 / 切换目录），execArgv 里仍是**旧目录**的标记，而
+// FNOS_DATA_DIR 已经指向**新目录**。于是换镜像后的 supervisor 过不了归属判定
+//（port-owner.js 的 processIdentity 要求每个标记都等于 path.join(dataDir, markerName)），
+// cmd/main 的归属扫描看不见它 ⇒ 平台以为「没在运行」⇒ **又拉起第二个 supervisor**。
+//
+// 两个 supervisor 的后果不是"重复而已"：它们轮转同一份 gateway.log（rename
+// ENOENT，先坏的那个掉进 safe 模式）、抢同一个公网端口（EADDRINUSE）。输的那个
+// 每 30 秒重试一次网关，撞满 10 次后往**共享的** state.json 里写
+// mode:'maintenance' —— 结果核心与网关都好着，桌面图标却打不开。
+//
+// 修法：execve 之前把标记改写成新镜像真正在用的那个数据目录的标记。
+// 传 targetDataDir 而不是直接用模块级 dataDir：改目录的分支里模块级 dataDir
+// 还是旧值，新目录是 record.dataDir。
+function execveArgsFor(targetDataDir, execArgv = process.execArgv) {
+  // markerName 没有从 port-owner.js 导出（那边只导出 instancePreload），
+  // 这里从它生成的完整路径反推，避免两处硬编码文件名各写一遍。
+  const marker = portOwner.instancePreload(targetDataDir);
+  const markerName = path.basename(marker);
+  const out = [];
+  for (let i = 0; i < execArgv.length; i += 1) {
+    const arg = execArgv[i];
+    if (arg === '--require' || arg === '-r') {
+      const next = execArgv[i + 1];
+      if (typeof next === 'string' && path.basename(next) === markerName) {
+        out.push(arg, marker);
+        i += 1;
+        continue;
+      }
+      out.push(arg);
+      continue;
+    }
+    if (arg.startsWith('--require=')) {
+      if (path.basename(arg.slice('--require='.length)) === markerName) {
+        out.push('--require=' + marker);
+        continue;
+      }
+      out.push(arg);
+      continue;
+    }
+    out.push(arg);
+  }
+  // argv 里一个标记都没有：新镜像就成了「无主」进程，cmd/main 会再拉一个
+  // supervisor。补一个，保证新镜像始终绑定本实例。
+  if (!out.some((arg) => typeof arg === 'string' && path.basename(arg) === markerName)) {
+    out.push('--require', marker);
+  }
+  return out;
+}
+
+
 let dailyTimer;
 let sessionTimer;
+let reconfigureRequestTimer;
 let updateTimer;
 // Set when an operation changed data and the core then refused to start, so
 // the administrator can decide whether to roll the data back. Automatic
@@ -145,6 +238,11 @@ let updateTimer;
 // failure was transient (a slow first render, a rejected npm call that had
 // written nothing). See docs/design.md.
 let pendingRestore = null;
+
+// 待确认的目录改配（2026-11-16）。新数据目录非空时，先把「要覆盖什么」摆给
+// 用户看，等他明确确认后才执行「清空新目录 → 复制旧数据 → 删除旧目录」。
+// 与 pendingRestore 同构：模块内状态 + publish 出去，页面据此渲染确认条。
+let pendingReconfigure = null;
 
 // 维护态说明（0.3.62，用户反馈）：原先 14 处 `publish({ mode: 'maintenance',
 // error: null })` 只让界面显示「维护中」——用户不知道程序在做什么、要等多久。
@@ -166,13 +264,116 @@ function publishMaintenance(text, etaSeconds) {
   });
 }
 
+// setup 模式判定：没有 install-options.json，或写了但当前授权/可写性不过。
+// 返回 null 表示可以正常启动；否则返回要显示在配置页上的原因（'' = 还没配过）。
+// create:false —— 启动期只验证，绝不替用户建目录：卷没挂上时建出来的空目录会
+// 让核心带着空数据启动，比不启动更糟。
+function setupBlockReason() {
+  const controlDir = configDir || dataDir;
+  try { const reason=directoryReconfigure.blocked(controlDir);if(reason)return reason; }catch(error){return '迁移事务无法读取：'+error.message;}
+  let stored;
+  try { stored = installOptions.read(controlDir); }
+  catch (error) { return `安装设置无法读取：${error.message}`; }
+  if (!stored) return '';
+  const status = installOptions.check(stored, process.env, { create: false });
+  if (status.ok) return null;
+  return status.issues.map(issue => `${issue.path}：${issue.code === 'not-authorized' ? '尚未授权给应用账号' : issue.code === 'missing' ? '目录不存在（卷未挂载？）' : issue.code === 'not-owned' ? '目录属主不是应用账号，无法修改其权限（请换一个目录）' : '当前不可写'}`).join('；');
+}
+
+// setup 期间的重检循环（2026-11-10）。
+// 只在 setup 态运行；判定通过后走 restart-all（换镜像重启），而不是原地 spawn 核心，
+// 因为 dataDir 可能已经变了，很多模块级常量是按旧目录算的，必须重启进程。
+let setupWatchTimer = null;
+let setupRestarting = false;
+
+// 按已落盘的配置换镜像重启（setup 态唯一的正式出口）。
+//
+// 为什么是「换镜像」而不是原地 spawn 核心：dataDir 是模块级常量，核心、网关、
+// 状态文件、PID 文件全挂在它上面；原地改一半会留下两套路径互相打架。
+//
+// 为什么先停网关再 execve：execve 只替换镜像，不保证旧监听 socket 立刻释放。
+// 冒进的结果是新镜像 EADDRINUSE → 每 30 秒重试网关 → 撞满 10 次往**共享的**
+// state.json 写 maintenance，核心好着但桌面图标打不开（见 execveArgsFor 注释）。
+//
+// 失败必须自己退回来：留在 setup 态、恢复网关、重新起轮询，绝不能把应用留在
+// 「没有网关也没有核心」的真空里。
+async function restartAfterSetup() {
+  if (setupRestarting || stopping || shuttingDown) return;
+  setupRestarting = true;
+  if (setupWatchTimer) clearInterval(setupWatchTimer);
+  setupWatchTimer = null;
+  try {
+    const record = installOptions.read(configDir || dataDir);
+    if (!record) throw new Error('尚未保存目录配置');
+    // 落盘之后再验一次，而不是信任调用方：轮询、保存表单、失败重试三条路都会
+    // 走到这里，只有复查过才敢真正换镜像。
+    const status = installOptions.check(record, process.env, { create: false });
+    if (!status.ok) throw new Error('目录尚未通过真实读写检查');
+    log('setup restart: replacing process image, data=' + record.dataDir);
+    // 标记必须指向 cmd/main 认定的数据目录（= install options 里那个），否则新镜像
+    // 过不了 port-owner 的归属判定，平台会再拉一个 supervisor。
+    // 同时把 env 对齐，避免「env 说新目录、标记说旧目录」这种半新半旧状态。
+    process.env.FNOS_DATA_DIR = record.dataDir;
+    process.env.FNOS_BACKUP_DIR = record.backupDir;
+    process.env.DSH_HOME = ops.dataPath(record.dataDir, 'dsh-home');
+    try { publish({ mode: 'maintenance', error: null, operation: { text: '目录已通过检查，正在按新目录启动…' } }); }
+    catch { /* 状态写失败不影响重启 */ }
+    stopping = true;
+    // 2026-11-18：execve 换镜像不再先停 gateway。gateway 收到 maintenance-hold 后
+    // 保持监听并回答「正在切换」维护页（5 秒自动刷新），fnOS 反代不再裸 Bad Gateway。
+    // 旧 gateway 由新镜像 boot 的 reclaimGatewayPort 回收（同实例归属判定，亚秒级），
+    // 随后新 gateway 接管监听。
+    try { if (gateway && gateway.connected) gateway.send({ type: 'maintenance-hold', text: '正在按新目录启动核心…' }); } catch { /* gateway 已退出则无从发送 */ }
+    detachOperationChain();
+    process.execve(process.execPath, [process.execPath, ...execveArgsFor(record.dataDir), __filename], gitEnv.normalizeGitParentEnv(process.env));
+    throw new Error('execve returned without replacing the process image');
+  } catch (error) {
+    log('setup restart failed: ' + error.message + '; back to setup with polling');
+    stopping = false;
+    setupRestarting = false;
+    try { if (gateway && gateway.connected && !exited(gateway)) gateway.send({ type: 'maintenance-release' }); } catch { /* gateway 已退出 */ }
+    try { startGateway(); } catch (startError) { log('setup restart gateway recovery failed: ' + startError.message); }
+    try { publish({ mode: 'setup', error: '目录已保存，但自动启动失败：' + error.message + '。本页会继续每 4 秒重试；也可以去应用中心停用后重新启用本应用。' }); }
+    catch { /* 页面下次刷新会重读 state.json */ }
+    startSetupWatch();
+  }
+}
+
+function startSetupWatch() {
+  if (setupWatchTimer || stopping || shuttingDown) return;
+  const TICK = 4000;
+  setupWatchTimer = setInterval(() => {
+    if (stopping || shuttingDown || setupRestarting) return;
+    if (state.mode !== 'setup') { clearInterval(setupWatchTimer); setupWatchTimer = null; return; }
+    let reason;
+    try { reason = setupBlockReason(); }
+    catch (error) { log('setup recheck failed: ' + error.message); return; }
+    // reason === '' 表示「还没配置」——这种情况只有用户提交表单才能推进，
+    // 轮询没有意义；用户点「保存并验证」那条 POST 会自己走完。
+    // 只有「配了但授权/可写性不过」才值得定期重检：用户可能刚去应用中心勾完权限。
+    if (reason === '') return;
+    if (reason !== null) {
+      // 仍未通过：把最新原因写回页面，让用户看到进度（例如从「未配置」变成「未授权」）。
+      if ((reason || null) !== (state.error || null)) {
+        try { publish({ mode: 'setup', error: reason || null }); } catch { /* 页面下次刷新会重读 */ }
+      }
+      return;
+    }
+    clearInterval(setupWatchTimer); setupWatchTimer = null;
+    log('setup satisfied: restarting for new data dir');
+    eventLog('setup_satisfied_restart', {});
+    void restartAfterSetup();
+  }, TICK);
+  if (setupWatchTimer.unref) setupWatchTimer.unref();
+}
+
 function publish(patch) {
   const previousMode = state.mode;
   // pendingRestore lives in a module variable but must always be mirrored into
   // the published state: the management page renders the banner from
   // state.json, and a publish that forgot the field would silently hide a
   // decision the administrator still owes an answer to.
-  const merged = { ...state, ...patch, pendingRestore, updatedAt: new Date().toISOString() };
+  const merged = { ...state, ...patch, pendingRestore, pendingReconfigure, updatedAt: new Date().toISOString() };
   // 离开维护态即清除操作说明（避免"已就绪却仍显示正在安装插件"的残留）
   if (Object.hasOwn(patch, 'mode') && patch.mode !== 'maintenance') merged.operation = null;
   else if (patch.mode === 'maintenance' && !Object.hasOwn(patch, 'operation')) merged.operation = state.operation || null;
@@ -284,6 +485,140 @@ async function startsAsIs() {
 // 仅规范化继承的Git配置；常驻core/gateway不得注入安装SSH改写。
 const gitEnv = require('./git-transport.js');
 
+// fnOS 应用设置页目录改配请求消费（2026-11-17）。config_callback 把新目录写进
+// <configDir>/reconfigure-request.json；这里轮询消费。事务链与 IPC reconfigure-directories
+// 分支一致：plan → 非空目标摆 pendingReconfigure（去控制台确认）→ 空目标直接 apply。
+// apply 成功后的进程重绑与 IPC 分支相同（execveArgsFor + execve，失败回滚恢复网关）。
+const RECONFIGURE_REQUEST_FILE = 'reconfigure-request.json';
+async function consumeReconfigureRequest() {
+  if (stopping || shuttingDown || directorySwitchPending || pendingReconfigure) return;
+  if (!configDir) return;
+  const file = path.join(configDir, RECONFIGURE_REQUEST_FILE);
+  let request;
+  try { request = ops.readJson(file); } catch (error) { if (error.code !== 'ENOENT') log(`reconfigure request unreadable: ${error.message}`); return; }
+  if (!request || typeof request !== 'object') return;
+  const dataDir2 = String(request.dataDir || '').trim();
+  const backupDir2 = String(request.backupDir || '').trim();
+  if (!dataDir2 && !backupDir2) { fs.rmSync(file, { force: true }); return; }
+  // 请求必须来自设置页的完整快照：两个字段都给（与 install-options 一致），单字段请求拒收防误触发。
+  if (!dataDir2 || !backupDir2) { log('reconfigure request ignored: incomplete fields'); return; }
+  if (dataDir2 === dataDir && backupDir2 === (process.env.FNOS_BACKUP_DIR || installOptions.defaults.backupDir)) {
+    fs.rmSync(file, { force: true }); return; // 已是当前配置（重复投递或回声）
+  }
+  const input = { dataDir: dataDir2, backupDir: backupDir2, currentDataDir: dataDir, currentBackupDir: process.env.FNOS_BACKUP_DIR || installOptions.defaults.backupDir, controlDir: configDir, appDir, env: process.env };
+  let planned;
+  try { planned = await directoryReconfigure.run('plan', input); }
+  catch (error) { log(`reconfigure request plan failed: ${error.message}`); return; }
+  if (!planned.ok) { fs.rmSync(file, { force: true }); log(`reconfigure request rejected: ${planned.message}`); eventLog('reconfigure_request_rejected', { dataDir: dataDir2, message: planned.message }); return; }
+  if (planned.needsConfirmation) {
+    // 新目录非空：按主流程摆确认条，由管理员在管理控制台确认后走原 IPC confirm 链。
+    pendingReconfigure = { dataDir: dataDir2, backupDir: backupDir2, confirmation: planned.confirmation, existingItems: planned.existingItems, message: planned.message, createdAt: Date.now() };
+    publish({ pendingReconfigure });
+    log('reconfigure request: pending confirmation (non-empty target)');
+    return; // 保留请求文件直到确认/取消链清场
+  }
+  // 空目标：无需确认，直接 apply（与 IPC 分支同序列）。
+  fs.rmSync(file, { force: true });
+  log(`reconfigure request: applying switch to ${dataDir2}`);
+  let moved;
+  publishMaintenance('正在迁移数据与备份到应用设置指定的新目录；本实例核心暂停，控制台保持可访问');
+  try {
+    await stopDsh();
+    moved = await directoryReconfigure.run('apply', { ...input, confirmed: true, confirmation: planned.confirmation });
+  } catch (error) {
+    publish({ mode: 'safe', error: error.message });
+    if (!shuttingDown && !directoryReconfigure.blocked(configDir)) {
+      try { await startDsh(activeDir); await probeWeb(); publish({ mode: readyMode(), error: error.message }); }
+      catch (startError) { publish({ mode: 'safe', error: error.message + '；旧核心恢复失败：' + startError.message }); }
+    }
+    log(`reconfigure request apply failed: ${error.message}`);
+    return;
+  }
+  pendingReconfigure = null;
+  const record = moved.record;
+  directorySwitchPending = true;
+  clearTimeout(dailyTimer); clearTimeout(sessionTimer); clearInterval(updateTimer);
+  eventLog('reconfigure_request_applied', { dataDir: record.dataDir, backupDir: record.backupDir });
+  setTimeout(() => { void (async () => {
+    const previousEnv = { FNOS_DATA_DIR: process.env.FNOS_DATA_DIR, FNOS_BACKUP_DIR: process.env.FNOS_BACKUP_DIR, DSH_HOME: process.env.DSH_HOME };
+    try {
+      if (shuttingDown) return;
+      const execArgs = execveArgsFor(record.dataDir);
+      process.env.FNOS_DATA_DIR = record.dataDir; process.env.FNOS_BACKUP_DIR = record.backupDir; process.env.DSH_HOME = ops.dataPath(record.dataDir, 'dsh-home');
+      stopping = true;
+      // 2026-11-18：gateway 跨 execve 保活（maintenance-hold 维护页），不再停监听；
+      // 旧 gateway 由新镜像 boot 的 reclaimGatewayPort 回收后换新。
+      try { if (gateway && gateway.connected) gateway.send({ type: 'maintenance-hold', text: '正在按新目录切换…' }); } catch { /* gateway 已退出 */ }
+      if (shuttingDown) throw new Error('应用停止中，取消目录切换');
+      if (!await probeBindable(corePort)) throw new Error('核心端口尚未释放，已拒绝重复启动');
+      detachOperationChain();
+      process.execve(process.execPath, [process.execPath, ...execArgs, __filename], gitEnv.normalizeGitParentEnv(process.env));
+      throw new Error('execve returned');
+    } catch (error) {
+      for (const [key, value] of Object.entries(previousEnv)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      stopping = false;
+      if (gateway && gateway.connected && !exited(gateway)) try { gateway.send({ type: 'maintenance-release' }); } catch { };
+      if (!shuttingDown) try { startGateway(); } catch (startError) { log('迁移后网关恢复失败：' + startError.message); }
+      publish({ mode: 'safe', error: '新目录已保存，自动切换失败；控制台仍可使用。请安排在应用中心停用再启用：' + error.message });
+    }
+  })(); }, 600);
+}
+
+/**
+ * Derive the V8 old-space cap for the core process from the machine it boots
+ * on, so the same FPK behaves correctly after a hardware swap instead of
+ * carrying a number that was only right on the build/test box.
+ *
+ * Background (2026-11-24): the core sat at ~1.9 GB RSS with 927 MB of it
+ * swapped out on a 16 GB N150. Node's own default is ~1/4 of RAM capped at
+ * 4 GB (4288 MB here) — generous enough that the heap is allowed to grow far
+ * past the live set before a major GC is forced, which is exactly the shape
+ * that turns into swap churn on a small box. A cap tied to RAM keeps that
+ * ceiling honest while still scaling automatically with the hardware.
+ *
+ * The clamp is deliberately three-sided:
+ *   - floor 512 MB — below this a large plugin graph cannot boot at all;
+ *   - ceiling (RAM - 2 GB) — leaves the OS, the gateway, chrome-headless and
+ *     the PTC workers room to live, so the cap can never force the whole
+ *     machine into swap the way a fixed 4 GB did;
+ *   - never above `maxMiB` — the caller's absolute wish, which itself never
+ *     exceeds Node's own default so we only ever tighten, never loosen.
+ * An explicit DSH_CORE_MAX_OLD_SPACE_MB overrides everything (diagnosis and
+ * benchmarking need a hand-set value), and 0 disables the flag entirely.
+ * @param {number} totalMemBytes - physical RAM of this machine.
+ * @param {string|undefined} override - raw env override, if any.
+ * @returns {number|null} megabytes for --max-old-space-size, or null to omit it.
+ */
+function coreOldSpaceMiB(totalMemBytes, override) {
+  if (override !== undefined && override !== '') {
+    const explicit = Number(override);
+    if (Number.isFinite(explicit) && explicit >= 0) return explicit === 0 ? null : Math.round(explicit);
+    log('DSH_CORE_MAX_OLD_SPACE_MB is not a number; falling back to the derived cap');
+  }
+  const totalMiB = totalMemBytes / 1048576;
+  // Node's own default (1/4 of RAM, capped at 4 GiB) is the most we ever allow:
+  // we only ever tighten below it, never loosen above it.
+  const nodeDefault = Math.min(totalMiB / 4, 4096);
+  // What the core actually needs. Measured live set on this deployment is
+  // ~1.9 GB RSS with a large plugin graph and 199 sessions on disk; the heap
+  // only has to hold that plus room for a compaction/tool-result spike, so
+  // 1.6x the live set (~3 GB) is generous. Tying the cap to the workload
+  // rather than to RAM is what keeps the GC honest: the 4288 MB default let
+  // garbage pile up for minutes between major GCs, which is what pushed
+  // 900+ MB of the core into swap on a 16 GB box.
+  const WORKING_SET_MiB = 1900;
+  const HEADROOM_FACTOR = 1.6;
+  const wantMiB = WORKING_SET_MiB * HEADROOM_FACTOR;
+  // Leave this much for everything else on the box (gateway, chrome-headless,
+  // PTC workers, docker, and whatever else the NAS runs). A NAS is not a
+  // single-purpose container host, so the core must never be allowed to claim
+  // RAM the rest of the system needs — that is precisely what turns swap churn
+  // into a load average above 8.
+  const RESERVE_MiB = 2048;
+  const derived = Math.min(nodeDefault, wantMiB, totalMiB - RESERVE_MiB);
+  return Math.max(512, Math.round(derived));
+}
+
 function spawnDsh(directory, profileName = profiles.selected(dataDir), createProfile = false, { startupTimeoutMs = 90_000, attempt = 1 } = {}) {
   coreStopConfirmed = false;
   return new Promise((resolve, reject) => {
@@ -312,13 +647,45 @@ function spawnDsh(directory, profileName = profiles.selected(dataDir), createPro
     ];
     expectedDshStop = false;
     const workspace = ops.dataPath(dataDir, 'workspace');
-    try { grants.syncShortcuts(dataDir); }
-    catch (error) { log(`authorized directory shortcuts unavailable: ${error.message}`); }
+    // 授权快捷入口同步（2026-11-18 事故后不再静默）：
+    // 旧写法 try/catch 只写一行 supervisor 日志，而 supervisor.log 之外无人看，
+    // 于是"授权目录突然变空"在现场完全没有痕迹。现在无论成败都记一条带结论的
+    // 事实行，并把它落到 startup-reports 里，管理页与诊断都能读到。
+    try {
+      const synced = grants.syncShortcuts(dataDir, process.env.TRIM_DATA_ACCESSIBLE_PATHS || '', { startedAt: bootStartedAt });
+      const snap = synced.snapshot;
+      const summary = snap.present
+        ? `fnOS 授权快照：${snap.paths.length} 个目录；入口 ${synced.links.length} 个`
+        : `fnOS 授权快照为空（进程启动时平台未下发 TRIM_DATA_ACCESSIBLE_PATHS）；保留既有入口 ${synced.kept.length} 个，未删除任何链接`;
+      log(`authorized directory shortcuts: ${summary}`);
+      if (!snap.present && synced.links.length) log('authorized directory shortcuts: 若已在应用中心补授权，需停止并重新启动本应用才能让平台重新下发授权');
+    } catch (error) {
+      log(`authorized directory shortcuts unavailable: ${error.message}`);
+    }
     const localBins = path.join(appDir, 'runtime', 'node_modules', '.bin');
     const dshEnv = gitEnv.normalizeGitParentEnv(process.env);
     delete dshEnv.DOCKER_HOST;
     delete dshEnv.DOCKER_CONTEXT;
-    const child = spawn(process.execPath, ['--require', portOwner.instancePreload(dataDir), '--require', path.join(__dirname, 'workspace-home.cjs'), bin, ...args], {
+    // OpenAI 兼容网关的端口（2026-11-12）：默认写死 8326，同机跑第二个实例时
+    // 两边抢同一个端口，后启动的那个必然 EADDRINUSE（表现为
+    // 「[openai-gateway] 网关期望运行但未能监听」且该实例的网关功能整体不可用）。
+    //
+    // 这里按**实例的核心端口偏移**派生：A 的 corePort=3081 ⇒ 8326（与旧行为完全
+    // 相同），B 的 corePort=3091 ⇒ 8336。派生而非写死的好处是用户在 GUI 里改
+    // 内部核心端口后，网关端口会**自动跟随**，不会再次撞车。
+    //
+    // 只在派生值合法（1..65535）时注入；越界就退回默认端口，避免把非法端口
+    // 传给核心（providers-hub 的 config.js 会因非法端口显式抛错）。
+    {
+      const derivedGatewayPort = 8326 + (corePort - 3081);
+      if (Number.isInteger(derivedGatewayPort) && derivedGatewayPort > 0 && derivedGatewayPort <= 65535) {
+        dshEnv.DSH_OPENAI_GATEWAY_PORT = String(derivedGatewayPort);
+      }
+    }
+    const oldSpaceMiB = coreOldSpaceMiB(os.totalmem(), process.env.DSH_CORE_MAX_OLD_SPACE_MB);
+    const heapFlag = oldSpaceMiB === null ? [] : ['--max-old-space-size=' + oldSpaceMiB];
+    log('core heap cap: ' + (oldSpaceMiB === null ? 'node default' : oldSpaceMiB + ' MB') + ' (RAM ' + Math.round(os.totalmem() / 1048576) + ' MB)');
+    const child = spawn(process.execPath, [...heapFlag, '--require', portOwner.instancePreload(dataDir), '--require', path.join(__dirname, 'workspace-home.cjs'), bin, ...args], {
       cwd: workspace,
       env: { ...dshEnv, ...dockerAccess.dshEnvironment(dataDir), DSH_HOME: dshHome || ops.dataPath(dataDir, 'dsh-home'), FNOS_WORKSPACE_HOME: workspace,
         PATH: `${localBins}${path.delimiter}${process.env.PATH || ''}`,
@@ -362,15 +729,58 @@ function spawnDsh(directory, profileName = profiles.selected(dataDir), createPro
     //     期间也不会误杀，因为模块加载会持续输出）；
     //   · **总上限** —— 无论是否有输出，超过 maxStartupMs 仍未就绪即失败，避免
     //     「一直缓慢输出但永不就绪」无限等待（如 12 条 pending 那种情形）。
-    const idleTimeoutMs = startupTimeoutMs;
-    // 硬上限：无论是否有输出都不超过 10 分钟（防止「缓慢输出但永不就绪」无限等待）。
+    // 空转上限固定 90 秒（2026-11-08，P0 修同值 bug）：此前 idleTimeoutMs 与
+    // maxStartupMs 都等于 startupTimeoutMs —— 首次尝试两者同为 90 秒，冷启动重试时
+    // 同为 600 秒，于是「空转判据」在重试时形同虚设：真卡死的核心要白等 10 分钟。
+    //
+    // ⚠ 2026-11-13 修正：上面那条「固定 90 秒」的前提是「冷启动期间模块加载会持续
+    // 输出」，但**宿主重启后的冷缓存**下并非如此 —— 实测核心要 115 秒才打印第一行
+    // （11-10 记录），此前一行都没有。于是宿主重启后首启必然被判 stall；而二次重试
+    // 虽然拿到 600 秒总预算，空转判据仍是 90 秒，**照样失败** ⇒ 每次宿主重启后两个
+    // 实例都会双双进安全模式（2026-11-13 00:11/00:07、00:41/00:37 实测同因同果：
+    // 两次都是「dsh startup stalled: no output for 90 seconds」）。
+    //
+    // ✅ 修法：**空转上限随尝试次数放宽**，而不是固定。
+    //   · 首次尝试 150 秒（2026-11-15 放宽，实测宿主重启后冷缓存首行 115 秒 > 90 秒必然误判 stall）—— 真卡死的核心照旧在 150 秒内暴露；
+    //   · 冷启动重试给 300 秒 —— 覆盖实测的 115 秒首行 + 余量；
+    //   · 硬上限（maxStartupMs）仍跟随本次预算（首次 90s / 重试 600s），防「缓慢输出
+    //     但永不就绪」无限等待。
+    const idleTimeoutMs = attempt === 1 ? 150_000 : 300_000;
+    // 硬上限：跟随本次尝试的预算（首次 90 秒、冷启动重试 600 秒），防止
+    // 「缓慢输出但永不就绪」无限等待。
     const maxStartupMs = startupTimeoutMs;
     let lastOutputAt = Date.now();
+    // CPU 活性防护（2026-11-17，用户报告「性能抢占导致加载慢被误判 stall」）：
+    // 空转判据的隐含前提是「无输出 = 没在推进」，但 CPU 被其他任务抢占时核心
+    // 可能长时间打不出一行日志、而进程实际在缓慢推进（IO/调度等待）。判死前
+    // 采样 /proc/<pid>/stat 的 utime+stime：与上次输出时刻的采样相比，若 CPU
+    // 时间仍在增长（>=500ms），说明进程在干活 —— 续期而不是杀。纯睡眠死锁
+    // （CPU 零增长）照旧判死，不会因此放过真卡死。读不到 /proc（非 Linux、
+    // 进程已退出）时保持原行为。
+    let lastCpuSample = null;
+    const readCpuSeconds = () => {
+      try {
+        const stat = fs.readFileSync(`/proc/${child.pid}/stat`, { encoding: 'utf8' });
+        // comm 可能含空格，从最后一个 ')' 之后取字段；utime=第14字段 stime=第15字段（相对全字段，含状态后）。
+        const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        return (Number(rest[11]) + Number(rest[12])) / 100; // clock ticks (100/s) → seconds
+      } catch { return null; }
+    };
     const armIdleTimer = () => {
       if (startupComplete || settled || stopping || shuttingDown) return;    // 就绪后看门狗退役（0.3.62）
+      lastCpuSample = readCpuSeconds();
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         const idleSec = Math.round((Date.now() - lastOutputAt) / 1000);
+        const cpuNow = readCpuSeconds();
+        const cpuBusy = lastCpuSample !== null && cpuNow !== null && cpuNow - lastCpuSample >= 0.5;
+        if (cpuBusy) {
+          // 进程仍在消耗 CPU：判定为「被抢占/推进中」，续期空转计时并记录一次，
+          // 连续续期也总受 maxStartupMs 硬上限兜底。
+          log(`startup watchdog: no output for ${idleSec}s but cpu advancing (+${Math.round((cpuNow - lastCpuSample) * 100) / 100}s); extending`);
+          armIdleTimer();
+          return;
+        }
         const message = `dsh startup stalled: no output for ${idleSec} seconds`;
         archiveStartupLogs('startup-stalled', directory, profileName, { message, idleMs: idleSec * 1000, attempt });
         child.kill('SIGTERM');
@@ -521,6 +931,41 @@ async function reclaimCorePort() {
   throw new Error(`端口 127.0.0.1:${corePort} 被残留 dsh 进程占用且无法释放。可在应用设置 → 运行控制中修改内部端口，或在 NAS 上手动结束残留进程`);
 }
 
+// 网关端口回收（2026-11-16，吸取 0.3.107 重装当晚 3080 被占连崩 11 次进 safe 的教训）：
+// core 有 reclaimCorePort，gateway 此前只靠 waitForGatewayPortFree 纯等待——占口的是
+// 本应用孤儿 gateway 时等再多也没用。这里对齐 core 模式：先确认端口忙，再用 portOwner
+// 识别本应用 gateway 残留（role=gateway），TERM→KILL 后等端口释放；归属核实不了就不杀，
+// 与 core 同口径报错（不自动结束无法核实归属的进程）。
+async function releaseOwnedGatewayPort() {
+  const identities = portOwner.ownedProcesses(dataDir, appDir).filter(identity => identity.role === 'gateway');
+  if (!identities.length) return;
+  log('terminating owned gateway leftovers: ' + identities.map(identity => identity.pid).join(', '));
+  for (const identity of identities) portOwner.signalOwned(identity, 'SIGTERM', dataDir, appDir);
+  for (let i = 0; i < 20; i++) {
+    if (!identities.some(identity => portOwner.identityMatches(identity, dataDir, appDir))) return;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  for (const identity of identities) portOwner.signalOwned(identity, 'SIGKILL', dataDir, appDir);
+  for (let i = 0; i < 20; i++) {
+    if (!identities.some(identity => portOwner.identityMatches(identity, dataDir, appDir))) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  log('gateway leftovers refused to die; continuing (gateway own EADDRINUSE retry will report)');
+}
+
+async function reclaimGatewayPort(timeoutMs = 8000) {
+  const port = effectivePublicPort();
+  if (!(await probePortBusy(port))) return;
+  await releaseOwnedGatewayPort();
+  for (let i = 0; i < Math.ceil(timeoutMs / 250); i++) {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (!(await probePortBusy(port))) return;
+  }
+  // 端口仍忙：不阻塞启动（可能与 waitForGatewayPortFree 语义对齐），交给 gateway
+  // 自身的 EADDRINUSE 重试 + 明确报错。回收只是把「本应用残留」这一最常见成因自愈掉。
+  log('gateway port ' + port + ' still busy after reclaim attempt');
+}
+
 function probeBindable(port) {
   return new Promise((resolve) => {
     const server = require('node:net').createServer();
@@ -540,7 +985,11 @@ function askGatewayPublicPort(port) {
 }
 
 async function startDsh(directory, profileName = profiles.selected(dataDir), createProfile = false) {
-  return configCoordination.withDataLock(dataDir, () => startDshLocked(directory, profileName, createProfile));
+  // operation:'boot'：标记这是监督器自身的启动锁（启动序列可重跑：核心残留会
+  // 被回收、包/补丁修复幂等）。上次进程被硬杀遗留的 boot 锁由 config-coordination
+  // 归档后放行，而不是每次重启都卡进安全模式；被中断的恢复/CLI 写入仍是
+  // exclusive，继续走人工归档路径。
+  return configCoordination.withDataLock(dataDir, () => startDshLocked(directory, profileName, createProfile), { operation: 'boot' });
 }
 async function startDshLocked(directory, profileName, createProfile) {
   if (stopping || shuttingDown) throw new Error('应用正在停止，不再启动核心');
@@ -574,6 +1023,11 @@ async function startDshLocked(directory, profileName, createProfile) {
         log('corrupt session logs quarantined: ' + corrupt.quarantined + '/' + corrupt.corrupt.length
           + ' (scanned ' + corrupt.scanned + ') -> ' + corrupt.dir);
         eventLog('sessions_quarantined', { scanned: corrupt.scanned, corrupt: corrupt.corrupt.length, quarantined: corrupt.quarantined, dir: corrupt.dir });
+      }
+      // 校验没跑成（zstd 缺失/超时/fork 失败）不等于文件损坏：只记录，不搬走，留给下一轮再查。
+      if (corrupt.unverified && corrupt.unverified.length) {
+        log('session integrity scan could not verify ' + corrupt.unverified.length + '/' + corrupt.scanned
+          + ' log(s), left in place: ' + corrupt.unverified.map((item) => item.file + ' (' + item.reason + ')').join(', '));
       }
     } catch (error) { log('session integrity scan skipped: ' + error.message); }
     // 装载一致性（0.3.61）：patch 声明了、包也装了、却没登记进 bundles 的插件——它的
@@ -676,7 +1130,15 @@ function settleAfterExit(child, { timeoutMs = 10_000 } = {}) {
   });
 }
 
-async function stopDsh() {
+// 停机预算（2026-11-08，P0）：平台 stop 超时约 50 秒，超过即 kill -9 —— 若此刻核心
+// 正持配置锁，就会留下孤儿锁，这正是「每周锁死一次」的来源。调用方可传入 deadline
+// （绝对时间戳），各阶段只花剩余预算，保证整条关停链有硬上限。
+function shutdownBudget(deadline, fallbackMs) {
+  if (!Number.isFinite(deadline)) return fallbackMs;
+  return Math.max(0, Math.min(fallbackMs, deadline - Date.now()));
+}
+
+async function stopDsh({ deadline = null } = {}) {
   coreStopConfirmed = false;
   cancelSelfRestart();
   if (!dsh) { await releaseOwnedCorePort(); coreStopConfirmed = true; return; }
@@ -684,12 +1146,14 @@ async function stopDsh() {
   expectedDshStop = true;
   const child = dsh;
   startupCancels.get(child)?.();
-  const gracefulWait = settleAfterExit(child, { timeoutMs: 10_000 });
+  const gracefulWait = settleAfterExit(child, { timeoutMs: shutdownBudget(deadline, 10_000) });
   child.kill('SIGTERM');
   const graceful = await gracefulWait;
   if (!exited(child)) {
     // kill 可能返回 false（进程已消失或从未建起）：仍然走有界等待，不再无条件 await。
-    const forcedWait = settleAfterExit(child, { timeoutMs: 5_000 });
+    // 预算见底时也要给 SIGKILL 留一个可观察窗口，否则 exited() 立刻为假会误报
+    // 「未确认退出」，把一次正常的强制退出变成异常路径。
+    const forcedWait = settleAfterExit(child, { timeoutMs: Math.max(500, shutdownBudget(deadline, 5_000)) });
     child.kill('SIGKILL');
     const forced = await forcedWait;
     if (!exited(child) && child.pid) throw new Error(`dsh未确认退出，保留句柄并停止本次操作（last=${forced}, graceful=${graceful}）`);
@@ -699,15 +1163,16 @@ async function stopDsh() {
   coreStopConfirmed = true;
 }
 
-async function stopGateway() {
+async function stopGateway({ deadline = null } = {}) {
   clearTimeout(gatewayRestartTimer);
+  clearTimeout(gatewayStableTimer);
   const child = gateway;
   if (!child) return;
-  let wait = settleAfterExit(child, { timeoutMs: 10000 });
+  let wait = settleAfterExit(child, { timeoutMs: shutdownBudget(deadline, 10_000) });
   child.kill('SIGTERM');
   await wait;
   if (!exited(child) && child.pid) {
-    wait = settleAfterExit(child, { timeoutMs: 5000 });
+    wait = settleAfterExit(child, { timeoutMs: Math.max(500, shutdownBudget(deadline, 5_000)) });
     child.kill('SIGKILL');
     await wait;
     if (!exited(child)) throw new Error('网关未确认退出，保留句柄并拒绝替换进程镜像');
@@ -831,6 +1296,9 @@ function startGateway() {
   });
   fs.closeSync(fd);
   const startedGateway = gateway;
+  clearTimeout(gatewayStableTimer);
+  gatewayStableTimer = setTimeout(() => { if (gateway === startedGateway) gatewayRestartAttempt = 0; }, gatewayStableAfterMs);
+  gatewayStableTimer.unref?.();
   gateway.on('message', (message) => {
     if (message?.type === 'public-port-result') {
       const reply = portReplies.get(message.id);
@@ -851,7 +1319,17 @@ function startGateway() {
       // 于是新 gateway 直接 EADDRINUSE 退出、再被重启……形成竞态。这里在重启前
       // 轮询等待端口真正空闲（最多 ~5 秒），与 gateway 内部的 EADDRINUSE 重试
       // 形成双保险。等待失败也照常重启（让 gateway 自己的重试兜底）。
-      waitForGatewayPortFree().finally(() => { if (!stopping && !shuttingDown && !gateway) gatewayRestartTimer = setTimeout(startGateway, 1000); });
+      gatewayRestartAttempt += 1;
+      if (gatewayRestartAttempt > gatewayRestartLimit) {
+        eventLog('gateway_restart_giveup', { attempts: gatewayRestartAttempt, code: code ?? null, signal: signal ?? null });
+        log('gateway exited ' + gatewayRestartAttempt + ' times; giving up automatic restart');
+        publishMaintenance('管理页后端连续 ' + gatewayRestartLimit + ' 次异常退出，已停止自动重启；请查看 gateway.log 后重启应用', 100);
+        return;
+      }
+      // 指数退避：1s→2s→4s→…→上限 30s。端口探测仍在前面，两者不冲突。
+      const restartDelay = Math.min(gatewayRestartBaseDelay * 2 ** (gatewayRestartAttempt - 1), gatewayRestartMaxDelay);
+      eventLog('gateway_restart_scheduled', { attempt: gatewayRestartAttempt, delayMs: restartDelay });
+      reclaimGatewayPort().catch(() => {}).finally(() => { if (!stopping && !shuttingDown && !gateway) gatewayRestartTimer = setTimeout(startGateway, restartDelay); });
     }
   });
 }
@@ -874,6 +1352,7 @@ async function waitForGatewayControl(timeoutMs = 10000) {
 }
 
 async function checkUpdate() {
+  if (directorySwitchPending) return { skipped: "directory-switch" };
   const settings = updateSettings();
   const response = await fetch(new URL('@deepseek-ai%2fdsh', settings.registry), {
     headers: { Accept: 'application/vnd.npm.install-v1+json' },
@@ -889,6 +1368,7 @@ async function checkUpdate() {
     latest: metadata['dist-tags']?.latest ?? null,
     next: metadata['dist-tags']?.next ?? null
   };
+  if (directorySwitchPending) return { skipped: 'directory-switch' };
   ops.writeJson(ops.dataPath(dataDir, 'update.json'), result);
   return result;
 }
@@ -912,6 +1392,7 @@ function clearAutomaticBackupDeferred(source = null) {
   publish({ automaticBackupDeferred: Object.keys(next).length ? next : null });
 }
 async function backup(kind, { automatic = kind === 'daily', source = kind === 'daily' ? 'daily' : 'session' } = {}) {
+  if (directorySwitchPending) return { skipped: 'directory-switch' };
   const settings = ops.backupSettings(dataDir);
   if (kind === 'daily' && settings.dailyMode === 'updates') {
     clearAutomaticBackupDeferred('daily');
@@ -1290,6 +1771,7 @@ async function runCommand(message) {
   let result;
   eventLog('operation_started', { action: message.action });
   try {
+    if (directorySwitchPending) throw new Error('目录已提交，正在切换；暂不接受修改操作，请稍后重新打开 DSH');
     if (message.action === 'inspect-restore-integrity') {
       result = await require('./restore-integrity.js').inspect(dataDir, activeDir, profiles.selected(dataDir));
       ops.writeJson(ops.dataPath(dataDir, 'restore-integrity.json'), result);
@@ -1629,12 +2111,12 @@ async function runCommand(message) {
       clearTimeout(dailyTimer);
       try {
         publishMaintenance('正在完全重启程序', 90);
+        try { if (gateway && gateway.connected) gateway.send({ type: 'maintenance-hold', text: '正在完全重启程序，本页会自动刷新…' }); } catch { /* gateway 已退出 */ }
         await stopDsh();
-        await stopGateway();
         if (shuttingDown) throw new Error('应用已收到停止请求，取消替换进程镜像');
-        if (!await waitForGatewayPortFree(8000)) throw new Error('网关监听尚未释放，拒绝execve');
         if (!await probeBindable(corePort)) throw new Error('核心监听尚未释放，拒绝execve');
-        process.execve(process.execPath, [process.execPath, ...process.execArgv, __filename], gitEnv.normalizeGitParentEnv(process.env));
+        detachOperationChain();
+        process.execve(process.execPath, [process.execPath, ...execveArgsFor(dataDir), __filename], gitEnv.normalizeGitParentEnv(process.env));
         throw new Error('execve returned without replacing the process image');
       } catch (error) {
         try { restartTracker.fail(); } catch (receiptError) { log('Restart failure receipt unavailable: ' + receiptError.message); }
@@ -1642,6 +2124,7 @@ async function runCommand(message) {
         if (!shuttingDown) {
           stopping = false;
           try {
+            if (gateway && gateway.connected && !exited(gateway)) try { gateway.send({ type: 'maintenance-release' }); } catch { };
             startGateway();
             await waitForGatewayControl();
             if (restoreCore && (!dsh || exited(dsh))) { await startDsh(activeDir); await probeWeb(); }
@@ -1658,6 +2141,149 @@ async function runCommand(message) {
           }
         }
         throw error;
+      }
+    }
+    else if (message.action === 'save-setup') {
+      // 目录配置页提交（2026-11-10）。这是 setup 模式唯一的出口：
+      //   验路径 -> 验授权与真实读写 -> （必要时）把旧目录数据搬过来 -> 落盘
+      //   -> 延迟重启进程，让新目录生效。
+      //
+      // 为什么重启而不是原地切换：supervisor 的 dataDir 是模块级常量，核心、
+      // 网关、状态文件、PID 文件全都挂在它上面。原地改一半只会留下两套路径
+      // 互相打架。execve 换镜像最干净：新镜像从 cmd/main 拿到的 env 已经指向
+      // 新目录，boot 重新读配置，一切从头建立。
+      //
+      // 为什么用 setTimeout 而不是直接重启：runCommand 的返回值要经 gateway.send
+      // 回给管理页（见函数尾部的 command-result）。同步 execve 会让镜像先被换掉，
+      // 结果永远回不去，页面只能等到 15 分钟超时。延迟一拍，先回结果再重启。
+      const controlDir = configDir || dataDir;
+      // 本页只改目录，没有插件勾选项：沿用上次的选择，别把它悄悄清空
+      // （清空会让下次启动少加载插件，用户只看到「我的插件不见了」）。
+      const record = installOptions.validate({
+        dataDir: String(message.dataDir || '').trim(),
+        backupDir: String(message.backupDir || '').trim(),
+        selectedPlugins: installOptions.read(controlDir)?.selectedPlugins || []
+      }, process.env);
+      const status = installOptions.check(record, process.env, { create: true });
+      const wasSetup = state.mode === 'setup';
+      if (!status.ok) {
+        const issues = status.issues
+          .map(issue => `${issue.path}：${issue.code === 'not-authorized' ? '尚未授权给应用账号' : issue.code === 'missing' ? '目录不存在（卷未挂载？）' : issue.code === 'not-owned' ? '目录属主不是应用账号，无法修改其权限（请换一个目录）' : '当前不可写'}`)
+          .join('；');
+        // 留在 setup 态：核心仍然不启动，页面把不合格的目录逐条列出来。
+        //
+        // 2026-11-17：即使检查不过也把设置落盘，并打开 setup 轮询。
+        //   原来这里只 publish 就返回，于是「现在不过、但用户离开本页就能修好」的
+        //   情况（去应用中心勾授权、改正目录属主）永远等不到第二次判定 —— 页面
+        //   按钮点一次失败一次，出路只剩「应用中心停用再启用」把进程换掉。
+        //   落盘 + 轮询让这条路自愈：用户去修，回来了这里每 4 秒重判一次，通过
+        //   就自己 execve 重启（见 startSetupWatch）。
+        //   只在 setup 态落盘：ready 态改目录走 reconfigure 事务，不能借道这里
+        //   把正在用的配置覆盖成一份没验过的。
+        if (wasSetup) {
+          try { installOptions.write(controlDir, record, process.env); log('setup record saved despite failing checks: ' + issues); }
+          catch (error) { log('setup record write failed: ' + error.message); }
+        }
+        publish({ mode: 'setup', error: issues });
+        if (wasSetup) startSetupWatch();
+        result = { notice: `目录尚未通过检查：${issues}${wasSetup ? '。设置已保存，本页每 4 秒自动重检一次；去应用中心授权（或修正目录属主）后无需再点按钮。' : ''}` };
+      } else {
+        // 换目录时先把旧数据搬过去。只搬平台可信源（TRIM_PKGVAR）里的数据：
+        // migrate 自己会校验源、锁定事务、逐项校验字节，失败就整体回滚。
+        // 目标已有数据（例如重装后重新指向老目录）走 preserveExisting，是只读 no-op。
+        let note = '';
+        const legacy = process.env.TRIM_PKGVAR;
+        const movingAway = path.resolve(record.dataDir) !== path.resolve(dataDir);
+        if (movingAway && legacy && path.isAbsolute(legacy) && installMigration.hasRealData(dataDir)) {
+          stopping = true; // 停网关期间不得走崩溃 respawn
+          await stopGateway();
+          try {
+            const moved = installMigration.migrate({
+              legacy: dataDir, target: record.dataDir, backupDir: record.backupDir,
+              controlDir, env: process.env, appDir, preserveExisting: true
+            });
+            if (moved.migrated) note = '旧数据已迁移到新目录。';
+            else log(`setup migration skipped: ${moved.reason}`);
+          } catch (error) {
+            stopping = false;
+            startGateway();
+            publish({ mode: 'setup', error: `数据迁移失败：${error.message}` });
+            throw new Error(`数据迁移失败，未保存配置：${error.message}`);
+          }
+          stopping = false;
+        }
+        installOptions.write(controlDir, record, process.env);
+        // 新目录立刻生效的前提是进程 env 一起换掉：execve 会把 current env 传给新镜像。
+        process.env.FNOS_DATA_DIR = record.dataDir;
+        process.env.DSH_HOME = ops.dataPath(record.dataDir, 'dsh-home');
+        log(`setup saved: data=${record.dataDir} backup=${record.backupDir}`);
+        eventLog('setup_saved', { dataDir: record.dataDir, backupDir: record.backupDir });
+        result = { notice: `${note}目录已保存，应用正在按新目录重启（约 10–30 秒），稍后刷新本页即可。` };
+        // 先把结果发出去（runCommand 尾部），再重启。
+        // 重启本身统一走 restartAfterSetup：停网关 -> 等端口释放 -> 按新目录重绑实例
+        // 标记 -> execve，失败自动退回 setup 并继续轮询。2026-11-16 那次「换镜像却
+        // 带着旧标记 ⇒ 平台起第二个 supervisor」就是这段内联代码漏掉的一步。
+        setTimeout(() => { void restartAfterSetup(); }, 600);
+      }
+    }
+    else if (message.action === 'cancel-reconfigure-directories') {
+      pendingReconfigure=null;publish({pendingReconfigure:null});result={notice:'未执行迁移。请更换其他目录后重新提交。'};
+    }
+    else if (message.action === 'reconfigure-directories' || message.action === 'confirm-reconfigure-directories') {
+      if (!configDir) throw new Error('迁移需要独立的应用配置目录；当前配置不支持在线改配');
+      const confirmed=message.action==='confirm-reconfigure-directories';
+      if (confirmed && (!pendingReconfigure || message.confirmation!==pendingReconfigure.confirmation || Date.now()-pendingReconfigure.createdAt>10*60*1000)) throw new Error('确认已过期或不匹配，请重新检查目录');
+      const source=confirmed?pendingReconfigure:{dataDir:String(message.dataDir||'').trim(),backupDir:String(message.backupDir||'').trim()};
+      const input={dataDir:source.dataDir,backupDir:source.backupDir,currentDataDir:dataDir,currentBackupDir:process.env.FNOS_BACKUP_DIR||installOptions.defaults.backupDir,controlDir:configDir,appDir,env:process.env};
+      const planned=await directoryReconfigure.run('plan',input);
+      if (!planned.ok) {
+        pendingReconfigure=null;publish({pendingReconfigure:null});result={notice:planned.message};
+      } else if (!confirmed && planned.needsConfirmation) {
+        pendingReconfigure={...source,confirmation:planned.confirmation,existingItems:planned.existingItems,message:planned.message,createdAt:Date.now()};
+        publish({pendingReconfigure});result={notice:planned.message};
+      } else {
+        if (confirmed && planned.confirmation!==source.confirmation) throw new Error('目标内容已变化，请重新检查并确认');
+        let moved;
+        publishMaintenance('正在迁移数据与备份；本实例核心暂停，控制台保持可访问');
+        try {
+          await stopDsh();
+          moved=await directoryReconfigure.run('apply',{...input,confirmed:true,confirmation:planned.confirmation});
+        } catch(error) {
+          pendingReconfigure=null;publish({mode:'safe',error:error.message});
+          if (!shuttingDown && !directoryReconfigure.blocked(configDir)) {
+            try {await startDsh(activeDir);await probeWeb();publish({mode:readyMode(),error:error.message});}catch(startError){publish({mode:'safe',error:error.message+'；旧核心恢复失败：'+startError.message});}
+          }
+          throw error;
+        }
+        pendingReconfigure=null;
+        const record=moved.record;
+        directorySwitchPending=true;
+        clearTimeout(dailyTimer);clearTimeout(sessionTimer);clearInterval(updateTimer);
+        result={notice:(moved.warning||'复制与校验完成，配置已保存。旧数据已移出到可恢复隔离区。')+' 正在切换到新目录，请稍后重新打开 DSH。'};
+        setTimeout(()=>{void(async()=>{
+          const previousEnv={FNOS_DATA_DIR:process.env.FNOS_DATA_DIR,FNOS_BACKUP_DIR:process.env.FNOS_BACKUP_DIR,DSH_HOME:process.env.DSH_HOME};
+          try {
+            if(shuttingDown)return;
+            // 标记重绑统一走 execveArgsFor（2026-11-16 起）：这里原先自己 map 一遍，
+            // 只处理「标记出现在 execArgv 里」的情形；若 argv 里根本没有标记，新镜像就是
+            // 无主进程，同样会招来第二个 supervisor。helper 补上了这个兜底。
+            const execArgs=execveArgsFor(record.dataDir);
+            process.env.FNOS_DATA_DIR=record.dataDir;process.env.FNOS_BACKUP_DIR=record.backupDir;process.env.DSH_HOME=ops.dataPath(record.dataDir,'dsh-home');
+            // gateway 跨 execve 保活（maintenance-hold），不停监听；旧 gateway 由新镜像回收。
+            try { if (gateway && gateway.connected) gateway.send({ type: 'maintenance-hold', text: '正在切换数据目录…' }); } catch { /* gateway 已退出 */ }
+            stopping=true;
+            if(shuttingDown)throw new Error('应用停止中，取消目录切换');
+            if(!await probeBindable(corePort))throw new Error('核心端口尚未释放，已拒绝重复启动');
+            detachOperationChain();
+            process.execve(process.execPath,[process.execPath,...execArgs,__filename],gitEnv.normalizeGitParentEnv(process.env));
+            throw new Error('execve returned');
+          }catch(error){
+            for(const [key,value] of Object.entries(previousEnv)){if(value===undefined)delete process.env[key];else process.env[key]=value;}
+            stopping=false;
+            if (gateway && gateway.connected && !exited(gateway)) try { gateway.send({ type: 'maintenance-release' }); } catch { };if(!shuttingDown)try{startGateway();}catch(startError){log('迁移后网关恢复失败：'+startError.message);}
+            publish({mode:'safe',error:'新目录已保存，自动切换失败；控制台仍可使用。请安排在应用中心停用再启用：'+error.message});
+          }
+        })();},600);
       }
     }
     else if (message.action === 'retry') {
@@ -1735,7 +2361,7 @@ async function runCommand(message) {
     eventLog('operation_succeeded', { action: message.action });
     if (gateway?.connected) gateway.send({ type: 'command-result', id: message.id, ok: true, result });
   } catch (error) {
-    eventLog('operation_failed', { action: message.action, code: error.code || 'failed' });
+    eventLog('operation_failed', { action: message.action, code: error.code || 'failed', error: error.message });
     if (gateway?.connected) gateway.send({ type: 'command-result', id: message.id, ok: false, error: error.message });
   }
 }
@@ -1759,6 +2385,7 @@ async function runCommand(message) {
 //   · 扫描不完整 → 不下结论，明确延期并在日志/事件里报告原因；
 //   · 有会话但无账本 → 仅在允许快照时建立真实存档，延期不得推进账本。
 async function checkSessionArchive({ force = false } = {}) {
+  if (directorySwitchPending) return { skipped: 'directory-switch' };
   const status = ops.sessionArchiveStatus(dataDir);
   // 扫描不完整：宁可延期，也不要把没读到的会话误记成已存档。
   if (!status.complete) {
@@ -2144,6 +2771,35 @@ async function boot() {
   const nodeMajor = Number(process.versions.node.split('.')[0]);
   if (nodeMajor < 22) throw new Error(`本机的 Node.js 运行时过旧（v${process.versions.node}），无法运行 DSH。请在 fnOS 应用中心安装或升级「Node.js v24」（nodejs_v24）后重启本应用。`);
   if (nodeMajor < 24) throw new Error(`本机的 Node.js 运行时版本过低（v${process.versions.node}，本应用按 v24 打包）。请在 fnOS 应用中心升级「Node.js v24」（nodejs_v24）后重启本应用。`);
+  // ── 目录配置（2026-11-10）：安装向导不再填数据/备份目录 ──
+  //
+  // 安装阶段拿不到目录授权、也验不了可写性，填进去的只是一串未经验证的字；
+  // 真出问题仍旧是首启才炸。现在安装不写目录，由这里接管：没有配置、或配置了
+  // 但授权/可写性不过 → 进 setup 模式。setup 只起网关、**绝不 spawn 核心**，
+  // 用户打开应用看到的就是配置页；保存并通过探针后进程换镜像、按新目录启动。
+  // 「未完成配置和授权就不继续启动」这条要求整个落在这个 return 上。
+  //
+  // 位置很关键：必须在第一个碰 dataDir 的 mkdir 之前。目录没授权时 mkdir 会
+  // EACCES，抛出去就掉进 safe 模式，用户看到的是「启动失败」而不是配置页。
+  {
+    const setupReason = setupBlockReason();
+    if (setupReason !== null) {
+      log('setup required: ' + (setupReason || 'install options missing yet'));
+      eventLog('setup_required', { reason: setupReason || 'missing-options' });
+      // 网关要读 state.json 与端口设置才能起监听；目录建不出来也只是日志难看，
+      // 不该把一个「等配置」的应用变成「启动失败」。
+      try { fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 }); } catch { /* 之后由配置页修正 */ }
+      try { publish({ mode: 'setup', error: setupReason || null }); }
+      catch (error) { log('setup state write failed: ' + error.message); }
+      startGateway();
+      // 授权变化不会通知我们：用户去应用中心勾完目录，进程还停在 setup，
+      // 没人再跑一次检查 —— 页面就永远卡在配置页。这里起一个轻量轮询，
+      // 定期重跑 setupBlockReason()；一旦通过就自重启，按新目录正常启动。
+      // 未配置目录时返回 '' 也算「未通过」，同样继续等待。
+      startSetupWatch();
+      return;
+    }
+  }
   for (const name of [dataDir, ops.dataPath(dataDir, 'dsh-home'), ops.dataPath(dataDir, 'workspace')]) fs.mkdirSync(name, { recursive: true, mode: 0o700 });
   // 存储属主自检（2026-10-31 事故加固）：root 钩子残留的 0700/0600 条目会让
   // 核心启动期 pnpm 抛出无路径的 "EACCES: permission denied, opendir"，排查困难。
@@ -2173,6 +2829,8 @@ async function boot() {
     log(`restored pending rollback decision for ${pendingRestore.snapshotId}`);
   }
   publish({ mode: 'starting', error: null });
+  // 启动前先回收本应用孤儿 gateway 占用的公开端口（2026-11-16 教训，见 reclaimGatewayPort）。
+  try { await reclaimGatewayPort(); } catch (error) { log('gateway port reclaim failed: ' + error.message); }
   startGateway();
   const portError = ops.portSettings(dataDir).corrupted;
   if (portError) { publish({ mode: 'safe', error: '端口配置损坏，已保留原文件；请修复配置后重试：' + portError }); return; }
@@ -2244,6 +2902,13 @@ async function boot() {
   scheduleSessionCheck();
   checkUpdate().catch((error) => log(`update check failed: ${error.message}`));
   updateTimer = setInterval(() => checkUpdate().catch((error) => log(`update check failed: ${error.message}`)), 24 * 60 * 60 * 1000);
+  // fnOS「应用设置」页的目录改配请求轮询（2026-11-17）：
+  // 应用设置页（wizard/config + cmd/config_callback）没有本应用的登录态，
+  // 不能走管理控制台的 CSRF action；config_callback 只把新目录写进
+  // reconfigure-request.json（TRIM_PKGETC），这里轮询消费。迁移本身复用
+  // 与 IPC 完全相同的事务链：plan → 非空时摆 pendingReconfigure 确认条
+  // （在管理控制台确认）→ 确认后 apply。空目录直接 apply 不打扰用户。
+  reconfigureRequestTimer = setInterval(() => { void consumeReconfigureRequest().catch((error) => log(`reconfigure request check failed: ${error.message}`)); }, 60_000);
   // 自动模式：核心就绪后检查一次会话存档（默认策略，见 ops.defaultBackupSettings）。
   if (state.mode === 'ready') maybeAutoArchiveSessions();
   if (state.mode === 'safe' && state.error) {
@@ -2273,20 +2938,36 @@ process.on('unhandledRejection', (reason) => {
   log(`unhandled rejection (continuing): ${detail.split('\n')[0]}`);
 });
 
+// 关停总预算（2026-11-08，P0）：旧路径最坏可叠到 50 秒以上（operation 20s +
+// stopDsh 15s + stopGateway 15s，CLI 关闭无上限），恰好跨过平台 stop 超时 → kill -9
+// → 核心若正持配置锁，孤儿锁留在数据根，下次启动就恢复不了。整条链限 20 秒，
+// 再加 2 秒兜底强制退出（兜底前先发 SIGKILL，尽量不留孤儿）。
+const SHUTDOWN_BUDGET_MS = 20_000;
 process.on('SIGTERM', async () => {
   shuttingDown = true;
   stopping = true;
   clearTimeout(gatewayRestartTimer);
+  clearTimeout(gatewayStableTimer);
   clearTimeout(sessionTimer);
   clearInterval(sessionTimer);
   clearTimeout(dailyTimer);
   clearInterval(updateTimer);
   cores.cancelInstall();
-  const cliClosed = await plugins.cancelCliOperations('supervisor shutdown');
-  if (!cliClosed.ok) log('CLI close unconfirmed: ' + cliClosed.remaining.map(item => item.pid).join(', '));
-  await Promise.race([operation.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 20_000))]);
-  try { await stopDsh(); await stopGateway(); process.exit(cliClosed.ok ? 0 : 1); }
-  catch (error) { log('shutdown incomplete: ' + error.message); process.exit(1); }
+  const deadline = Date.now() + SHUTDOWN_BUDGET_MS;
+  const hardExit = setTimeout(() => {
+    log('shutdown budget exhausted; forcing exit');
+    eventLog('shutdown_budget_exhausted', { budgetMs: SHUTDOWN_BUDGET_MS });
+    try { if (dsh && !exited(dsh)) dsh.kill('SIGKILL'); } catch {}
+    try { if (gateway && !exited(gateway)) gateway.kill('SIGKILL'); } catch {}
+    process.exit(1);
+  }, SHUTDOWN_BUDGET_MS + 2_000);
+  let cliClosed;
+  try { cliClosed = await plugins.cancelCliOperations('supervisor shutdown'); }
+  catch (error) { cliClosed = { ok: false, remaining: [], error: error.message }; }
+  if (!cliClosed.ok) log('CLI close unconfirmed: ' + (cliClosed.remaining || []).map(item => item.pid).join(', '));
+  await Promise.race([operation.catch(() => {}), new Promise((resolve) => setTimeout(resolve, shutdownBudget(deadline, 5_000)))]);
+  try { await stopDsh({ deadline }); await stopGateway({ deadline }); clearTimeout(hardExit); process.exit(cliClosed.ok ? 0 : 1); }
+  catch (error) { log('shutdown incomplete: ' + error.message); clearTimeout(hardExit); process.exit(1); }
 });
 
 operation = boot().catch(async (error) => {

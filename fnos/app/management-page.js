@@ -4,6 +4,7 @@ const fs = require('node:fs');
 let yamlModule = null;
 try { yamlModule = require('yaml'); } catch { /* 降级：AI 面板不列 provider */ }
 const ops = require('./ops.js');
+const appName = require('./app-name.js').appName();
 const cores = require('./core-manager.js');
 const profiles = require('./profiles.js');
 const plugins = require('./plugins.js');
@@ -14,12 +15,13 @@ const managementTheme = require('./management-theme.js');
 const managementPlugins = require('./management-plugins.js');
 const managementDiagnosis = require('./management-diagnosis.js');
 const reliabilityPanel = require('./reliability-panel.js');
+const installOptions = require('./install-options.js');
 const actions = require('./actions.js');   // 破坏性 action 的唯一定义处（见该文件头注释）
 
 const groups = [
   { id: 'overview', label: '概览', description: '查看运行状态、重启 DSH 和调整服务端口。', items: [['overview', '运行状态'], ['runtime', '运行控制']] },
   { id: 'core', label: '核心与扩展', description: '管理 DSH 核心版本、插件、npm 下载源与 profile 配置文件。', items: [['versions', 'DSH 版本'], ['plugins', '插件管理'], ['registry', 'npm 源'], ['config', '配置文件']] },
-  { id: 'data', label: '数据与权限', description: '管理配置档与备份，以及目录、容器和插件 URL 的访问权限。', items: [['profiles', '配置档'], ['backups', '备份与恢复'], ['grants', '目录权限'], ['containers', '容器权限'], ['pluginPaths', '插件 URL 放行']] },
+  { id: 'data', label: '数据与权限', description: '管理配置档与备份，以及目录、容器和插件 URL 的访问权限。', items: [['profiles', '配置档'], ['backups', '备份与恢复'], ['grants', '目录权限'], ['directories', '目录配置'], ['containers', '容器权限'], ['pluginPaths', '插件 URL 放行']] },
   { id: 'diagnostics', label: '诊断', description: '使用独立 AI 诊断配置档、查看日志、执行命令与开启限时网络调试。', items: [['ai', 'AI 诊断'], ['logs', '诊断日志'], ['terminal', '命令行'], ['network', '网络调试']] }
 ];
 const views = new Set(groups.flatMap((group) => group.items.map(([id]) => id)));
@@ -200,6 +202,22 @@ function remediationGuide(options) {
 function safeModeRemediation(state, form, action) {
   if (state.mode !== 'safe' || !state.error) return '';
   const reason = String(state.error);
+  // 配置锁必须排在基础设施分支之前：锁错误里常带 EACCES（读 /proc/<pid> 失败），
+  // 先判权限会把「锁没解除」显示成「权限不足」，把用户引向完全错误的动作。
+  // 这张卡只给只读检查 + 重试 + 日志，不给任何「重置配置」类按钮 —— 锁问题
+  // 重置配置无效，反而会丢掉判断事务是否完成的证据。
+  if (require('./recovery-guide').classifyFailure(reason).kind === 'config-lock') {
+    return '<div class="card remediation"><h3>配置锁未解除，启动被拒</h3>'
+      + '<p>启动被一把遗留的配置锁挡住：可能是上次写入进程已结束但锁没来得及回收，也可能是仍有进程在写入，或上一次事务结果未确认。'
+      + '先运行只读检查，确认是「哪把锁、卡在什么原因」。</p>'
+      + '<div class="guide-actions"><button type="button" id="recovery-check">运行只读基础检查</button></div>'
+      + '<pre id="recovery-check-result" hidden aria-live="polite"></pre>'
+      + '<p class="hint">孤儿锁（持锁者已确认消失、事务已完成）会在下次启动或写入时自动归档，owner.json 原样保留作证据 —— 这种情况直接重试即可。'
+      + '活锁、锁内有额外证据、结果未确认的现场需要人工核对；<strong>不要 rm 锁目录</strong>，那会丢掉判断事务是否完成的唯一证据。</p>'
+      + '<div class="actions">' + action('retry', '重新启动 DSH')
+      + '<a class="primary-link" href="/__fnos/logs?source=supervisor">查看诊断日志</a>'
+      + '<a class="primary-link" href="/__fnos/diagnostics-pack" download>导出诊断包</a></div></div>';
+  }
   if (require('./recovery-guide').classifyFailure(reason).infrastructure) return remediationGuide({ action, error: reason });
   if (/must be a top-level YAML array|failed to parse overlay/.test(reason)) {
     return `<div class="card remediation"><h3>检测到 patch 配置损坏</h3><p>cordis.patch.yml 的内容无法被 DSH 解析为合法配置。可以一键重置为合法的空配置：原文件会先备份到 patch-backups，随后自动重启 DSH 核心。</p><p class="error">注意：文件里的插件启用/禁用、插入声明会被清空（插件本体不受影响，需要时可在插件管理里重新配置）。</p><div class="actions">${action('heal-patch-layer', '重置 patch 配置并重启')}</div></div>`;
@@ -279,7 +297,20 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   })();
   const terminalHistory = ops.readJson(ops.dataPath(dataDir, 'terminal-history.json'), []);
   const pluginUrlPaths = pluginPaths.snapshot(dataDir);
-  const authorizedDirectories = grants.inspect();
+  // 授权视图（2026-11-18）：不再只读 env 快照。面板要能回答三个不同的问题——
+  // 平台下发过什么（可能过期）、现在实际能读写什么（ACL 是真正边界）、
+  // 工作区里已经建了哪些入口（历史证据）。旧实现只渲染第一个，于是"授权已生效
+  // 但进程 env 还是旧的"这种情况在页面上表现为"当前未收到 fnOS 授权目录"，
+  // 用户只能靠猜去重启应用。
+  const grantStatus = grants.status(dataDir);
+  const authorizedDirectories = grantStatus.grants;
+  // 目录配置（2026-11-16）：当前生效的数据/备份目录从 install-options.json 读，
+  // 不是从代码里的默认值读 —— 那只是安装向导的预填值。
+  const controlDir = process.env.FNOS_CONFIG_DIR || dataDir;
+  let storedDirectories = null;
+  try { storedDirectories = installOptions.read(controlDir); } catch { /* 坏文件也要能进页面重配 */ }
+  const currentDataDir = dataDir;
+  const currentBackupDir = process.env.FNOS_BACKUP_DIR || storedDirectories?.backupDir || '';
   const statusBase = { starting: '启动中', ready: '运行中', rollback: '已回滚', safe: '安全模式', maintenance: '自动维护模式，请等待' }[state.mode] || '未知';
   // 维护态带上"正在做什么"（0.3.62，用户反馈）：只显示「维护中」等于没说。
   const op = state.operation && typeof state.operation === 'object' ? state.operation : null;
@@ -295,8 +326,13 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const profileOptions = profileNames.filter(name => name !== 'fnos-diagnostic').map((name) => [name, `${name}${name === activeProfile ? '（运行中）' : ''}`]);
   const backupRows = backupReadError ? '<tr><td colspan="4" class="error">' + escapeHtml(backupReadError) + '</td></tr>' : backups.map((item) => `<tr><td>${escapeHtml(item.createdAt)}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.version)}</td><td>${action('restore', '恢复此备份', `<input type="hidden" name="backupId" value="${escapeHtml(item.id)}">`)}</td></tr>`).join('');
   const pluginCards = managementPlugins.cards(installedPlugins, form);
-  const pendingPluginPaths = pluginUrlPaths.candidates.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item.path)}/*</code></strong><span>最近检测：${escapeHtml(item.lastSeen)} · 次数：${item.count}</span></div><div class="actions">${form('allow-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '放行')}${form('dismiss-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '忽略')}</div></article>`).join('');
-  const approvedPluginPaths = pluginUrlPaths.approved.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item)}/*</code></strong><span>已允许自动改写到 DSH 网关</span></div><div class="actions">${form('revoke-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item)}">`, '撤销放行', 'danger')}</div></article>`).join('');
+  // 归属（2026-11-25）：候选来自浏览器调用栈里的 /plugins/<名>/ 片段；老数据没有该字段时
+  // 显示「未知来源」而不是编一个——路径名与包名经常对不上（/bili → billion-context）。
+  const pluginOrigin = (name) => name
+    ? `<span>来源插件：<code>${escapeHtml(name)}</code></span>`
+    : '<span>来源插件：未知（此记录早于归属采集，重新触发一次请求即可补上）</span>';
+  const pendingPluginPaths = pluginUrlPaths.candidates.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item.path)}/*</code></strong>${pluginOrigin(item.plugin)}<span>最近检测：${escapeHtml(item.lastSeen)} · 次数：${item.count}</span></div><div class="actions">${form('allow-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '放行')}${form('dismiss-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item.path)}">`, '忽略')}</div></article>`).join('');
+  const approvedPluginPaths = pluginUrlPaths.approved.map((item) => `<article class="plugin-card"><div><strong><code>${escapeHtml(item)}/*</code></strong>${pluginOrigin(pluginUrlPaths.approvedPlugins?.[item])}<span>已允许自动改写到 DSH 网关</span></div><div class="actions">${form('revoke-plugin-path', `<input type="hidden" name="path" value="${escapeHtml(item)}">`, '撤销放行', 'danger')}</div></article>`).join('');
   const registryPresets = [
     ['npm 官方源', 'https://registry.npmjs.org/'],
     ['npmmirror 镜像', 'https://registry.npmmirror.com/'],
@@ -304,6 +340,17 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     ['华为云镜像', 'https://repo.huaweicloud.com/repository/npm/']
   ].map(([label, value]) => action('set-registry', label, `<input type="hidden" name="registry" value="${value}">`)).join('');
   const grantRows = authorizedDirectories.map((item) => `<tr><td><code>${escapeHtml(item.path)}</code></td><td>${!item.directory ? '目录不存在或无法进入' : !item.readable ? '无读取权限' : item.writable ? '可读写' : '只读'}</td></tr>`).join('');
+  const grantLinkRows = grantStatus.links.map((item) => `<tr><td><code>${escapeHtml(item.name)}</code></td><td><code>${escapeHtml(item.target || '（无法解析的链接）')}</code></td><td>${!item.target ? '不是本应用创建的入口' : !item.present ? '目标已不存在' : item.readable ? '可读' : '目标存在但无读取权限'}</td></tr>`).join('');
+  const grantSnapshotText = grantStatus.snapshot.present
+    ? `平台下发 ${grantStatus.snapshot.paths.length} 个授权目录`
+    : '启动时平台未下发授权列表（TRIM_DATA_ACCESSIBLE_PATHS 为空）';
+  const grantSyncText = grantStatus.saved && grantStatus.saved.checkedAt ? `上次同步 ${escapeHtml(grantStatus.saved.checkedAt)}` : '尚无同步记录';
+  const grantWarning = grantStatus.needsRestart
+    ? `<p class="error" role="status">启动时没有收到授权列表，但工作区里已有 ${grantStatus.links.length} 个快捷入口。${grantStatus.lateGrants > 0 ? `其中 ${grantStatus.lateGrants} 个目标的权限在本进程启动之后才改动过，很可能就是刚完成的授权。` : ''}fnOS 只在启动应用时下发授权，请在应用中心<strong>停止并重新启动</strong>本应用，重启后授权才会出现在上表。</p>`
+    : '';
+  const grantKeptNote = !grantStatus.snapshot.present && grantStatus.links.length
+    ? `<p class="hint">授权列表为空期间不会删除已有入口：失效的入口访问时会被 fnOS 权限拦下，但不会因为你重启应用就消失。真正撤销授权时，入口会在下一次拿到授权列表后自动清理。${grantStatus.dangling ? ` 其中 ${grantStatus.dangling} 个入口的目标目录当前访问不到（共享目录可能只是暂时不可用），因此先保留、不做删除。` : ''}</p>`
+    : '';
   const debugMode = networkDebug?.mode || 'read-only';
   const debugForm = form('start-network-debug', `<label>访问模式 ${select('mode', [['read-only', '只读模式'], ['command', '指令模式']], debugMode)}</label><label>有效期（分钟） <input type="number" name="minutes" min="1" max="60" value="${networkDebug?.minutes || 15}" required></label>`, networkDebug ? '切换模式并重新计时' : '开启临时调试');
   // 给 AI 调试者的提示词随连接信息一起复制出去。两种模式的可用能力不同，
@@ -311,8 +358,8 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   const debugExpires = networkDebug ? escapeHtml(new Date(networkDebug.expiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })) : '';
   const debugPromptCommon = networkDebug ? `连接方式：\n- 接口基址：https://${networkDebug.address}:${networkDebug.port}（自签名证书：curl 请加 -k 或忽略证书校验）\n- 鉴权：每个请求带请求头 Authorization: Bearer ${networkDebug.token}\n- 本次调试有效期至北京时间 ${debugExpires}，过期自动失效\n\n协作约定：\n- 把接口返回原文完整贴出，不要凭记忆转述。\n- 连接地址与 Token 是敏感凭据，不要转存或写进日志、代码；调试完成后提醒管理员在「应用设置 → 远程调试」里关闭临时调试。` : '';
   const debugPrompt = debugMode === 'command'
-    ? `你是受邀参与 DeepSeek Harness（DSH，飞牛 fnOS 应用）远程调试的 AI 助手。管理员把连接信息发给你，请按说明协助排查。\n\n${debugPromptCommon}\n\n可用接口（指令模式）：\n1) GET /snapshot —— 只读快照：应用状态与网关/应用/DSH 三方最近日志（已脱敏）。请先取快照再判断。\n2) POST /command —— 执行管理指令。请求头 Content-Type: application/json，请求体为 JSON：{"action":"..."}。白名单指令：\n- check-update：检查核心更新\n- retry：重启 DSH 核心（服务会短暂中断）\n- backup：创建一份备份\n- safe-mode：进入安全模式\n- enable-plugin / disable-plugin：需附带 "packageName":"<已安装插件包名>"\n- probe-plugin-route：需附带 "path":"< /dsh-插件名/ping 或 /dsh-插件名/summary >"，探测插件路由是否可达\n成功返回 {"ok":true,"result":…}；同一时刻仅允许一条指令（并发得 409）。\n\n约定：retry、safe-mode、disable-plugin 这类有破坏性的动作，执行前先说明影响并征得管理员同意。`
-    : `你是受邀参与 DeepSeek Harness（DSH，飞牛 fnOS 应用）远程调试的 AI 助手。管理员把连接信息发给你，请按说明协助排查。\n\n${debugPromptCommon}\n\n可用接口（只读模式）：\n- GET /snapshot —— 唯一接口：返回应用状态与网关/应用/DSH 三方最近日志（已脱敏）。\n- 本模式没有任何管理指令：POST /command 会返回 403 read-only mode，请勿尝试任何写操作。\n\n约定：你的任务是读取快照、分析日志、定位问题并给出结论与建议；需要的变更操作请整理成具体步骤，由管理员在本机执行。`;
+    ? `你是受邀参与 ${appName}（DSH，飞牛 fnOS 应用）远程调试的 AI 助手。管理员把连接信息发给你，请按说明协助排查。\n\n${debugPromptCommon}\n\n可用接口（指令模式）：\n1) GET /snapshot —— 只读快照：应用状态与网关/应用/DSH 三方最近日志（已脱敏）。请先取快照再判断。\n2) POST /command —— 执行管理指令。请求头 Content-Type: application/json，请求体为 JSON：{"action":"..."}。白名单指令：\n- check-update：检查核心更新\n- retry：重启 DSH 核心（服务会短暂中断）\n- backup：创建一份备份\n- safe-mode：进入安全模式\n- enable-plugin / disable-plugin：需附带 "packageName":"<已安装插件包名>"\n- probe-plugin-route：需附带 "path":"< /dsh-插件名/ping 或 /dsh-插件名/summary >"，探测插件路由是否可达\n成功返回 {"ok":true,"result":…}；同一时刻仅允许一条指令（并发得 409）。\n\n约定：retry、safe-mode、disable-plugin 这类有破坏性的动作，执行前先说明影响并征得管理员同意。`
+    : `你是受邀参与 ${appName}（DSH，飞牛 fnOS 应用）远程调试的 AI 助手。管理员把连接信息发给你，请按说明协助排查。\n\n${debugPromptCommon}\n\n可用接口（只读模式）：\n- GET /snapshot —— 唯一接口：返回应用状态与网关/应用/DSH 三方最近日志（已脱敏）。\n- 本模式没有任何管理指令：POST /command 会返回 403 read-only mode，请勿尝试任何写操作。\n\n约定：你的任务是读取快照、分析日志、定位问题并给出结论与建议；需要的变更操作请整理成具体步骤，由管理员在本机执行。`;
   const debugPanel = networkDebug
     ? `<p>当前为<strong>${debugMode === 'command' ? '指令模式' : '只读模式'}</strong>，至北京时间 <strong>${escapeHtml(new Date(networkDebug.expiresAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }))}</strong> 自动关闭。</p><div id="debug-info" class="debug-info"><div>只读快照：<code>https://${escapeHtml(networkDebug.address)}:${networkDebug.port}/snapshot</code></div>${debugMode === 'command' ? `<div>指令接口：<code>https://${escapeHtml(networkDebug.address)}:${networkDebug.port}/command</code></div>` : ''}<div>临时 Token：<code>${escapeHtml(networkDebug.token)}</code></div></div><div id="debug-prompt" hidden>${escapeHtml(debugPrompt)}</div><div class="actions"><button id="copy-debug" type="button">复制连接信息</button><label><input type="checkbox" id="copy-debug-prompt" checked> 附带给 AI 的调试说明</label>${action('stop-network-debug', '立即关闭')}</div><div class="divider"></div><h3>切换模式或有效期</h3>${debugForm}<p class="hint">切换会立即关闭旧端口、废弃旧 Token，并生成新的连接信息；已发起的 FPK 操作可能继续完成。</p>`
     : `<p>在 NAS IPv4 地址上临时开启随机 HTTPS 端口。默认只读 15 分钟，可设置 1–60 分钟；到期、手动关闭或应用重启后失效。</p>${debugForm}`;
@@ -329,6 +376,35 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   ].map(([name, value]) => `<tr><th>${escapeHtml(name)}</th><td>${escapeHtml(value)}</td></tr>`).join('') : '';
   const dockerPanel = `<h2>容器权限</h2><p>当前连接：<strong>${dockerStatus?.mode === 'rootless' ? 'Rootless Docker' : '系统默认'}</strong>。Rootless 守护进程应以应用用户运行，Socket 固定在 <code>${escapeHtml(dockerStatus?.socket || '/run/user/UID/docker.sock')}</code>。</p><div class="table-scroll"><table><tbody>${dockerRows || '<tr><td>无法读取 Docker 检查状态</td></tr>'}</tbody></table></div>${dockerStatus?.dockerGroup ? '<p class="error">应用用户仍属于系统 docker 组。即使切到 Rootless，DSH 仍可显式访问系统 Docker Socket；确认 Rootless 可用后，应从该组移除应用用户并重启 FPK。</p>' : ''}<div class="divider"></div><h3>连接 DSH</h3><p>启用时会验证本用户 Socket 与 Docker 的 Rootless 标志，然后重启 DSH。关闭连接仅清除专用 Socket 设置，不会修改 NAS 的用户组。</p><div class="actions">${dockerStatus?.connection.ready && dockerStatus.mode !== 'rootless' ? action('set-docker-mode', '使用 Rootless Docker', '<input type="hidden" name="dockerMode" value="rootless">') : ''}${dockerStatus?.mode === 'rootless' ? action('set-docker-mode', '恢复系统默认连接', '<input type="hidden" name="dockerMode" value="system">') : ''}<a class="primary-link" href="/__fnos/?view=containers">刷新检查</a></div><div class="divider"></div><h3>NAS 管理员准备步骤</h3><ol><li>检查应用用户 <code>${escapeHtml(dockerUser)}</code> 的主目录是否存在且可写；安装 <code>newuidmap</code>、<code>newgidmap</code> 与 Docker Rootless 安装工具，并为该用户配置互不重叠的 subuid/subgid 范围，每项至少 65536 个。</li><li>以该应用用户运行 <code>dockerd-rootless-setuptool.sh install</code>。若 fnOS 支持用户级 systemd，再启用用户的 Docker 服务和 linger。</li><li>刷新本页，确认“Rootless 守护进程”显示“已验证”，然后点击“使用 Rootless Docker”。</li><li>确认 DSH 能使用 Rootless Docker 后，由 NAS 管理员执行 <code>sudo gpasswd -d ${escapeHtml(dockerUser)} docker</code>，再从应用中心完整停止并启动 FPK，刷新本页确认不再属于系统 docker 组。</li></ol><p class="hint">FPK 不会安装 Docker、修改 NAS 系统用户或自动开放 Docker Socket。Rootless Docker 仍可操作应用用户有权访问的文件，请继续限制工作区和插件权限。</p>`;
 
+  // 目录配置面板（2026-11-16）。
+  //
+  // 为什么放在管理页而不是只留在安装向导：目录不是装一次就定死的 —— 用户可能
+  // 换卷、换存储空间、把数据挪到更快的设备上。运行中改配才是常态。
+  //
+  // 确认条（pendingReconfigure）由 supervisor 摆出来，页面只负责渲染与提交
+  // 「确认」；**确认的标的以 supervisor 记录的那份为准**，页面再传什么都不会
+  // 改变要执行的目录 —— 避免「确认条出现后用户又改了输入框」导致标的漂移。
+  const directoryPanel = () => {
+    const pending = state.pendingReconfigure || null;
+    const banner = pending
+      ? `<div class="pending" role="alert"><div><strong>新数据目录里已有内容，需要你确认</strong><p>${escapeHtml(pending.message)}</p><p class="hint">确认后：先清空新目录里的这些内容（${escapeHtml((pending.existingItems || []).join('、'))}），再用当前目录的数据替换；复制校验与配置保存都成功后，旧数据会移出到可恢复隔离区；失败保留旧数据，不会直接删除。数据与备份会分别迁移。</p></div><div class="actions">${form('confirm-reconfigure-directories', `<input type="hidden" name="confirmation" value="${escapeHtml(pending.confirmation)}">`, '确认并迁移', 'danger')}${form('cancel-reconfigure-directories', '', '不确认，更换目录')}</div></div>`
+      : '';
+    const rows = [
+      ['数据目录', currentDataDir, '会话、设置、插件数据、私有工作区都在这里。'],
+      ['备份目录', currentBackupDir || '（未设置）', '快照与迁移回滚包存放处；必须与数据目录互相独立。']
+    ].map(([label, value, hint]) => `<tr><td><strong>${label}</strong></td><td><code>${escapeHtml(value)}</code></td><td>${hint}</td></tr>`).join('');
+    // 备份与数据是否同物理盘：只提示不阻断（另备磁盘属环境条件）。
+    // sameDevice 返回 null 表示路径还不存在/不可读，此时不提示。
+    const sameDisk = currentDataDir && currentBackupDir
+      ? installOptions.sameDevice(currentDataDir, currentBackupDir)
+      : null;
+    const sameDiskHint = sameDisk === true
+      ? '<p class="hint" style="margin-top:8px">提示：当前备份目录与数据目录在同一块物理磁盘上。逻辑隔离有效（防误删、防回滚互害），但整盘故障会同时影响两者；升级前冷备也会退化为全量复制，无法使用硬链接加速。若条件允许，建议改配到另一块物理盘；不改也能继续使用。</p>'
+      : '';
+    const fields = `<label>新数据目录 <input name="dataDir" required value="${escapeHtml(currentDataDir)}" placeholder="/vol1/1000/DSH-Data/dsh-fnos" spellcheck="false"></label><label>新备份目录 <input name="backupDir" required value="${escapeHtml(currentBackupDir)}" placeholder="/vol1/1000/DSH-Recovery/dsh-fnos" spellcheck="false"></label>${sameDiskHint}`;
+    return `<h2>目录配置</h2>${banner}<p>改配目录会把当前数据整体搬到新位置：<strong>清空新目录 → 复制旧数据 → 移出旧目录数据（可恢复）</strong>。新目录非空时必须二次确认；不确认就换一个空目录。</p><div class="table-scroll"><table><thead><tr><th>项目</th><th>当前路径</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table></div><div class="divider"></div><h3>改配到新目录</h3>${form('reconfigure-directories', fields, '迁移到新目录')}<p class="hint">新目录必须是 NAS 上的绝对路径，且已通过 fnOS「访问权限」授权（授权的是<strong>父目录</strong>）。目录须可读写；属主为应用账号 <code>${escapeHtml(process.env.TRIM_USERNAME || 'dsh_fnos')}</code>，否则应用无法修改它的权限、启动会失败。迁移期间仅暂停本实例核心，控制台保持可访问；复制与配置提交后，网关短暂重启以切换到新目录。</p>`;
+  };
+
   const panels = {
     overview: `<h2>运行状态</h2>${automaticBackupCard(state, action)}<div class="summary"><div><span>应用状态</span><strong>${status}</strong></div><div><span>DSH 核心</span><strong>${escapeHtml(state.activeVersion || state.bundledVersion || '未知')}</strong></div><div><span>配置档</span><strong>${escapeHtml(activeProfile)}</strong></div><div><span>应用版本</span><strong>${escapeHtml(appVer || '未知')}</strong></div></div>${state.error ? `${safeModeRemediation(state, form, action)}${startupDiagnosisCard(startupDiag, form, action, state)}${state.reportPath && state.mode === 'safe' ? `<p class="hint">完整诊断报告：<code>${escapeHtml(state.reportPath)}</code>（含错误全文与启动日志尾部）</p>` : ''}` : ''}${/*
       诊断模式卡片独立渲染（0.3.62 修复）：它原先挂在 `state.error` 分支里，
@@ -341,10 +417,11 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     registry: `<h2>npm 源</h2><p>当前源：<code>${escapeHtml(registry)}</code></p><div class="actions">${registryPresets}</div>${form('set-registry', `<label>自定义 HTTPS 源 <input name="registry" type="url" required value="${escapeHtml(registry)}"></label>`, '保存源')}<p class="hint">仅填写可信的 HTTPS 镜像地址。插件使用新源需要重新启动 DSH 核心。</p>`,    config: `<h2>配置文件</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。DSH 的自定义配置写在 <code>cordis.patch.yml</code>（每个配置档一份；保存时校验页面读取版本，外部改动后需刷新，不会覆盖较新配置），保存后 DSH 会自动热加载（patchReload: live），无需重启；若 core 因此异常，请到「运行控制」重试进入安全模式，<strong>按影响从小到大的分级引导</strong>修复（含备份恢复与禁用自定义条目）。</p><h3>cordis.patch.yml（可编辑）</h3>${form('save-patch-config', `<input type="hidden" name="patchRevision" value="${escapeHtml(patchView.patchRevision)}"><input type="hidden" name="profile" value="${escapeHtml(activeProfile)}"><textarea name="content" class="patch-editor" spellcheck="false" wrap="off">${escapeHtml(patchView.patch)}</textarea>`, '保存并应用')}<h3>备份（自动保留最近 10 份）</h3>${patchBackupOptions.length ? form('restore-patch-config', `<label>选择备份 ${select('backupName', patchBackupOptions, patchBackupOptions[0] && patchBackupOptions[0][0])}</label>${legacyPatchBackups.length ? `<label class="hint"><input type="checkbox" name="confirmLegacyProfile" value="true"> 我确认把「来源未知的历史备份」恢复到当前配置档 ${escapeHtml(activeProfile)}（${legacyPatchBackups.length} 份历史备份需要此确认）</label>` : ''}`, '恢复此备份') : '<p class="hint">暂无备份（保存或禁用时会自动创建）。</p>'}<div class="divider"></div><h3>cordis.yml（根配置，只读）</h3><pre class="patch-readonly">${escapeHtml(patchView.rootConfig) || '（空）'}</pre><p class="hint">这是 profile 根配置，DSH 官方要求不要直接修改它；所有自定义都应写在上方 cordis.patch.yml。</p>`,
 
     plugins: `<h2>插件管理</h2>${pluginWiringCard(wiring, action)}<p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。禁用会保留安装文件；卸载会从配置、依赖清单和安装目录清理插件。操作完成后会验证 DSH 能否启动。</p>${state.mode === 'safe' ? '<p class="error">当前处于安全模式。可先禁用冲突插件，成功后 DSH 会自动恢复运行。</p>' : ''}<h3>安装新插件</h3>${form('install-plugin', '<label>插件来源 <input name="packageName" required placeholder="name@1.2.3、user/repo 或 github:user/repo#tag"></label>', '检查并安装插件')}<p class="hint">安装前会检查 DSH 插件声明、依赖兼容性并（对 npm 来源）查询高危漏洞公告；支持 npm 来源（name@1.2.3）与 GitHub 来源（user/repo 或 github:user/repo#tag，经 pnpm 安装）。安装失败会恢复原配置。GitHub 来源不经过 npm 安全审计；插件运行时代码拥有 DSH 权限，请只安装可信发布者的插件。</p><h3>从本地文件导入</h3><form id="plugin-import-form"><p><input type="file" id="plugin-import-file" accept=".tgz,.tar.gz" required></p><p><button type="submit" id="plugin-import-btn">上传并安装</button><span id="plugin-import-status" class="hint"></span></p></form><p class="hint">支持 npm pack 产物（.tgz，≤64MB）。上传后走与在线安装相同的校验与回滚链；插件运行时代码拥有 DSH 权限，请只导入可信来源的包。</p>${pluginsNeedRepair ? `<div class="card remediation"><h3>检测到插件文件缺失</h3><p>部分插件的 node_modules 文件不完整（通常是 pnpm 操作半途失败所致，表现为插件路由 404、功能消失）。可按 pnpm-lock.yaml 一键重建插件目录，完成后自动重启 DSH。</p><div class="actions">${action('repair-plugin-files', '一键修复插件文件并重启')}</div></div>` : ''}<h3>已安装插件</h3>${managementPlugins.toolbar(session.csrf, view)}<div class="plugin-list">${pluginCards || '<p class="hint">当前配置档没有额外安装的插件。</p>'}</div><div class="divider"></div>`,
-    pluginPaths: `<h2>插件 URL 放行</h2><p>手机和 fnOS 远程入口使用子路径。应用会自动发现插件请求的根路径 API，但不会自动放行。确认路径属于可信插件后点击“放行”，再返回并强制刷新 DSH。</p><p class="hint">这里只控制浏览器 URL 自动改写，不限制插件在 DSH 内部的权限，也不代替插件与 DSH 核心版本的兼容检查。每条规则覆盖对应路径及其子路径，不含其他前缀。</p><h3>待放行</h3><div class="plugin-list">${pendingPluginPaths || '<p class="hint">尚未检测到第三方根路径请求。先打开插件页面，再刷新这里。</p>'}</div><div class="divider"></div><h3>已放行</h3><div class="plugin-list">${approvedPluginPaths || '<p class="hint">尚未放行第三方路径。</p>'}</div>`,
+    pluginPaths: `<h2>插件 URL 放行</h2><p>手机和 fnOS 远程入口使用子路径。应用会自动发现插件请求的根路径 API，但不会自动放行。每条会显示发起请求的插件（取自该请求的脚本来源），确认可信后再点击“放行”，然后返回并强制刷新 DSH。</p><p class="hint">这里只控制浏览器 URL 自动改写，不限制插件在 DSH 内部的权限，也不代替插件与 DSH 核心版本的兼容检查。每条规则覆盖对应路径及其子路径，不含其他前缀。</p><h3>待放行</h3><div class="plugin-list">${pendingPluginPaths || '<p class="hint">尚未检测到第三方根路径请求。先打开插件页面，再刷新这里。</p>'}</div><div class="divider"></div><h3>已放行</h3><div class="plugin-list">${approvedPluginPaths || '<p class="hint">尚未放行第三方路径。</p>'}</div>`,
     profiles: `<h2>DSH 配置档</h2><p>当前配置档：<strong>${escapeHtml(activeProfile)}</strong>。新配置档从 DSH 官方 Web 模板创建，切换前自动备份。</p>${form('switch-profile', `<label>已有配置档 ${select('profile', profileOptions, activeProfile)}</label>`, '切换配置档')}${form('create-profile', '<label>新配置档名称 <input name="profile" required pattern="[a-z][a-z0-9_-]{0,31}" maxlength="32" placeholder="例如 work"></label>', '新建并切换')}`,
-    grants: `<h2>目录权限</h2><p>在 fnOS 应用中心找到 DeepSeek Harness，打开访问权限并授予需要使用的 NAS 文件夹。授权后重新启动应用，再刷新此页。</p><p>已授权且可读取的目录会在 DSH 工作区的 <code>${escapeHtml(grants.shortcutFolder)}</code> 中显示为快捷入口。文件操作仍受 fnOS 对应用账号授予的权限限制。</p><div class="table-scroll"><table><thead><tr><th>fnOS 授权目录</th><th>当前访问</th></tr></thead><tbody>${grantRows || '<tr><td colspan="2">当前未收到 fnOS 授权目录。请在 fnOS 应用中心授予访问权限。</td></tr>'}</tbody></table></div><div class="divider"></div><h3>检测工作区写入权限</h3><p>输入在 DSH 中选择的完整目录，例如 <code>/vol1/共享文件夹/项目目录</code>。检测会在该目录短暂创建并删除一个空文件夹，与 DSH 的工作区检查一致。</p>${form('probe-workspace', '<label>工作区绝对路径 <input name="workspacePath" required placeholder="/vol1/共享文件夹/项目目录"></label>', '检测实际写入权限')}<p class="hint">上表只显示授权根目录的基础权限；子目录可能有不同 ACL。若刚授权仍未显示，请在 fnOS 应用中心停止并重新启动本应用。</p>`,
+    grants: `<h2>目录权限</h2><p>在 fnOS 应用中心找到 ${appName}，打开访问权限并授予需要使用的 NAS 文件夹。<strong>fnOS 只在启动应用时下发授权，改完授权必须停止并重新启动本应用</strong>，否则本进程拿到的仍是旧列表。</p>${grantWarning}<h3>平台下发的授权</h3><p class="hint">${escapeHtml(grantSnapshotText)} · ${grantSyncText}</p><div class="table-scroll"><table><thead><tr><th>fnOS 授权目录</th><th>当前访问</th></tr></thead><tbody>${grantRows || '<tr><td colspan="2">启动时没有收到授权列表。这可能是尚未授权，也可能是授权发生在应用启动之后——两种情况的解决办法都是：在应用中心授予权限后停止并重新启动本应用。</td></tr>'}</tbody></table></div><div class="divider"></div><h3>工作区里的快捷入口</h3><p>已授权且可读取的目录会在 DSH 工作区的 <code>${escapeHtml(grants.shortcutFolder)}</code> 中显示为快捷入口。文件操作仍受 fnOS 对应用账号授予的权限限制。</p><div class="table-scroll"><table><thead><tr><th>入口</th><th>指向</th><th>状态</th></tr></thead><tbody>${grantLinkRows || '<tr><td colspan="3">工作区里还没有快捷入口。</td></tr>'}</tbody></table></div>${grantKeptNote}<div class="divider"></div><h3>检测工作区写入权限</h3><p>输入在 DSH 中选择的完整目录，例如 <code>/vol1/共享文件夹/项目目录</code>。检测会在该目录短暂创建并删除一个空文件夹，与 DSH 的工作区检查一致。</p>${form('probe-workspace', '<label>工作区绝对路径 <input name="workspacePath" required placeholder="/vol1/共享文件夹/项目目录"></label>', '检测实际写入权限')}<p class="hint">上表只显示授权根目录的基础权限；子目录可能有不同 ACL。若刚授权仍未显示，请在 fnOS 应用中心停止并重新启动本应用。</p>`,
     containers: dockerPanel,
+    directories: directoryPanel(),
     backups: `<h2>备份与恢复</h2>${automaticBackupCard(state, action)}${sessionArchiveCard(sessionArchive, action, backupSettings)}<p>备份包含 DSH 设置、会话和私有工作区；恢复会覆盖当前数据。</p><p>自动备份条件：${{ always: '每天 03:00', changed: '每天 03:00，仅内容有改动', updates: '仅在更新或切换前' }[backupSettings.dailyMode]}。就绪核心在线校验备份，不主动停服；数据变化、恢复或停止未确认时延期重试。会话快照单独保留 48 份，不占用手动备份名额。</p>${action('backup', '立即备份（将暂停 DSH）')}<div class="divider"></div><h3>备份策略</h3>${form('set-backup-settings', `<label>每日保留 <input type="number" name="dailyLimit" min="1" max="30" value="${backupSettings.daily}" required></label><label>手动保留 <input type="number" name="manualLimit" min="1" max="30" value="${backupSettings.manual}" required></label><label>更新前保留 <input type="number" name="upgradeLimit" min="1" max="10" value="${backupSettings['pre-upgrade']}" required></label><label>自动备份 ${select('dailyMode', [['always', '每天'], ['changed', '仅内容有改动'], ['updates', '仅更新或切换前']], backupSettings.dailyMode)}</label><label>会话存档 ${select('sessionMode', [['auto', '自动检查（运行中延期）'], ['timer', '定时检查（运行中延期）'], ['manual', '仅手动']], backupSettings.sessionMode)}</label><label>检查周期（分钟）<input type="number" name="sessionInterval" min="5" max="10080" value="${backupSettings.sessionInterval}" required></label>`, '保存备份策略')}<p class="hint">会话存档策略只影响「是否/何时为会话新建快照」：自动模式在核心启动后检查；定时模式按检查周期执行（5 分钟 ~ 7 天，默认 60 分钟）。核心运行、停止未确认或管理命令仍活动时均延期，仅在已确认停止的安全模式下自动快照。长期运行可能一直无法自动备份；手动备份会暂停任务并重新启动核心。</p>}<h3>已有备份</h3><div class="table-scroll"><table><thead><tr><th>时间</th><th>类型</th><th>DSH 版本</th><th>操作</th></tr></thead><tbody>${backupRows || '<tr><td colspan="4">暂无备份</td></tr>'}</tbody></table></div>`,
     runtime: `${state.mode === 'safe' ? remediationGuide({
       action,
@@ -370,7 +447,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   }
   panels.ai = diagnosisCard(state, form, action, diagnosisState, csrf, aiProviders);
   if (view === 'runtime') panels[view] += require('./connection-settings').render(dataDir, form);
-  if (['overview', 'backups', 'logs'].includes(view)) panels[view] += reliabilityPanel.render({dataDir,state,backups,backupReadError,profile:activeProfile,authorizedCount:authorizedDirectories.length,action,report:integrityReport});
+  if (['overview', 'backups', 'logs'].includes(view)) panels[view] += reliabilityPanel.render({dataDir,state,backups,backupReadError,profile:activeProfile,authorizedCount:authorizedDirectories.length,grantHint:grantStatus.snapshot.present?'平台已下发授权列表':'启动时未下发授权（改授权后需重启应用）',action,report:integrityReport});
 
   const navIcons = {overview:"M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",core:"M12 3l8 4.5v9L12 21l-8-4.5v-9z M12 3v9m8-4.5L12 12 4 7.5m8 4.5v9",data:"M3 6h7l2 3h9v11H3z M3 6V4h7l2 2",diagnostics:"M3 12h4l3-7 4 14 3-7h4"};
   const primaryNav = groups.map((item) => `<a href="/__fnos/?view=${item.items[0][0]}"${item.id === group.id ? ' aria-current="page"' : ''}><svg class="nav-icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="${navIcons[item.id]}"></path></svg><span class="nav-label">${escapeHtml(item.label)}</span></a>`).join('');
@@ -422,20 +499,18 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   // 程序在做什么、要等多久，只能反复刷新。现在写明：在做什么 + 已用时 + 预计。
   const opStarted = op && op.startedAt ? Date.parse(op.startedAt) : NaN;
   const opElapsed = Number.isFinite(opStarted) ? Math.max(0, Math.round((Date.now() - opStarted) / 1000)) : null;
-  const opLine = op && op.text
-    ? `<span class="op-line">当前操作：<strong>${escapeHtml(op.text)}</strong>`
-      + (opElapsed !== null ? `<span class="op-elapsed"> · 已用 ${opElapsed} 秒</span>` : '')
-      + (state.mode !== 'maintenance' && op.etaSeconds ? ` · 预计约 ${op.etaSeconds} 秒` : '')
-      + `</span>`
-    : '';
-  const statusBanner = (state.error || state.mode === 'maintenance')
-    ? `<div id="status-banner" class="notice ${state.mode === 'maintenance' && !state.error ? 'notice-busy' : 'notice-error'}" role="alert">`
-      + `<strong>${escapeHtml(statusBase)}</strong>`
-      + (state.error ? `<span> · ${escapeHtml(require('./recovery-guide').classifyFailure(state.error).title)}</span><details class="failure-detail"><summary>查看完整错误</summary><pre>${escapeHtml(String(state.error))}</pre></details>` : '')
-      + opLine
-      + (state.mode === 'maintenance' ? `<span class="op-hint">维护耗时受数据量和磁盘速度影响，暂无法准确预计完成时间。DSH 服务可能暂时不可用；完成后会自动尝试恢复，请等待，无需重复操作。</span>` : '')
-      + `</div>`
-    : '';
+  // 前端脚本按 .op-line > strong / .op-elapsed 就地更新，所以元素必须常在（无操作时只加 hidden），
+  // 标签也留在 DOM 里，避免「当前操作」这层语义只靠前端补。
+  const opLine = `<span class="op-line"${op?.text ? '' : ' hidden'}>当前操作：<strong>${escapeHtml(op?.text || '')}</strong>`
+    + (op?.text && opElapsed !== null ? `<span class="op-elapsed"> · 已用 ${opElapsed} 秒</span>` : '<span class="op-elapsed"></span>')
+    + (op?.text && state.mode !== 'maintenance' && op.etaSeconds ? ` · 预计约 ${op.etaSeconds} 秒` : '')
+    + `</span>`;
+  const statusBanner = '<section id="status-banner" class="notice notice-error console-status-banner" role="status"'+(['ready','rollback'].includes(state.mode)&&!state.error?' hidden':'')+'>'
+    + '<div class="console-status-main"><div><strong id="console-state-title">'+escapeHtml(statusBase)+'</strong><p id="console-state-summary">'+escapeHtml(state.error ? require('./recovery-guide').classifyFailure(state.error).title : '主核心状态不影响本控制台和独立 AI 诊断。')+'</p></div><a class="primary-link" href="/__fnos/?view=ai">AI 诊断</a></div>'
+    + '<details class="failure-detail"><summary>查看状态详情</summary><pre id="console-state-error">'+escapeHtml(String(state.error||op?.text||'暂无更多错误信息。'))+'</pre></details>'
+    + opLine
+    + '<p class="op-hint"'+(state.mode==='maintenance'?'':' hidden')+'>维护时间暂无法准确预计；日志、设置和 AI 诊断保持可用。</p>'
+    + '<p id="console-state-refresh" hidden>状态已变化；为保留当前输入，本页不会自动刷新。<button type="button" id="console-state-reload">刷新控制台</button></p></section>';
   // A failed change that left the core unable to start is not rolled back on
   // its own any more: the snapshot is offered here instead, because applying
   // it discards everything written since it was taken.
@@ -492,11 +567,16 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
     reloadGate = true;
     reloadTimer = setTimeout(() => {
       reloadTimer = null; reloadGate = false;
-      if (!currentOperation(generation) || document.hidden || document.body.dataset.busy === '1' || document.querySelector('#ai-log > div')) return;
+      if (!currentOperation(generation) || document.hidden || window.__fnosDiagnosticBusy || document.body.dataset.busy === '1' || document.querySelector('#ai-log > div') || document.getElementById('ai-input')?.value.trim() || document.body.dataset.editing === '1') return;
       location.reload();
     }, delay);
     return true;
   };
+  document.addEventListener('input',()=>{document.body.dataset.editing='1';cancelReload();});
+  document.getElementById('console-state-reload')?.addEventListener('click',()=>{
+    if ((document.body.dataset.editing==='1' || document.querySelector('#ai-log > div')) && !window.confirm('刷新会结束当前页面的诊断对话或未保存输入，仍要刷新？')) return;
+    location.reload();
+  });
   const automaticBackupReasons = ${JSON.stringify(Object.fromEntries(['application-stopping', 'management-cli-active', 'core-running-or-unconfirmed', 'core-stop-unconfirmed', 'scan-incomplete'].map(reason => [reason, automaticBackups.reasonText(reason)])))};
   const updateAutomaticBackupNotice = (info) => {
     const notice = document.getElementById('automatic-backup-notice');
@@ -607,81 +687,93 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
   document.addEventListener('click', (event) => {
     if (event.target.closest('a[data-dsh-open]') && window.parent !== window) window.parent.postMessage({ type: 'dsh-fnos-view', view: 'dsh' }, '*');
   });
+  // —— 宿主外壳接管握手（状态条去重）：外壳版已带 #boot-status 轮询时，
+  // 控制台页隐藏自己的状态卡，避免同屏两层重复状态面。独立打开时不受影响。
+  (() => {
+    if (window.parent === window) return;
+    let parentOrigin = location.ancestorOrigins?.[0] || location.origin;
+    try { if (document.referrer) parentOrigin = new URL(document.referrer).origin; } catch {}
+    const banner = document.getElementById('status-banner');
+    const onMessage = e => {
+      if (e.source !== parent || e.origin !== parentOrigin || e.data?.type !== 'fnos:host-recovery') return;
+      document.body.dataset.hostRecovery = e.data.mode || 'unknown';
+      if (banner) banner.hidden = true;
+      clearTimeout(timer);
+    };
+    window.addEventListener('message', onMessage);
+    window.addEventListener('pagehide', () => window.removeEventListener('message', onMessage), { once: true });
+    const timer = setTimeout(() => window.removeEventListener('message', onMessage), 8000);
+  })();
+
   // —— AI 诊断对话（网关直连模型，不经过 core；核心挂了也能用）——
   ${managementDiagnosis.clientScript()}
 
-  // 常驻状态轮询（0.3.66，用户反馈）：原先只有**点了操作按钮**才临时轮询，
-  // 若用户从应用中心冷启动应用后停在管理页，页面会一直显示旧状态（"维护中"），
-  // 必须手动切视图才发现已就绪。现在页面加载即每 3 秒拉一次 /__fnos/state，
-  // 状态变化时更新徽标与横幅；就绪即停（不再打扰）。
+  // 被动轮询只更新事实；不刷新正在使用的排障工作区。
   (() => {
-    const LABEL = { starting: '启动中', ready: '运行中', rollback: '已回滚', safe: '安全模式', maintenance: '自动维护模式，请等待' };
-    let lastMode = null;
-    let lastOpSignature = null;
-    let idleTicks = 0;
+    const LABEL = { starting: '启动中', setup: '需要配置', ready: '运行中', rollback: '已回滚', safe: '安全模式', maintenance: '正在维护' };
+    let lastMode = null, pollTimer = null, pollingActive = true, tickRunning = false;
+    const schedule = (delay = 3000) => {
+      clearTimeout(pollTimer); pollTimer = null;
+      if (pollingActive && pageActive && !document.hidden && !authProblem) pollTimer = setTimeout(tick, delay);
+    };
     const tick = async () => {
-      // ⚠ 有操作在途时必须让位（0.3.66 修正）。
-      // 常驻轮询原本会在状态变化时 location.reload()，但用户点「重启」的
-      // fetch 提交可能**还没走完** —— reload 会打断它，前端 .catch() 于是把
-      // 按钮显示成「操作失败，请刷新页面重试」，而服务端可能已成功。
-      // 这与 0.3.62 修过的「轮询打断在途 POST」是同一类错误（我又犯了一次）。
-      // 判据：body.dataset.busy 是提交处理设置的标志，操作期间只观看不动作。
-      if (!pageActive || document.hidden || document.body.dataset.busy === '1') return;
+      pollTimer = null;
+      if (!pollingActive || !pageActive || document.hidden || authProblem || tickRunning) return;
+      if (document.body.dataset.busy === '1') { schedule(); return; }
+      tickRunning = true;
       const generation = operationGeneration;
       try {
         const { info } = await requestState();
-        if (!currentOperation(generation) || document.hidden || document.body.dataset.busy === '1') return;
-        if (!info || typeof info.mode !== 'string') { idleTicks = 0; return; }
+        if (!pollingActive || !currentOperation(generation) || document.hidden || document.body.dataset.busy === '1') return;
+        if (!info || typeof info.mode !== 'string') throw new Error('状态响应无效');
+        const base = LABEL[info.mode] || '状态待确认';
         const aiCore = document.getElementById('ai-core-state');
-        if (aiCore) aiCore.textContent = ['ready', 'rollback'].includes(info.mode) ? '核心已就绪' : '核心未就绪（' + info.mode + '）';
+        if (aiCore) aiCore.textContent = '主核心状态：' + base + '。独立诊断仍可使用。';
         const recoveryGuide = document.querySelector('.guide');
         if (recoveryGuide) recoveryGuide.hidden = info.mode !== 'safe';
-        idleTicks = 0;
-        // ⚠ 0.3.73：相同 mode 也要更新「操作文案/进度」——维护中的操作会变化，
-        // 而 mode 一直是 maintenance。原实现在 mode 未变时直接 return，
-        // 于是「正在创建配置备份…」这类文案永远停在第一个操作上。
-        const op0 = info.operation && typeof info.operation === 'object' ? info.operation : null;
-        const opSignature = op0 ? String(op0.text || '') + '|' + String(op0.progress || '') : '';
-        // 即使服务端状态没变，也需覆盖 BFCache/操作超时留下的临时文案。
         const changed = lastMode !== null && info.mode !== lastMode;
         lastMode = info.mode;
-        lastOpSignature = opSignature;
-        const base = LABEL[info.mode] || info.mode;
-        const op = op0;
-        setAppState(info.mode === 'maintenance' && op && op.text ? base + '：' + op.text : base,
+        const op = info.operation && typeof info.operation === 'object' ? info.operation : null;
+        setAppState(info.mode === 'maintenance' && op?.text ? base + '：' + op.text : base,
           info.mode === 'ready' ? undefined : (info.mode === 'safe' || info.mode === 'rollback' ? 'bad' : 'warn'));
-        // 横幅也要跟着状态走（0.3.68，用户反馈）：横幅是服务端渲染的静态 DOM，
-        // 原先只有徽标（#app-state）会被轮询更新，横幅会**一直停在"维护中"**
-        // 直到手动刷新。就绪时移除它；维护中且文案变了就就地更新。
         const banner = document.getElementById('status-banner');
         if (banner) {
-          if (info.mode === 'ready') banner.remove();
-          else if (info.mode === 'maintenance' && op && op.text) {
-            // 用 textContent 而非 innerHTML 拼接：op.text 来自服务端，虽已转义过一次，
-            // 但前端字符串拼接是二次加工，直接写 DOM 文本可彻底避免注入。
-            const line = banner.querySelector('.op-line');
-            const strong = line && line.querySelector('strong');
-            if (strong) strong.textContent = String(op.text);
-            if (line) {
-              const began = op.startedAt ? Date.parse(op.startedAt) : NaN;
-              let elapsed = line.querySelector('.op-elapsed');
-              if (Number.isFinite(began)) {
-                if (!elapsed) { elapsed = document.createElement('span'); elapsed.className = 'op-elapsed'; line.appendChild(elapsed); }
-                elapsed.textContent = ' · 已用 ' + Math.max(0, Math.round((Date.now() - began) / 1000)) + ' 秒';
-              } else if (elapsed) elapsed.remove();
-            }
-          }
+          banner.hidden = ['ready', 'rollback'].includes(info.mode) && !info.error;
+          const heading = document.getElementById('console-state-title'), summary = document.getElementById('console-state-summary'), detail = document.getElementById('console-state-error');
+          if (heading) heading.textContent = base;
+          if (summary) summary.textContent = info.mode === 'maintenance' ? '维护时间暂无法准确预计，排障入口保持可用。' : info.mode === 'safe' ? '核心未就绪；先查看错误与日志，不要反复重启。' : '主核心状态不影响本控制台和独立 AI 诊断。';
+          if (detail) detail.textContent = String(info.error || op?.text || '暂无更多错误信息。').slice(0, 4000);
+          const line = banner.querySelector('.op-line'), strong = line?.querySelector('strong'), elapsed = line?.querySelector('.op-elapsed');
+          if (line) line.hidden = !op?.text;
+          if (strong) strong.textContent = String(op?.text || '').slice(0, 500);
+          const began = Date.parse(op?.startedAt || '');
+          if (elapsed) elapsed.textContent = Number.isFinite(began) ? ' · 已用 ' + Math.max(0, Math.round((Date.now() - began) / 1000)) + ' 秒' : '';
+          const hint = banner.querySelector('.op-hint');
+          if (hint) hint.hidden = info.mode !== 'maintenance';
         }
-        // 只在**没有操作在途**时刷新（上面的 busy 检查已保证），且再次确认
-        if (document.body.dataset.busy === '1') return;
-        if (changed && info.mode === 'ready') { scheduleReload(700); return; }
-        if (changed && info.mode !== 'ready') scheduleReload(0);
-      } catch (error) { idleTicks = 0; if (currentOperation(generation) && error.authExpired) setAppState(error.message, 'bad'); }
+        if (changed) { const note = document.getElementById('console-state-refresh'); if (note) note.hidden = false; }
+      } catch (error) {
+        if (!pollingActive || !currentOperation(generation) || document.hidden || document.body.dataset.busy === '1') return;
+        setAppState(error.authExpired ? error.message : '状态待确认', error.authExpired ? 'bad' : 'warn');
+        const banner = document.getElementById('status-banner');
+        if (banner) {
+          banner.hidden = false;
+          const heading = document.getElementById('console-state-title'), summary = document.getElementById('console-state-summary');
+          if (heading) heading.textContent = error.authExpired ? '管理授权已过期' : '暂时无法确认核心状态';
+          if (summary) summary.textContent = error.authExpired ? '请手动重新打开控制台；当前输入不会自动丢弃。' : '状态请求失败或超时，不等于核心已停止。设置、日志和独立 AI 诊断仍可使用。';
+          const hint = banner.querySelector('.op-hint'); if (hint) hint.hidden = true;
+          const line = banner.querySelector('.op-line'); if (line) line.hidden = true;
+        }
+        const aiCore = document.getElementById('ai-core-state');
+        if (aiCore) aiCore.textContent = '主核心状态待确认；独立 AI 诊断不依赖本次状态请求。';
+      } finally { tickRunning = false; schedule(); }
     };
-    tick();
-    setInterval(tick, 3000);
-    window.addEventListener('pageshow', () => setTimeout(tick, 0));
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+    const pause = () => { pollingActive = false; clearTimeout(pollTimer); pollTimer = null; stateFlight?.controller.abort(); };
+    const resume = () => { pollingActive = true; clearTimeout(pollTimer); pollTimer = setTimeout(tick, 0); };
+    window.addEventListener('pagehide', pause);
+    window.addEventListener('pageshow', resume);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); else resume(); });
+    void tick();
   })();
 
   ${managementPlugins.clientScript()}
@@ -909,7 +1001,7 @@ function render(dataDir, state, session, requestUrl, openDshPath, nonce = '', ne
       }).finally(() => { clearTimeout(postDeadline); if (postController === postAbort) { postController = null; activePostForm = null; activePostButton = null; } });
   });
   </script>` : '';
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DeepSeek Harness 应用设置</title><style>
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${appName} 应用设置</title><style>
 *{box-sizing:border-box}body{margin:0;background:var(--mg-bg,#fff);color:var(--mg-text,#0f1115);font:15px/1.55 system-ui,sans-serif}.shell{max-width:980px;margin:auto;padding:24px 18px 64px}.notice{position:sticky;top:0;z-index:10;padding:12px max(18px,calc((100vw - 944px)/2));background:#e6f5eb;color:#14522e;border-bottom:1px solid #b8ddc4;box-shadow:0 3px 12px #17224715}.notice-error{background:#fff0ee;color:#9b2424;border-color:#edc0ba}.pending{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;margin:0 0 18px;padding:14px 16px;background:#fff8e6;border:1px solid #e8cf95;border-left:4px solid #c8901a;border-radius:10px}.pending strong{display:block;margin-bottom:6px;color:#7a5200}.pending p{margin:0 0 6px}.pending .hint{margin:0}.pending .actions{display:flex;gap:8px;flex:none;flex-wrap:wrap}/* 宽屏下 form 是 inline-flex（按钮排一行用的），会让它按内容收缩 —— 实测
    944px 的卡片里 form 只有 318px，patch 编辑器因此极窄。含编辑器的 form
    单独改成块级撑满，编辑器才拿得到全宽。 */
@@ -1085,7 +1177,7 @@ button.restart-icon.is-working .restart-glyph{animation:restart-spin .9s linear 
   html,body{max-width:100%;overflow-x:hidden}
 ${managementTheme.css}
 ${managementPlugins.styles}
-${managementDiagnosis.styles}</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${statusBanner}${pendingBar}${restartDialog}<div class="shell settings-shell"><header><h1>DeepSeek Harness · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><div class="settings-layout"><aside class="settings-sidebar"><nav class="primary" aria-label="设置分类">${primaryNav}</nav></aside><div class="settings-content"><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav><main class="card">${panels[view]}</main></div></div></div>${busyScript}${nonce ? `<script nonce="${nonce}">(${managementTheme.installNavigation.toString()})();</script>` : ''}</body></html>`;
+${managementDiagnosis.styles}</style></head><body><script type="application/json" id="destructive-actions">${destructiveJson}</script>${noticeBar}${pendingBar}${restartDialog}<div class="shell settings-shell"><header><h1>${appName} · 应用设置</h1><div class="header-actions"><span class="state ${statusTone}" id="app-state">${status}</span>${headerRestart}</div></header><div class="settings-layout"><aside class="settings-sidebar"><nav class="primary" aria-label="设置分类">${primaryNav}</nav></aside><div class="settings-content"><p class="group-description">${group.description}</p><nav class="secondary" aria-label="二级菜单">${secondaryNav}</nav>${statusBanner}<main class="card">${panels[view]}</main></div></div></div>${busyScript}${nonce ? `<script nonce="${nonce}">(${managementTheme.installNavigation.toString()})();</script>` : ''}</body></html>`;
 }
 
 module.exports = { render, selectedView };

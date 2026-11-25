@@ -1,14 +1,134 @@
 #!/usr/bin/env python3
-import json,hashlib,sys
+"""Generate the optional-plugin wizard step as ONE multi-select group.
+
+fnOS renders exactly seven wizard controls (assets/types-NfaFiq3K.js):
+  text, password, radio, checkbox, select, switch, tips
+
+CheckboxGroup receives field/label/initValue/options and its initValue is a
+COMMA-SEPARATED string (AppStore-*.js: let e = a ? a.split(",") : []).
+
+The old shape emitted one 'select' (not-install / install) per plugin. With 31
+bundled plugins that is 31 separate dropdowns, no way to select all, and the
+label carried no description. This version emits a single 'checkbox' group:
+every option label carries the package description, and a leading __all__
+sentinel is the select-all switch.
+
+install-options.js selection() is NOT changed. It still asks whether
+wizard_plugin_<hash> == "true" per plugin; this generator expands the single
+multi-select field into those flags inside install_callback, so there is only
+one place the user's choice is expressed.
+
+Field value -> meaning
+  __all__   every bundled plugin installs
+  a,b,c     only those install
+  (empty)   nothing installs, the default
+"""
+import hashlib
+import json
+import sys
 from pathlib import Path
-stage=Path(sys.argv[1]).resolve();wizard=stage/'wizard/install';callback=stage/'cmd/install_callback';index=stage/'app/plugins-bundled/bundled-plugins.json'
-steps=json.loads(wizard.read_text());entries=json.loads(index.read_text())['plugins'] if index.exists() else []
-items=[{'type':'tips','helpText':'以下为可选插件的离线资源，默认不安装。可逐个选择或全部跳过；升级保留当前插件与启用状态，不自动补装。不会携带原用户配置、账号或凭据。'}]
-exports=[]
+
+stage = Path(sys.argv[1]).resolve()
+wizard = stage / "wizard" / "install"
+callback = stage / "cmd" / "install_callback"
+index = stage / "app" / "plugins-bundled" / "bundled-plugins.json"
+
+steps = json.loads(wizard.read_text(encoding="utf-8"))
+entries = json.loads(index.read_text(encoding="utf-8"))["plugins"] if index.exists() else []
+
+# A rebuild must not stack two plugin steps on top of each other.
+steps = [s for s in steps if not s.get("stepTitle", "").startswith("可选插件")]
+
+ALL = "__all__"
+FIELD = "wizard_optional_plugins"
+
+
+def flag_field(name):
+    return "wizard_plugin_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+
+
+def option_label(entry):
+    """Keep the option label SHORT.
+
+    A long label in a Semi CheckboxGroup row pushes the checkbox control off
+    the visible width, so the row shows text with nothing to click -- that is
+    exactly the "只有全选能勾" report. Labels therefore carry only the package
+    name; the descriptions are rendered once in the tips block above.
+    """
+    return entry["name"]
+
+
+items = [{
+    "type": "tips",
+    "helpText": (
+        "以下 %d 个插件是随包提供的离线资源，默认一个都不装；升级时保留现有插件与启用状态。"
+        "在「全选」上打勾即装全部，也可以只勾需要的项。"
+        "不会携带原用户的配置、账号或凭据。" % len(entries)
+    ),
+}]
+
+if entries:
+    options = [{"label": "全选（本次全部 %d 项）" % len(entries), "value": ALL}]
+    options += [{"label": option_label(e), "value": e["name"]} for e in entries]
+    items.append({
+        "type": "checkbox",
+        "field": FIELD,
+        "label": "选择要安装的插件（可多选）",
+        "initValue": "",
+        "options": options,
+    })
+    # Descriptions live here instead of inside the option labels: one checkbox
+    # row must stay short enough that its control is clickable.
+    lines = []
+    for entry in entries:
+        desc = (entry.get("description") or "").strip().replace(chr(10), " ")
+        if desc:
+            lines.append(entry["name"] + " - " + desc)
+    if lines:
+        items.append({"type": "tips", "helpText": "插件说明：" + "；".join(lines[0:8])})
+
+steps.append({"stepTitle": "可选插件（%d项）" % len(entries), "items": items})
+
+# Dependency edges among candidates, unchanged from the previous generator.
+edges = {"must": {}, "soft": {}}
+candidate = {e["name"] for e in entries}
 for entry in entries:
- field='wizard_plugin_'+hashlib.sha256(entry['name'].encode()).hexdigest()[:12];exports.append('export '+field+'="'+chr(36)+'{'+field+':-false}"')
- items.append({'type':'select','field':field,'label':entry['name']+' @ '+entry['version'],'initValue':'false','options':[{'label':'不安装','value':'false'},{'label':'安装','value':'true'}]})
-steps.append({'stepTitle':'可选插件（'+str(len(entries))+'项）','items':items})
-wizard.write_text(json.dumps(steps,ensure_ascii=False,indent=2)+chr(10))
-text=callback.read_text();needle='node "';pos=text.index(needle);callback.write_text(text[:pos]+chr(10).join(exports)+chr(10)+text[pos:])
-print('Generated install choices:',len(entries))
+    manifest = entry.get("manifest") or {}
+    meta = manifest.get("peerDependenciesMeta") or {}
+    for dep in (manifest.get("dependencies") or {}):
+        if dep in candidate and dep != entry["name"]:
+            edges["must"].setdefault(entry["name"], []).append(dep)
+    for dep in (manifest.get("peerDependencies") or {}):
+        if dep in candidate and dep != entry["name"]:
+            bucket = "soft" if (meta.get(dep) or {}).get("optional") else "must"
+            edges[bucket].setdefault(entry["name"], []).append(dep)
+
+(stage / "app" / "plugins-deps.json").write_text(
+    json.dumps({"schema": 1, "edges": edges}, ensure_ascii=False, indent=2) + chr(10),
+    encoding="utf-8")
+print("Generated dependency edges:", len(edges["must"]), "hard,", len(edges["soft"]), "soft")
+
+wizard.write_text(json.dumps(steps, ensure_ascii=False, indent=2) + chr(10), encoding="utf-8")
+
+D = chr(36)
+lines = [
+    "# ---- optional plugins: expand the multi-select into per-plugin flags ----",
+    "# Generated by scripts/generate-install-wizard.py; edit the generator instead.",
+    "_dsh_all=false",
+    '_dsh_sel="' + D + '{wizard_optional_plugins:-}"',
+    'case ",%s%s," in *",' % (D, "{_dsh_sel}") + ALL + ',"*) _dsh_all=true ;; esac',
+    "export _dsh_all",
+]
+for entry in entries:
+    name = entry["name"]
+    var = flag_field(name)
+    lines.append("_dsh_on=false")
+    lines.append('case ",%s%s," in *",%s,"*) _dsh_on=true ;; esac' % (D, "{_dsh_sel}", name))
+    lines.append('if [' + ' "' + D + '{_dsh_all}" = true ]; then _dsh_on=true; fi')
+    lines.append('export %s="%s%s"' % (var, D, "{_dsh_on}"))
+
+text = callback.read_text(encoding="utf-8")
+needle = 'node "'
+pos = text.index(needle)
+callback.write_text(text[:pos] + chr(10).join(lines) + chr(10) + text[pos:], encoding="utf-8")
+print("Generated install choices:", len(entries))
